@@ -151,14 +151,17 @@ fn dropped_git_vars(names: impl IntoIterator<Item = OsString>) -> impl Iterator<
 ///
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
 /// like a failed spawn.
-pub(crate) fn executable() -> Result<std::path::PathBuf, String> {
-    crate::agent::trusted_program("git").map_err(|err| format!("failed to run git: {err}"))
+pub(crate) fn executable(
+    search_path: &crate::runtime::SearchPath,
+) -> Result<std::path::PathBuf, String> {
+    crate::agent::trusted_program("git", search_path)
+        .map_err(|err| format!("failed to run git: {err}"))
 }
 
 /// Builds a command for the trusted `git` executable that drops every `GIT_*`
 /// variable of the daemon's environment except those [`is_inherited`] accepts.
 ///
-/// The executable is resolved once through
+/// The executable is resolved once, on `search_path`, through
 /// [`trusted_program`](crate::agent::trusted_program), so no second `PATH`
 /// search can pick another candidate.
 ///
@@ -166,8 +169,8 @@ pub(crate) fn executable() -> Result<std::path::PathBuf, String> {
 ///
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
 /// like a failed spawn.
-pub(crate) fn command() -> Result<Command, String> {
-    let mut command = Command::new(executable()?);
+pub(crate) fn command(search_path: &crate::runtime::SearchPath) -> Result<Command, String> {
+    let mut command = Command::new(executable(search_path)?);
     for name in dropped_git_vars(std::env::vars_os().map(|(name, _)| name)) {
         command.env_remove(name);
     }
@@ -348,7 +351,7 @@ mod tests {
                 let product = source
                     .find("\n#[cfg(test)]\nmod tests")
                     .map_or(source.as_str(), |end| &source[..end]);
-                for pattern in ["Command::new(\"git\")", "trusted_program(\"git\")"] {
+                for pattern in ["Command::new(\"git\")", "trusted_program(\"git\""] {
                     if product.contains(pattern) {
                         found.push((path.clone(), pattern.to_owned()));
                     }

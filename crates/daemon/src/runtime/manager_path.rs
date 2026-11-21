@@ -5,10 +5,14 @@
 //! the `PATH` it was started with, so agents the login environment provides
 //! (version-manager shims) stay invisible until the daemon restarts. A daemon
 //! whose job takes the manager `PATH` therefore reads the manager again at the
-//! boundary where its registry resolves or launches an agent, and the registry
-//! hands that one value to every reader of the operation, so a probe and a
-//! launch agree on what runs. The state belongs to the [`ManagerPath`] of a
-//! registry; two registries never share it.
+//! boundary where its registry resolves or launches an agent. The operation
+//! takes one [`SearchPath`] snapshot from that read and moves it to every
+//! resolver, `git` spawn and hook it reaches, so a probe, a worktree bind and a
+//! launch agree on what runs even while another operation refreshes. Work that
+//! starts no agent (diff, retention, removal, session-stop hooks, cwd tracking,
+//! project add, show and candidates) takes the registry's last read without reading the manager again. The state
+//! belongs to the [`ManagerPath`] of a registry; no process-wide copy exists, so
+//! two registries never share it.
 //!
 //! Only `PATH` is refreshed. Other allowlisted variables, such as a store
 //! location, stay as the process got them. A manager that cannot answer leaves
@@ -26,28 +30,57 @@ use std::time::{Duration, Instant};
 use pohunek_platform::supervisor::UnitEnvironment;
 use tracing::{debug, warn};
 
-/// The manager `PATH` of the registry that refreshed last, for the helper
-/// resolvers (`git`, hook interpreters) that no registry reaches.
+/// The executable search path of one operation, taken once from its registry
+/// and moved to every resolver, `git` spawn and hook the operation reaches.
 ///
-/// Process-wide until those resolvers take their search path from the registry
-/// (#2494); every other reader uses [`ManagerPath::search_path`] of its own
-/// registry.
-static HELPER_CURRENT: RwLock<Option<OsString>> = RwLock::new(None);
-
-/// The `PATH` the helper resolvers search: the manager's when a
-/// [`ManagerPath::refresh`] has read one, else the process's.
-#[must_use]
-pub(crate) fn helper_search_path() -> Option<OsString> {
-    let current = HELPER_CURRENT
-        .read()
-        .unwrap_or_else(PoisonError::into_inner);
-    current.clone().or_else(|| std::env::var_os("PATH"))
+/// A value, not a reader: it is `Send + Sync` and cheap to clone, so it crosses
+/// `spawn_blocking` and `spawn` boundaries by being moved into the closure, and
+/// a concurrent refresh of the registry never changes it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SearchPath {
+    /// The `PATH` executables resolve on: the manager's when the daemon
+    /// follows it and has read one, else the process's.
+    resolved: Option<Arc<OsStr>>,
+    /// The manager `PATH` of the read this snapshot was taken after; the base
+    /// environment of a launch swaps it in for the process's.
+    manager: Option<Arc<OsStr>>,
 }
 
-fn store_helper(path: Option<OsString>) {
-    *HELPER_CURRENT
-        .write()
-        .unwrap_or_else(PoisonError::into_inner) = path;
+impl SearchPath {
+    /// A snapshot resolving on `resolved`, with `manager` as the manager
+    /// `PATH` the base environment follows.
+    #[must_use]
+    pub(crate) fn new(resolved: Option<OsString>, manager: Option<OsString>) -> Self {
+        Self {
+            resolved: resolved.map(Arc::from),
+            manager: manager.map(Arc::from),
+        }
+    }
+
+    /// The process `PATH`, for fixtures that never follow a service manager.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn process() -> Self {
+        Self::new(crate::agent::process_search_path(), None)
+    }
+
+    /// The `PATH` executables resolve on.
+    #[must_use]
+    pub(crate) fn as_os_str(&self) -> Option<&OsStr> {
+        self.resolved.as_deref()
+    }
+
+    /// An owned copy of [`Self::as_os_str`].
+    #[must_use]
+    pub(crate) fn to_os_string(&self) -> Option<OsString> {
+        self.resolved.as_deref().map(OsStr::to_os_string)
+    }
+
+    /// The manager `PATH` the base environment of a launch follows.
+    #[must_use]
+    pub(crate) fn manager(&self) -> Option<OsString> {
+        self.manager.as_deref().map(OsStr::to_os_string)
+    }
 }
 
 /// Why the manager's `PATH` could not be read.
@@ -174,15 +207,7 @@ impl ManagerPath {
             .clone()
     }
 
-    /// The `PATH` this daemon resolves executables on and gives its agents:
-    /// the manager's when a refresh has read one, else the process's.
-    #[must_use]
-    pub fn search_path(&self) -> Option<OsString> {
-        self.manager_path().or_else(|| std::env::var_os("PATH"))
-    }
-
     fn store(&self, path: Option<OsString>) {
-        store_helper(path.clone());
         *self
             .inner
             .current

@@ -280,6 +280,7 @@ impl SessionRegistry {
         let Some(worktree) = self.inner.worktree.clone() else {
             return;
         };
+        let search_path = self.search_path_snapshot();
         let mut probes = 0_usize;
         for candidate in candidates
             .iter_mut()
@@ -298,8 +299,11 @@ impl SessionRegistry {
             probes += 1;
             let manager = Arc::clone(&worktree);
             let session_id = candidate.session_id.0.clone();
-            let work = match tokio::task::spawn_blocking(move || manager.unsaved_work(&session_id))
-                .await
+            let search_path = search_path.clone();
+            let work = match tokio::task::spawn_blocking(move || {
+                manager.unsaved_work(&session_id, &search_path)
+            })
+            .await
             {
                 Ok(work) => work,
                 Err(_join) => WorktreeWork::Held {

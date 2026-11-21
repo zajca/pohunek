@@ -291,6 +291,9 @@ pub(crate) struct CheckoutFacts<'a> {
     pub(crate) remote_source: Option<&'a RemoteSourceResolver>,
     /// Observer of the read of the declared paths.
     pub(crate) read_observer: Option<&'a ReadObserver>,
+    /// The search path of the operation whose launch is judged; `git` is
+    /// resolved on it.
+    pub(crate) search_path: &'a crate::runtime::SearchPath,
 }
 
 /// Why the predicate could not reach an answer.
@@ -432,7 +435,7 @@ fn evaluate(facts: &CheckoutFacts<'_>) -> Result<Verdict, Failure> {
             "the launch directory is not a checkout root",
         ));
     }
-    let git = Git::new(facts.scratch_root)?;
+    let git = Git::new(facts.scratch_root, facts.search_path)?;
     let head = match facts.remote_source {
         Some(resolver) => {
             let source = resolver.resolve(&repository).ok_or(Failure::Remote)?;
@@ -1030,10 +1033,10 @@ struct Git {
 }
 
 impl Git {
-    fn new(scratch_root: &Path) -> Result<Self, Failure> {
+    fn new(scratch_root: &Path, search_path: &crate::runtime::SearchPath) -> Result<Self, Failure> {
         use std::os::unix::fs::DirBuilderExt as _;
 
-        let program = crate::git::executable().map_err(|_not_found| Failure::NoGit)?;
+        let program = crate::git::executable(search_path).map_err(|_not_found| Failure::NoGit)?;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(SCRATCH_DIR_MODE)

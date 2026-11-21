@@ -17,7 +17,7 @@ use tracing::warn;
 
 use super::{
     admin_lock, check_fetch_source, git_capture, git_command, git_run, output_failure_message,
-    run_output_bounded, run_output_bounded_then, share_within, OutputPolicy, RepoHookLayer,
+    run_output_bounded, run_output_bounded_then, share_within, GitScope, OutputPolicy,
     GIT_COMMAND_TIMEOUT,
 };
 
@@ -48,16 +48,17 @@ pub(crate) struct FetchedBase {
     ref_oid: String,
     repository: PathBuf,
     ref_name: String,
-    /// The hook layer of the session the base was fetched for; the guarded
-    /// delete runs under it like every other git command of that session.
-    layer: RepoHookLayer,
+    /// The hook layer and search path of the session operation the base was
+    /// fetched for; the guarded delete runs under them like every other git
+    /// command of that operation.
+    git: GitScope,
 }
 
 impl Drop for FetchedBase {
     fn drop(&mut self) {
         if let Err(message) = git_run(
             &self.repository,
-            self.layer,
+            &self.git,
             &["update-ref", "-d", &self.ref_name, &self.ref_oid],
         ) {
             warn!(
@@ -92,10 +93,10 @@ pub(crate) fn fetch_ref_name() -> Result<String, String> {
 /// `FETCH_HEAD`, which concurrent fetches in one repository would share.
 pub(super) fn fetch_origin(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     base_branch: &str,
 ) -> Result<FetchedBase, String> {
-    fetch_into_ref(repo, layer, base_branch, &fetch_ref_name()?)
+    fetch_into_ref(repo, git, base_branch, &fetch_ref_name()?)
 }
 
 /// Which owner-visibility profile a single-ref `git fetch` from `origin` runs with.
@@ -143,12 +144,12 @@ impl FetchScope {
 /// `--end-of-options` keeps the refspec positional.
 pub(super) fn fetch_command(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     source: &str,
     fetch_ref: &str,
     scope: FetchScope,
 ) -> Result<Command, String> {
-    let mut cmd = git_command(repo, layer)?;
+    let mut cmd = git_command(repo, git)?;
     cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .arg("fetch")
         .arg("--no-tags");
@@ -165,11 +166,11 @@ pub(super) fn fetch_command(
 /// with [`FetchScope::Tracked`].
 pub(super) fn fetch_into_ref(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     source: &str,
     fetch_ref: &str,
 ) -> Result<FetchedBase, String> {
-    fetch_into_ref_with(repo, layer, source, fetch_ref, FetchScope::Tracked)
+    fetch_into_ref_with(repo, git, source, fetch_ref, FetchScope::Tracked)
 }
 
 /// Fetch `source` from `origin` into `fetch_ref` and return the guard that
@@ -187,13 +188,13 @@ pub(super) fn fetch_into_ref(
 /// the leading-dash guard (defense in depth against argv flag injection).
 pub(crate) fn fetch_into_ref_with(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     source: &str,
     fetch_ref: &str,
     scope: FetchScope,
 ) -> Result<FetchedBase, String> {
-    check_fetch_source(repo, layer, source)?;
-    let mut probe = git_command(repo, layer)?;
+    check_fetch_source(repo, git, source)?;
+    let mut probe = git_command(repo, git)?;
     probe.args(["rev-parse", "--verify", "--quiet", fetch_ref]);
     let probed = run_output_bounded(probe, GIT_COMMAND_TIMEOUT)?;
     match probed.status.code() {
@@ -201,13 +202,13 @@ pub(crate) fn fetch_into_ref_with(
         Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
         _ => return Err(output_failure_message(&probed)),
     }
-    let cmd = fetch_command(repo, layer, source, fetch_ref, scope)?;
+    let cmd = fetch_command(repo, git, source, fetch_ref, scope)?;
     // The fetch's connectivity check reads every `worktrees/<name>/HEAD`, and
     // `git worktree add` first writes a null-oid placeholder there, which fails
     // the check with `bad object worktrees/<name>/HEAD`. Holding the admin lock
     // shared keeps the fetch from overlapping an add or prune on the same
     // repository while fetches still run side by side.
-    let lock = admin_lock(repo, layer)?;
+    let lock = admin_lock(repo, git)?;
     let guard = share_within(&lock, fetch_lock_wait())?;
     // Fetch diagnostics are not parsed: a successful fetch already owns its ref.
     let output = run_output_bounded_then(
@@ -220,7 +221,7 @@ pub(crate) fn fetch_into_ref_with(
         // The probe above proved the destination was absent, so a failed
         // fetch deletes only the ref the fetch itself created: nothing else
         // can name a session-owned ref here.
-        if let Err(delete) = git_run(repo, layer, &["update-ref", "-d", fetch_ref]) {
+        if let Err(delete) = git_run(repo, git, &["update-ref", "-d", fetch_ref]) {
             warn!(
                 fetch_ref,
                 error = %delete,
@@ -232,10 +233,10 @@ pub(crate) fn fetch_into_ref_with(
     // The fetch created the ref (it was absent above), so this request owns it
     // even when it does not resolve to a commit.
     let resolved =
-        git_capture(repo, layer, &["rev-parse", "--verify", fetch_ref]).and_then(|ref_oid| {
+        git_capture(repo, git, &["rev-parse", "--verify", fetch_ref]).and_then(|ref_oid| {
             git_capture(
                 repo,
-                layer,
+                git,
                 &["rev-parse", "--verify", &format!("{fetch_ref}^{{commit}}")],
             )
             .map(|commit| (ref_oid, commit))
@@ -243,7 +244,7 @@ pub(crate) fn fetch_into_ref_with(
     let (ref_oid, commit) = match resolved {
         Ok(ids) => ids,
         Err(message) => {
-            if let Err(delete) = git_run(repo, layer, &["update-ref", "-d", fetch_ref]) {
+            if let Err(delete) = git_run(repo, git, &["update-ref", "-d", fetch_ref]) {
                 warn!(fetch_ref, error = %delete, "could not delete the temporary fetch ref");
             }
             return Err(message);
@@ -254,7 +255,7 @@ pub(crate) fn fetch_into_ref_with(
         ref_oid,
         repository: repo.to_path_buf(),
         ref_name: fetch_ref.to_owned(),
-        layer,
+        git: git.clone(),
     })
 }
 

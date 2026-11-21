@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
-use super::RepoHookLayer;
 use super::{
     admin_lock, git_command, lock_within, run_admin_command_within, share_within, worktree_add_new,
     worktree_prune,
@@ -237,7 +236,10 @@ fn bind_creates_a_valid_worktree_and_records_a_binding() {
     let mgr = manager("create");
     let repo = init_repo("create-repo");
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind worktree");
 
     assert!(!bound.reused);
@@ -271,7 +273,10 @@ fn bind_creates_a_worktree_on_a_bare_repo() {
     let mgr = manager("bare-bind");
     let bare = init_bare_repo("bare-bind");
     let bound = mgr
-        .bind(&request("s-1", &bare, "feat/x"))
+        .bind(
+            &request("s-1", &bare, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("a worktree can be bound off a bare repo");
     assert!(
         is_valid_worktree(&bound.path),
@@ -289,14 +294,20 @@ fn bind_reuses_an_owned_valid_worktree() {
     let mgr = manager("reuse");
     let repo = init_repo("reuse-repo");
     let first = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("first bind");
     assert!(!first.reused);
 
     // Re-binding the same (session, repo, branch) must reuse, not re-run
     // `git worktree add -b` (which would fail because the branch now exists).
     let second = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("second bind reuses");
     assert!(second.reused, "second bind should reuse the owned worktree");
     assert_eq!(second.path, first.path);
@@ -307,8 +318,18 @@ fn bind_reuses_an_owned_valid_worktree() {
 fn two_branches_of_one_repo_bind_two_distinct_trees() {
     let mgr = manager("two-branches");
     let repo = init_repo("two-branches-repo");
-    let a = mgr.bind(&request("s-1", &repo, "feat/a")).expect("bind a");
-    let b = mgr.bind(&request("s-1", &repo, "feat/b")).expect("bind b");
+    let a = mgr
+        .bind(
+            &request("s-1", &repo, "feat/a"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind a");
+    let b = mgr
+        .bind(
+            &request("s-1", &repo, "feat/b"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind b");
 
     assert_ne!(a.path, b.path, "two branches must not share a tree");
     assert!(is_valid_worktree(&a.path));
@@ -327,7 +348,10 @@ fn bind_refuses_a_foreign_directory_at_the_target_path() {
     fs::create_dir_all(&target).expect("create foreign dir");
 
     let err = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("foreign tree must be refused");
     assert_eq!(err.code, "worktree_path_conflict");
 }
@@ -337,7 +361,10 @@ fn bind_recreates_when_owned_directory_was_lost() {
     let mgr = manager("recreate");
     let repo = init_repo("recreate-repo");
     let first = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("first bind");
 
     // Simulate the worktree directory being lost while the binding remains.
@@ -345,7 +372,10 @@ fn bind_recreates_when_owned_directory_was_lost() {
     assert!(!is_valid_worktree(&first.path));
 
     let again = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("recreate owned worktree");
     assert!(!again.reused, "a lost directory is recreated, not reused");
     assert_eq!(again.path, first.path);
@@ -357,7 +387,10 @@ fn bind_rejects_a_non_git_repository() {
     let mgr = manager("nonrepo");
     let not_a_repo = unique_dir("nonrepo-dir");
     let err = mgr
-        .bind(&request("s-1", &not_a_repo, "feat/x"))
+        .bind(
+            &request("s-1", &not_a_repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("non-git repo must error");
     assert_eq!(err.code, "not_a_git_repo");
 }
@@ -370,14 +403,19 @@ fn bind_rejects_flag_injecting_branch_and_base() {
     // A branch beginning with '-' must be refused before any git invocation so
     // it cannot be parsed as a git flag.
     let err = mgr
-        .bind(&request("s-1", &repo, "--upload-pack=evil"))
+        .bind(
+            &request("s-1", &repo, "--upload-pack=evil"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("dash-leading branch rejected");
     assert_eq!(err.code, "invalid_branch");
 
     // Same guard for a dash-leading base branch.
     let mut req = request("s-2", &repo, "feat/x");
     req.base_branch = Some("--exec=evil".to_owned());
-    let err = mgr.bind(&req).expect_err("dash-leading base rejected");
+    let err = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect_err("dash-leading base rejected");
     assert_eq!(err.code, "invalid_branch");
 }
 
@@ -405,7 +443,10 @@ fn bind_rejects_flag_injecting_default_branch_from_crafted_head() {
 
     // Bind WITHOUT an explicit base so the crafted default branch is resolved.
     let err = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("crafted default branch must be rejected");
     assert_eq!(err.code, "invalid_branch", "got: {err:?}");
     // No worktree was created — the malicious ref never reached a git sink.
@@ -427,7 +468,7 @@ fn detached_head_binds_with_explicit_base_but_fails_without() {
     let with_base = {
         let mut req = request("s-1", &repo, "feat/x");
         req.base_branch = Some("main".to_owned());
-        mgr.bind(&req)
+        mgr.bind(&req, &crate::runtime::SearchPath::process())
             .expect("bind with explicit base on detached HEAD")
     };
     assert!(is_valid_worktree(&with_base.path));
@@ -435,7 +476,10 @@ fn detached_head_binds_with_explicit_base_but_fails_without() {
 
     // Without a base, the default branch cannot be resolved on detached HEAD.
     let err = mgr
-        .bind(&request("s-2", &repo, "feat/y"))
+        .bind(
+            &request("s-2", &repo, "feat/y"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("detached HEAD without a base must error clearly");
     assert_eq!(err.code, "invalid_base_branch");
     assert!(
@@ -481,7 +525,9 @@ fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
     let mgr = manager("fetch-success");
     let mut req = request("s-1", &downstream, "feat/x");
     req.base_branch = Some("main".to_owned());
-    let bound = mgr.bind(&req).expect("bind fetches and binds");
+    let bound = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect("bind fetches and binds");
 
     assert!(
         bound.warnings.is_empty(),
@@ -526,7 +572,9 @@ fn remote_only_base_branch_is_fetched_before_default_branch_fallback() {
     let mgr = manager("remote-base");
     let mut req = request("s-1", &downstream, "feat/x");
     req.base_branch = Some("stacked/base".to_owned());
-    let bound = mgr.bind(&req).expect("bind fetches the remote-only base");
+    let bound = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect("bind fetches the remote-only base");
 
     assert_eq!(bound.base_branch, "stacked/base");
     assert!(
@@ -616,7 +664,7 @@ fn concurrent_creates_in_one_repository_each_start_from_their_own_base() {
                         request(&format!("s-{index}"), downstream, &format!("feat/{index}"));
                     req.base_branch = Some(base.clone());
                     barrier.wait();
-                    mgr.bind(&req)
+                    mgr.bind(&req, &crate::runtime::SearchPath::process())
                 })
             })
             .collect();
@@ -684,7 +732,8 @@ fn a_base_fetch_waits_for_a_worktree_add_that_has_not_finished_its_admin_entry()
     .expect("write gitdir");
     fs::write(entry.join("commondir"), "../..\n").expect("write commondir");
     fs::write(entry.join("HEAD"), format!("{}\n", "0".repeat(40))).expect("write the placeholder");
-    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
+    let lock = admin_lock(&downstream, &crate::worktree::GitScope::for_process())
+        .expect("repository lock");
 
     let mgr = manager("fetch-vs-add");
     let mut req = request("s-1", &downstream, "feat/1");
@@ -695,7 +744,7 @@ fn a_base_fetch_waits_for_a_worktree_add_that_has_not_finished_its_admin_entry()
         let (tx, rx) = std::sync::mpsc::channel();
         let (mgr, req) = (&mgr, &req);
         scope.spawn(move || {
-            let _ = tx.send(mgr.bind(req));
+            let _ = tx.send(mgr.bind(req, &crate::runtime::SearchPath::process()));
         });
         // The bind either parks its fetch on the lock or ends early with the
         // fetch error the lock prevents.
@@ -733,7 +782,8 @@ fn a_base_fetch_waits_for_a_worktree_add_that_has_not_finished_its_admin_entry()
 fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
     let (upstream, tip) = upstream_with_stacked_base("fetch-vs-fetch-upstream");
     let downstream = clone_of(&upstream, "fetch-vs-fetch-downstream");
-    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
+    let lock = admin_lock(&downstream, &crate::worktree::GitScope::for_process())
+        .expect("repository lock");
 
     let fetched = std::thread::scope(|scope| {
         // Dropped on unwind too, before the scope waits for the fetch.
@@ -744,7 +794,11 @@ fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
         let fetch = scope.spawn(|| {
             super::fetch::FETCH_LOCK_WAIT_OVERRIDE
                 .with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
-            super::fetch::fetch_origin(&downstream, RepoHookLayer::Run, "stacked/base")
+            super::fetch::fetch_origin(
+                &downstream,
+                &crate::worktree::GitScope::for_process(),
+                "stacked/base",
+            )
         });
         pohunek_test_support::wait::poll_until(
             "the fetch to finish beside the other fetch",
@@ -760,7 +814,8 @@ fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
 #[test]
 fn a_waiting_add_holds_back_new_fetches_of_the_repository() {
     let repo = init_repo("writer-preference");
-    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("repository lock");
+    let lock =
+        admin_lock(&repo, &crate::worktree::GitScope::for_process()).expect("repository lock");
 
     std::thread::scope(|scope| {
         let fetch = share_within(&lock, TEST_LOCK_WAIT).expect("the fetch shares the lock");
@@ -790,13 +845,18 @@ fn a_waiting_add_holds_back_new_fetches_of_the_repository() {
 fn a_fetch_that_cannot_get_the_repository_lock_falls_back_to_the_local_base_with_a_warning() {
     let (upstream, _) = upstream_with_stacked_base("fetch-lock-warning-upstream");
     let downstream = clone_of(&upstream, "fetch-lock-warning-downstream");
-    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
+    let lock = admin_lock(&downstream, &crate::worktree::GitScope::for_process())
+        .expect("repository lock");
     let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
 
     super::fetch::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
     let mut warnings = Vec::new();
-    let (start_point, fetched) =
-        WorktreeManager::fetch_start_point(&downstream, RepoHookLayer::Run, "main", &mut warnings);
+    let (start_point, fetched) = WorktreeManager::fetch_start_point(
+        &downstream,
+        &crate::worktree::GitScope::for_process(),
+        "main",
+        &mut warnings,
+    );
 
     assert_eq!(start_point, "main", "the local base is used");
     assert!(fetched.is_none());
@@ -813,14 +873,15 @@ fn a_fetch_that_cannot_get_the_repository_lock_falls_back_to_the_local_base_with
 fn a_bind_whose_origin_only_base_cannot_get_the_repository_lock_reports_the_fetch_failure() {
     let (upstream, _) = upstream_with_stacked_base("fetch-lock-error-upstream");
     let downstream = clone_of(&upstream, "fetch-lock-error-downstream");
-    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
+    let lock = admin_lock(&downstream, &crate::worktree::GitScope::for_process())
+        .expect("repository lock");
     let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
 
     super::fetch::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
     let mut req = request("s-1", &downstream, "feat/1");
     req.base_branch = Some("stacked/base".to_owned());
     let error = manager("fetch-lock-error")
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect_err("the base cannot be fetched without the lock");
 
     assert_eq!(error.code, "base_branch_fetch_failed", "{error:?}");
@@ -845,7 +906,7 @@ fn concurrent_worktree_adds_and_prunes_in_one_repository_all_succeed() {
         let (adds, prune) = std::thread::scope(|scope| {
             let prune = scope.spawn(|| {
                 barrier.wait();
-                worktree_prune(&repo, RepoHookLayer::Run)
+                worktree_prune(&repo, &crate::worktree::GitScope::for_process())
             });
             let handles: Vec<_> = (0..RAW_ADDS_PER_ROUND)
                 .map(|index| {
@@ -855,7 +916,7 @@ fn concurrent_worktree_adds_and_prunes_in_one_repository_all_succeed() {
                         barrier.wait();
                         worktree_add_new(
                             repo,
-                            RepoHookLayer::Run,
+                            &crate::worktree::GitScope::for_process(),
                             &path,
                             &format!("b/{round}-{index}"),
                             "main",
@@ -894,13 +955,21 @@ fn admin_lock_is_shared_per_repository_and_independent_across_repositories() {
     let first = init_repo("lock-first");
     let second = init_repo("lock-second");
     let linked = unique_dir("lock-linked").join("wt");
-    worktree_add_new(&first, RepoHookLayer::Run, &linked, "feat/linked", "main")
-        .expect("add a linked worktree");
+    worktree_add_new(
+        &first,
+        &crate::worktree::GitScope::for_process(),
+        &linked,
+        "feat/linked",
+        "main",
+    )
+    .expect("add a linked worktree");
 
-    let first_lock = admin_lock(&first, RepoHookLayer::Run).expect("lock for the first repository");
-    let via_linked = admin_lock(&linked, RepoHookLayer::Run).expect("lock via a linked worktree");
-    let second_lock =
-        admin_lock(&second, RepoHookLayer::Run).expect("lock for the second repository");
+    let first_lock = admin_lock(&first, &crate::worktree::GitScope::for_process())
+        .expect("lock for the first repository");
+    let via_linked = admin_lock(&linked, &crate::worktree::GitScope::for_process())
+        .expect("lock via a linked worktree");
+    let second_lock = admin_lock(&second, &crate::worktree::GitScope::for_process())
+        .expect("lock for the second repository");
     assert!(
         Arc::ptr_eq(&first_lock, &via_linked),
         "the main checkout and its linked worktree share one lock"
@@ -930,7 +999,7 @@ fn admin_lock_is_shared_per_repository_and_independent_across_repositories() {
 #[test]
 fn admin_lock_wait_reports_a_timeout_instead_of_blocking_forever() {
     let repo = init_repo("lock-timeout");
-    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("lock");
+    let lock = admin_lock(&repo, &crate::worktree::GitScope::for_process()).expect("lock");
     let _held = lock_within(&lock, Duration::ZERO).expect("take the lock");
 
     let message = lock_within(&lock, Duration::ZERO).expect_err("lock is held");
@@ -945,15 +1014,21 @@ fn admin_lock_wait_reports_a_timeout_instead_of_blocking_forever() {
 fn admin_commands_wait_for_the_repository_lock_before_running_git() {
     let repo = init_repo("lock-wiring");
     let checkout = unique_dir("lock-wiring-checkout").join("wt");
-    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("lock");
+    let lock = admin_lock(&repo, &crate::worktree::GitScope::for_process()).expect("lock");
     let held = lock_within(&lock, Duration::ZERO).expect("take the lock");
 
-    let mut cmd = git_command(&repo, RepoHookLayer::Run).expect("git command");
+    let mut cmd =
+        git_command(&repo, &crate::worktree::GitScope::for_process()).expect("git command");
     cmd.args(["worktree", "add", "-b", "feat/locked", "--end-of-options"])
         .arg(&checkout)
         .arg("main");
-    let message = run_admin_command_within(&repo, RepoHookLayer::Run, cmd, Duration::ZERO)
-        .expect_err("the held lock keeps the command from running");
+    let message = run_admin_command_within(
+        &repo,
+        &crate::worktree::GitScope::for_process(),
+        cmd,
+        Duration::ZERO,
+    )
+    .expect_err("the held lock keeps the command from running");
 
     assert!(
         message.contains("timed out"),
@@ -1010,11 +1085,17 @@ fn repository_lock_is_released_when_git_exits_even_if_a_hook_descendant_holds_th
     let first_path = unique_dir("lock-exit-first").join("wt");
     let second_path = unique_dir("lock-exit-second").join("wt");
     let add = |path: &Path, branch: &str, lock_wait: Duration| {
-        let mut cmd = git_command(&repo, RepoHookLayer::Run).expect("git command");
+        let mut cmd =
+            git_command(&repo, &crate::worktree::GitScope::for_process()).expect("git command");
         cmd.args(["worktree", "add", "-b", branch, "--end-of-options"])
             .arg(path)
             .arg("main");
-        run_admin_command_within(&repo, RepoHookLayer::Run, cmd, lock_wait)
+        run_admin_command_within(
+            &repo,
+            &crate::worktree::GitScope::for_process(),
+            cmd,
+            lock_wait,
+        )
     };
 
     std::thread::scope(|scope| {
@@ -1071,7 +1152,8 @@ fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
     let started = state.join("started");
     let release = state.join("release");
     let ended = state.join("ended");
-    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let python = crate::agent::trusted_program("python3", &crate::runtime::SearchPath::process())
+        .expect("test Python");
     // The grandchild writes its partial output before it creates `started`, and the
     // hook itself exits only once `started` exists, so git cannot finish (and the
     // output drain cannot close the pipe) before that output is written.
@@ -1095,15 +1177,19 @@ fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
         let logs = &logs;
         let first = scope.spawn(move || {
             let _subscriber = logs.install();
-            let _ = tx.send(manager.bind(req));
+            let _ = tx.send(manager.bind(req, &crate::runtime::SearchPath::process()));
         });
         pohunek_test_support::wait::poll_until("native hook grandchild ready", || {
             started.exists().then_some(())
         });
-        let lock = admin_lock(&repo, RepoHookLayer::Run).expect("repository lock");
+        let lock =
+            admin_lock(&repo, &crate::worktree::GitScope::for_process()).expect("repository lock");
         drop(lock_within(&lock, TEST_LOCK_WAIT).expect("git exit releases lock before drain"));
         manager
-            .bind(&request("second", &repo, "feat/second"))
+            .bind(
+                &request("second", &repo, "feat/second"),
+                &crate::runtime::SearchPath::process(),
+            )
             .expect("second bind proceeds");
         let result = rx.recv_timeout(Duration::from_secs(3));
         assert!(
@@ -1143,14 +1229,18 @@ fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
 fn an_oversized_failing_native_hook_keeps_bounded_partial_diagnostics() {
     use std::os::unix::fs::PermissionsExt;
     let repo = init_repo("native-hook-cap");
-    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let python = crate::agent::trusted_program("python3", &crate::runtime::SearchPath::process())
+        .expect("test Python");
     let hook = repo.join(".git/hooks/post-checkout");
     fs::write(&hook, format!("#!{}\nimport sys\nsys.stderr.write('diagnostic marker\\n'+'x'*(9*1024*1024))\nsys.exit(7)\n", python.display())).expect("write hook");
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
     let error = manager("native-hook-cap")
-        .bind(&request("first", &repo, "feat/first"))
+        .bind(
+            &request("first", &repo, "feat/first"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("native hook fails");
     assert!(error.msg.contains("diagnostic marker"));
     assert!(
@@ -1168,7 +1258,7 @@ fn an_oversized_failing_native_hook_keeps_bounded_partial_diagnostics() {
 #[test]
 fn admin_lock_survives_a_panicking_holder() {
     let repo = init_repo("lock-poison");
-    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("lock");
+    let lock = admin_lock(&repo, &crate::worktree::GitScope::for_process()).expect("lock");
     let poisoner = Arc::clone(&lock);
     let panicked = std::thread::spawn(move || {
         let _guard = poisoner.rw.write().expect("take the lock");
@@ -1191,7 +1281,9 @@ fn successful_fetch_leaves_no_temporary_ref_and_keeps_the_logical_base_name() {
     let mgr = manager("pin");
     let mut req = request("s-1", &downstream, "feat/x");
     req.base_branch = Some("main".to_owned());
-    let bound = mgr.bind(&req).expect("bind");
+    let bound = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect("bind");
 
     assert_eq!(bound.base_branch, "main");
     let stored = mgr
@@ -1214,7 +1306,10 @@ fn failed_fetch_leaves_no_temporary_ref() {
 
     let mgr = manager("fetch-clean");
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind falls back when fetch fails");
 
     assert!(bound
@@ -1232,7 +1327,12 @@ fn base_ref_with_refspec_syntax_is_not_fetched() {
 
     for hostile in ["main:refs/heads/injected", "+main", "ma*in"] {
         assert!(
-            super::fetch::fetch_origin(&downstream, RepoHookLayer::Run, hostile).is_err(),
+            super::fetch::fetch_origin(
+                &downstream,
+                &crate::worktree::GitScope::for_process(),
+                hostile
+            )
+            .is_err(),
             "{hostile:?} must be rejected before any fetch"
         );
     }
@@ -1260,7 +1360,9 @@ fn fetched_commit_stays_referenced_until_the_worktree_is_created() {
     let mgr = manager("pinned");
     let mut req = request("s-1", &downstream, "feat/x");
     req.base_branch = Some("stacked/base".to_owned());
-    let bound = mgr.bind(&req).expect("bind");
+    let bound = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect("bind");
 
     assert_eq!(
         fs::read_to_string(downstream.join("pinned.txt"))
@@ -1283,8 +1385,12 @@ fn annotated_tag_base_is_pinned_by_its_commit_and_its_ref_is_deleted() {
     let downstream = clone_of(&upstream, "tag-downstream");
     git_in(&downstream, &["tag", "-d", "v1.0.0"]);
 
-    let fetched = super::fetch::fetch_origin(&downstream, RepoHookLayer::Run, "v1.0.0")
-        .expect("fetch the tag");
+    let fetched = super::fetch::fetch_origin(
+        &downstream,
+        &crate::worktree::GitScope::for_process(),
+        "v1.0.0",
+    )
+    .expect("fetch the tag");
     assert_eq!(fetched.commit, commit);
     drop(fetched);
     assert_eq!(leftover_fetch_refs(&downstream), "");
@@ -1292,7 +1398,9 @@ fn annotated_tag_base_is_pinned_by_its_commit_and_its_ref_is_deleted() {
     let mgr = manager("tag");
     let mut req = request("s-1", &downstream, "feat/x");
     req.base_branch = Some("v1.0.0".to_owned());
-    let bound = mgr.bind(&req).expect("bind from a tag base");
+    let bound = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect("bind from a tag base");
     assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), commit);
     assert_eq!(leftover_fetch_refs(&downstream), "");
 }
@@ -1314,8 +1422,13 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
         ("refs/pohunek/fetch/taken-same", &main_tip),
     ] {
         git_in(&downstream, &["update-ref", dest, oid]);
-        super::fetch::fetch_into_ref(&downstream, RepoHookLayer::Run, "main", dest)
-            .expect_err("an existing destination must fail the fetch");
+        super::fetch::fetch_into_ref(
+            &downstream,
+            &crate::worktree::GitScope::for_process(),
+            "main",
+            dest,
+        )
+        .expect_err("an existing destination must fail the fetch");
         assert_eq!(&git_stdout(&downstream, &["rev-parse", dest]), oid);
     }
 }
@@ -1329,7 +1442,7 @@ fn fetch_disables_automatic_maintenance() {
     ] {
         let cmd = super::fetch::fetch_command(
             &repo,
-            RepoHookLayer::Run,
+            &crate::worktree::GitScope::for_process(),
             "main",
             "refs/pohunek/fetch/x",
             scope,
@@ -1358,14 +1471,20 @@ fn second_session_on_same_branch_gets_a_clear_in_use_error() {
     let mgr = manager("same-branch");
     let repo = init_repo("same-branch-repo");
     let first = mgr
-        .bind(&request("s-1", &repo, "feat/shared"))
+        .bind(
+            &request("s-1", &repo, "feat/shared"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("first bind");
     assert!(is_valid_worktree(&first.path));
 
     // A different session requesting the SAME branch cannot get a second
     // worktree (git allows one worktree per branch); the error must be clear.
     let err = mgr
-        .bind(&request("s-2", &repo, "feat/shared"))
+        .bind(
+            &request("s-2", &repo, "feat/shared"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("same branch in a second session must fail clearly");
     assert_eq!(err.code, "worktree_branch_in_use", "got: {err:?}");
 }
@@ -1379,7 +1498,9 @@ fn a_requested_base_that_does_not_exist_fails_instead_of_using_the_default_branc
     let mut req = request("s-1", &repo, "feat/x");
     req.base_branch = Some("release/does-not-exist".to_owned());
 
-    let err = mgr.bind(&req).expect_err("a missing base fails the create");
+    let err = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect_err("a missing base fails the create");
 
     assert_eq!(err.code, "invalid_base_branch", "{err:?}");
     assert!(err.msg.contains("release/does-not-exist"), "{err:?}");
@@ -1408,7 +1529,7 @@ fn a_requested_base_that_cannot_be_fetched_fails_naming_the_fetch_failure() {
     req.base_branch = Some("stacked/base-4".to_owned());
 
     let err = mgr
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect_err("a base that is neither local nor fetchable fails the create");
 
     assert_eq!(err.code, "base_branch_fetch_failed", "{err:?}");
@@ -1443,7 +1564,7 @@ fn a_local_requested_base_is_used_when_its_fetch_fails_with_a_fetch_warning_only
     req.base_branch = Some("release".to_owned());
 
     let bound = mgr
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect("a local base survives a failed fetch");
 
     assert_eq!(bound.base_branch, "release");
@@ -1472,7 +1593,10 @@ fn a_create_without_a_base_still_starts_from_the_current_branch_when_fetch_fails
     let repo = repo_with_an_unreachable_origin("no-base-fetch-fails-repo");
 
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("a request without a base falls back to the current branch");
 
     assert_eq!(bound.base_branch, "main");
@@ -1500,7 +1624,9 @@ fn an_explicit_base_ignored_for_an_existing_branch_at_another_commit_is_reported
     let mut req = request("s-1", &repo, "feat/x");
     req.base_branch = Some("main".to_owned());
 
-    let bound = mgr.bind(&req).expect("bind checks the existing branch out");
+    let bound = mgr
+        .bind(&req, &crate::runtime::SearchPath::process())
+        .expect("bind checks the existing branch out");
 
     assert_eq!(
         git_stdout(&bound.path, &["rev-parse", "HEAD"]),
@@ -1555,7 +1681,7 @@ fn a_local_branch_behind_its_origin_named_as_its_own_base_is_reported() {
     let mut req = request("s-1", &downstream, "pr/head");
     req.base_branch = Some("pr/head".to_owned());
     let bound = manager("adopt")
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect("bind the local head branch");
 
     assert_eq!(
@@ -1587,7 +1713,7 @@ fn a_branch_a_pre_create_hook_moves_off_the_base_is_reported_as_checked_out() {
     req.base_branch = Some("main".to_owned());
 
     let bound = manager("base-moved")
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect("bind the moved branch");
 
     assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), moved_to);
@@ -1611,7 +1737,7 @@ fn a_tag_named_like_the_local_base_does_not_decide_the_base_commit() {
     req.base_branch = Some("main".to_owned());
 
     let bound = manager("base-tag")
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect("bind at the base commit");
 
     assert!(
@@ -1630,7 +1756,10 @@ fn an_existing_branch_without_an_explicit_base_or_at_the_base_commit_is_not_repo
 
     // No explicit base: an existing branch is the ordinary resume case.
     let bound = manager("base-default")
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind without an explicit base");
     assert!(
         bound
@@ -1646,7 +1775,7 @@ fn an_existing_branch_without_an_explicit_base_or_at_the_base_commit_is_not_repo
     let mut req = request("s-2", &repo, "feat/y");
     req.base_branch = Some("main".to_owned());
     let bound = manager("base-same")
-        .bind(&req)
+        .bind(&req, &crate::runtime::SearchPath::process())
         .expect("bind at the base commit");
     assert!(
         bound
@@ -1671,7 +1800,10 @@ fn fetch_failure_keeps_the_worktree_with_a_warning() {
     );
 
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind falls back when fetch fails");
     assert!(
         is_valid_worktree(&bound.path),
@@ -1703,7 +1835,10 @@ fn failing_setup_script_keeps_the_worktree_with_a_warning() {
     git_in(&repo, &["commit", "-q", "-m", "add failing setup"]);
 
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind keeps worktree despite setup failure");
     assert!(
         is_valid_worktree(&bound.path),
@@ -1726,7 +1861,12 @@ fn successful_setup_script_produces_no_warning() {
     git_in(&repo, &["add", "."]);
     git_in(&repo, &["commit", "-q", "-m", "add ok setup"]);
 
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     assert!(
         bound.warnings.is_empty(),
         "a passing setup script must not warn: {:?}",
@@ -1753,7 +1893,10 @@ fn failing_setup_script_warning_detail_excludes_script_stderr() {
     git_in(&repo, &["commit", "-q", "-m", "add leaking setup"]);
 
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind keeps worktree");
     let warning = bound
         .warnings
@@ -1796,7 +1939,10 @@ fn hanging_setup_script_is_terminated_with_its_forked_children() {
 
     let started = Instant::now();
     let bound = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind returns despite a hanging setup script");
     let elapsed = started.elapsed();
     assert!(
@@ -1903,7 +2049,10 @@ fn binding_persist_failure_rolls_back_the_worktree() {
         return;
     }
 
-    let result = mgr.bind(&request("s-1", &repo, "feat/x"));
+    let result = mgr.bind(
+        &request("s-1", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    );
 
     // Restore perms first so the temp dir is cleanable regardless of the outcome.
     fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o700))
@@ -1927,12 +2076,21 @@ fn binding_persist_failure_rolls_back_the_worktree() {
 fn cleanup_session_removes_only_owned_worktrees() {
     let mgr = manager("cleanup");
     let repo = init_repo("cleanup-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     assert!(bound.path.exists());
 
     // Unknown session: nothing owned, nothing removed.
     let none = mgr
-        .cleanup_session("s-unknown", &mut Vec::new())
+        .cleanup_session(
+            "s-unknown",
+            &crate::runtime::SearchPath::process(),
+            &mut Vec::new(),
+        )
         .expect("cleanup unknown");
     assert_eq!(none, WorktreeCleanup::default());
     assert!(
@@ -1942,7 +2100,11 @@ fn cleanup_session_removes_only_owned_worktrees() {
 
     // Owned session: the tree and its binding are removed.
     let removed = mgr
-        .cleanup_session("s-1", &mut Vec::new())
+        .cleanup_session(
+            "s-1",
+            &crate::runtime::SearchPath::process(),
+            &mut Vec::new(),
+        )
         .expect("cleanup owned");
     assert_eq!(
         removed,
@@ -1970,7 +2132,8 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
     let bind_owned = |session: &str, branch: &str, project: &str| {
         let mut req = request(session, &repo, branch);
         req.project_id = Some(project.to_owned());
-        mgr.bind(&req).expect("bind")
+        mgr.bind(&req, &crate::runtime::SearchPath::process())
+            .expect("bind")
     };
     let a = bind_owned("s-1", "feat/a", "p-1");
     let b = bind_owned("s-2", "feat/b", "p-1");
@@ -1980,7 +2143,12 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
 
     // Pruning p-1 (nothing skipped) removes both of its worktrees, never p-2's.
     let prune = mgr
-        .cleanup_project("p-1", &no_skip, &mut Vec::new())
+        .cleanup_project(
+            "p-1",
+            &no_skip,
+            &crate::runtime::SearchPath::process(),
+            &mut Vec::new(),
+        )
         .expect("cleanup p-1");
     assert_eq!(prune.removed, 2);
     assert!(prune.skipped.is_empty());
@@ -2003,7 +2171,12 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
         .into_iter()
         .collect();
     let prune = mgr
-        .cleanup_project("p-2", &skip, &mut Vec::new())
+        .cleanup_project(
+            "p-2",
+            &skip,
+            &crate::runtime::SearchPath::process(),
+            &mut Vec::new(),
+        )
         .expect("cleanup p-2 skipping c");
     assert_eq!(prune.removed, 0, "the live worktree was skipped");
     assert_eq!(prune.skipped.len(), 1);
@@ -2016,18 +2189,28 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
 
     // With nothing skipped, p-2 is finally removed.
     assert_eq!(
-        mgr.cleanup_project("p-2", &no_skip, &mut Vec::new())
-            .expect("cleanup p-2")
-            .removed,
+        mgr.cleanup_project(
+            "p-2",
+            &no_skip,
+            &crate::runtime::SearchPath::process(),
+            &mut Vec::new()
+        )
+        .expect("cleanup p-2")
+        .removed,
         1
     );
     assert!(!c.path.exists());
 
     // Pruning a project with no owned worktrees is a no-op.
     assert_eq!(
-        mgr.cleanup_project("p-unknown", &no_skip, &mut Vec::new())
-            .expect("cleanup unknown")
-            .removed,
+        mgr.cleanup_project(
+            "p-unknown",
+            &no_skip,
+            &crate::runtime::SearchPath::process(),
+            &mut Vec::new()
+        )
+        .expect("cleanup unknown")
+        .removed,
         0
     );
 }
@@ -2154,7 +2337,10 @@ fn post_create_hook_runs_with_cleared_env_and_exact_allowlist() {
         "#!/bin/sh\nenv > \"$POHUNEK_REPO/hook-env.txt\"\n",
     );
     let bound = mgr
-        .bind(&request("s-hook", &repo, "feat/x"))
+        .bind(
+            &request("s-hook", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind runs post-create hook");
     assert!(bound.warnings.is_empty(), "a passing hook warns nothing");
 
@@ -2220,7 +2406,12 @@ fn post_create_hook_in_hooks_dir_shadows_legacy_setup() {
     git_in(&repo, &["add", "."]);
     git_in(&repo, &["commit", "-q", "-m", "hook + setup"]);
 
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     assert!(
         bound.path.join("post-create-ran").exists(),
         "the hooks/post-create script runs"
@@ -2242,10 +2433,16 @@ fn reused_worktree_fires_no_create_hook() {
         "post-create",
         "#!/bin/sh\necho ran >> \"$POHUNEK_REPO/create-count\"\n",
     );
-    mgr.bind(&request("s-1", &repo, "feat/x"))
-        .expect("first bind");
+    mgr.bind(
+        &request("s-1", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    )
+    .expect("first bind");
     let again = mgr
-        .bind(&request("s-1", &repo, "feat/x"))
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("reuse bind");
     assert!(again.reused, "second bind reuses the worktree");
 
@@ -2274,10 +2471,16 @@ fn remove_hooks_fire_on_cleanup_with_post_remove_in_repository() {
         "post-remove",
         "#!/bin/sh\ntouch \"$POHUNEK_REPO/post-remove-ran\"\n",
     );
-    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    mgr.bind(
+        &request("s-1", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    )
+    .expect("bind");
 
     let mut warnings = Vec::new();
-    let removed = mgr.cleanup_session("s-1", &mut warnings).expect("cleanup");
+    let removed = mgr
+        .cleanup_session("s-1", &crate::runtime::SearchPath::process(), &mut warnings)
+        .expect("cleanup");
     assert_eq!(
         removed,
         WorktreeCleanup {
@@ -2303,11 +2506,17 @@ fn remove_hooks_fire_on_cleanup_with_post_remove_in_repository() {
 fn post_remove_skips_with_warning_when_repository_is_gone() {
     let mgr = manager("hook-remove-repo-gone");
     let repo = init_repo("hook-remove-repo-gone-repo");
-    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    mgr.bind(
+        &request("s-1", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    )
+    .expect("bind");
     fs::remove_dir_all(&repo).expect("delete repository before cleanup");
 
     let mut warnings = Vec::new();
-    let removed = mgr.cleanup_session("s-1", &mut warnings).expect("cleanup");
+    let removed = mgr
+        .cleanup_session("s-1", &crate::runtime::SearchPath::process(), &mut warnings)
+        .expect("cleanup");
 
     // The repository is gone, so `git worktree remove` cannot run: the binding is
     // dropped anyway and the failure is reported rather than counted as cleaned.
@@ -2352,7 +2561,11 @@ fn host_global_and_in_repo_post_create_run_host_global_first() {
         "#!/bin/sh\necho repo >> \"$POHUNEK_REPO/order\"\n",
     );
 
-    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    mgr.bind(
+        &request("s-1", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    )
+    .expect("bind");
     let order = fs::read_to_string(repo.join("order")).expect("order file");
     assert_eq!(
         order.lines().collect::<Vec<_>>(),
@@ -2373,8 +2586,11 @@ fn each_create_hook_logs_its_start_and_its_duration_and_outcome() {
     let repo = init_repo("hook-timing-repo");
     commit_hook(&repo, "post-create", "#!/bin/sh\nexit 3\n");
 
-    mgr.bind(&request("s-timed", &repo, "feat/x"))
-        .expect("bind");
+    mgr.bind(
+        &request("s-timed", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    )
+    .expect("bind");
 
     let text = logs.text();
     for (layer, outcome) in [("host", "succeeded"), ("repository", "failed")] {
@@ -2564,7 +2780,12 @@ echo 'hook output stays private' >&2
     rustix::io::fcntl_setfd(&inheritable, rustix::io::FdFlags::empty())
         .expect("clear close-on-exec");
 
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     assert!(
         bound.warnings.is_empty() && bound.stderr_tails.is_empty(),
         "a successful hook leaves no warning and no tail: {:?}",
@@ -2617,7 +2838,7 @@ echo 'hook output stays private' >&2
 
 /// Asserts `unsaved_work` holds the session for exactly `expected`.
 fn assert_held(mgr: &WorktreeManager, session: &str, expected: SessionRetentionHold) {
-    match mgr.unsaved_work(session) {
+    match mgr.unsaved_work(session, &crate::runtime::SearchPath::process()) {
         WorktreeWork::Held { hold, detail } => {
             assert_eq!(hold, expected, "detail: {detail}");
             assert!(!detail.is_empty(), "a hold always explains itself");
@@ -2630,10 +2851,14 @@ fn assert_held(mgr: &WorktreeManager, session: &str, expected: SessionRetentionH
 fn unsaved_work_clears_a_clean_owned_worktree() {
     let mgr = manager("unsaved-clean");
     let repo = init_repo("unsaved-clean-repo");
-    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    mgr.bind(
+        &request("s-1", &repo, "feat/x"),
+        &crate::runtime::SearchPath::process(),
+    )
+    .expect("bind");
 
     assert_eq!(
-        mgr.unsaved_work("s-1"),
+        mgr.unsaved_work("s-1", &crate::runtime::SearchPath::process()),
         WorktreeWork::Saved,
         "a freshly bound worktree branched off main holds nothing"
     );
@@ -2644,7 +2869,7 @@ fn unsaved_work_clears_a_session_with_no_binding() {
     let mgr = manager("unsaved-unbound");
 
     assert_eq!(
-        mgr.unsaved_work("s-unknown"),
+        mgr.unsaved_work("s-unknown", &crate::runtime::SearchPath::process()),
         WorktreeWork::Saved,
         "a session with no owned worktree has nothing to lose"
     );
@@ -2654,7 +2879,12 @@ fn unsaved_work_clears_a_session_with_no_binding() {
 fn unsaved_work_holds_a_worktree_with_an_uncommitted_change() {
     let mgr = manager("unsaved-dirty");
     let repo = init_repo("unsaved-dirty-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     fs::write(bound.path.join("README.md"), "edited by the agent\n").expect("dirty a tracked file");
 
     assert_held(&mgr, "s-1", SessionRetentionHold::WorktreeUncommitted);
@@ -2664,7 +2894,12 @@ fn unsaved_work_holds_a_worktree_with_an_uncommitted_change() {
 fn unsaved_work_holds_a_worktree_with_an_untracked_file() {
     let mgr = manager("unsaved-untracked");
     let repo = init_repo("unsaved-untracked-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     fs::write(bound.path.join("notes.md"), "scratch work\n").expect("add an untracked file");
 
     assert_held(&mgr, "s-1", SessionRetentionHold::WorktreeUntracked);
@@ -2674,7 +2909,12 @@ fn unsaved_work_holds_a_worktree_with_an_untracked_file() {
 fn unsaved_work_holds_a_worktree_whose_commit_is_in_no_other_ref() {
     let mgr = manager("unsaved-unpushed");
     let repo = init_repo("unsaved-unpushed-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     fs::write(bound.path.join("README.md"), "committed only here\n").expect("edit tracked file");
     git_in(&bound.path, &["add", "."]);
     git_in(&bound.path, &["commit", "-q", "-m", "work in progress"]);
@@ -2686,7 +2926,12 @@ fn unsaved_work_holds_a_worktree_whose_commit_is_in_no_other_ref() {
 fn unsaved_work_clears_a_commit_another_ref_still_contains() {
     let mgr = manager("unsaved-pushed");
     let repo = init_repo("unsaved-pushed-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     fs::write(bound.path.join("README.md"), "committed and shared\n").expect("edit tracked file");
     git_in(&bound.path, &["add", "."]);
     git_in(&bound.path, &["commit", "-q", "-m", "shared work"]);
@@ -2694,14 +2939,22 @@ fn unsaved_work_clears_a_commit_another_ref_still_contains() {
     // survives the checkout's removal either way.
     git_in(&bound.path, &["branch", "review/feat-x"]);
 
-    assert_eq!(mgr.unsaved_work("s-1"), WorktreeWork::Saved);
+    assert_eq!(
+        mgr.unsaved_work("s-1", &crate::runtime::SearchPath::process()),
+        WorktreeWork::Saved
+    );
 }
 
 #[test]
 fn unsaved_work_holds_a_worktree_git_cannot_read() {
     let mgr = manager("unsaved-unreadable");
     let repo = init_repo("unsaved-unreadable-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     // The `.git` file is what makes the directory a worktree; without it git
     // cannot report anything about the checkout that is still on disk.
     fs::remove_file(bound.path.join(".git")).expect("drop the worktree gitdir link");
@@ -2713,11 +2966,16 @@ fn unsaved_work_holds_a_worktree_git_cannot_read() {
 fn unsaved_work_clears_a_binding_whose_checkout_is_already_gone() {
     let mgr = manager("unsaved-vanished");
     let repo = init_repo("unsaved-vanished-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let bound = mgr
+        .bind(
+            &request("s-1", &repo, "feat/x"),
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("bind");
     fs::remove_dir_all(&bound.path).expect("delete the checkout behind git's back");
 
     assert_eq!(
-        mgr.unsaved_work("s-1"),
+        mgr.unsaved_work("s-1", &crate::runtime::SearchPath::process()),
         WorktreeWork::Saved,
         "nothing is on disk, so removal destroys nothing"
     );
@@ -2838,7 +3096,9 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
     }
     let mut switched = request("s-skip", &repo, "review/skip");
     switched.skip_repo_hooks = true;
-    let skipped = mgr.bind(&switched).expect("bind the switched session");
+    let skipped = mgr
+        .bind(&switched, &crate::runtime::SearchPath::process())
+        .expect("bind the switched session");
     assert_eq!(
         filter_runs(),
         "",
@@ -2846,7 +3106,10 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
     );
     assert_eq!(config_hook_runs(), "", "the switched checkout ran no hook");
     let running = mgr
-        .bind(&request("s-run", &repo, "review/run"))
+        .bind(
+            &request("s-run", &repo, "review/run"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect("bind the control session");
     assert!(
         filter_runs().lines().any(|run| run == "smudge"),
@@ -2873,7 +3136,10 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
     };
 
     stale_index(&skipped.path);
-    assert_eq!(mgr.unsaved_work("s-skip"), WorktreeWork::Saved);
+    assert_eq!(
+        mgr.unsaved_work("s-skip", &crate::runtime::SearchPath::process()),
+        WorktreeWork::Saved
+    );
     assert!(!marker.exists(), "the switched check ran no hook");
     assert!(
         !fsmonitor_marker.exists(),
@@ -2883,7 +3149,10 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
     assert_eq!(config_hook_runs(), "", "the switched check ran no hook");
 
     stale_index(&running.path);
-    assert_eq!(mgr.unsaved_work("s-run"), WorktreeWork::Saved);
+    assert_eq!(
+        mgr.unsaved_work("s-run", &crate::runtime::SearchPath::process()),
+        WorktreeWork::Saved
+    );
     assert!(
         marker.exists(),
         "without the switch the check runs the checkout's hook"
@@ -2934,7 +3203,8 @@ fn partial_credential_diagnostics_are_redacted(deadline: bool) {
     let release = state.join("release");
     let ended = state.join("ended");
     let _release = ReleaseOnDrop(release.clone());
-    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let python = crate::agent::trusted_program("python3", &crate::runtime::SearchPath::process())
+        .expect("test Python");
     let hook = repo.join(".git/hooks/post-checkout");
     let suffix = if deadline {
         format!("if os.fork()==0:\n    while not pathlib.Path({:?}).exists(): time.sleep(0.01)\n    try: os.write(2,b'@example.invalid/repo.git')\n    except BrokenPipeError: pass\n    pathlib.Path({:?}).write_text('done')\n    os._exit(0)\n", release.to_str().expect("release path"), ended.to_str().expect("ended path"))
@@ -2946,7 +3216,10 @@ fn partial_credential_diagnostics_are_redacted(deadline: bool) {
     let logs = crate::runtime::lifecycle::tests::LogCapture::default();
     let _subscriber = logs.install();
     let error = manager("partial-url")
-        .bind(&request("first", &repo, "feat/first"))
+        .bind(
+            &request("first", &repo, "feat/first"),
+            &crate::runtime::SearchPath::process(),
+        )
         .expect_err("hook exit 7 fails bind");
     fs::write(&release, "go").expect("release writer");
     if deadline {
@@ -2979,11 +3252,15 @@ fn a_fetch_with_a_pipe_holding_hook_uses_the_remote_tip_and_removes_its_ref() {
     let started = state.join("started");
     let ended = state.join("ended");
     let _release = ReleaseOnDrop(release.clone());
-    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let python = crate::agent::trusted_program("python3", &crate::runtime::SearchPath::process())
+        .expect("test Python");
     let hook = downstream.join(".git/hooks/reference-transaction");
     fs::write(&hook, format!("#!{}\nimport os,sys,time,pathlib\ns=pathlib.Path({:?})\nrefs=sys.stdin.read()\nif sys.argv[1]=='committed' and ' refs/pohunek/fetch/' in refs and not (s/'started').exists():\n    (s/'started').write_text('ready')\n    if os.fork()==0:\n        while not (s/'release').exists(): time.sleep(0.01)\n        (s/'ended').write_text('done')\n        os._exit(0)\nos._exit(0)\n", python.display(), state.to_str().expect("state path"))).expect("write fetch hook");
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("executable hook");
-    let result = manager("held-fetch").bind(&request("first", &downstream, "feat/first"));
+    let result = manager("held-fetch").bind(
+        &request("first", &downstream, "feat/first"),
+        &crate::runtime::SearchPath::process(),
+    );
     fs::write(&release, "go").expect("release fetch writer");
     assert!(started.exists(), "the fetch transaction hook ran");
     pohunek_test_support::wait::poll_until("fetch descendant exits naturally", || {
@@ -3043,8 +3320,13 @@ fn a_remote_branch_fetch_that_times_out_is_a_fetch_failure_and_skips_ls_remote()
     super::fetch::FETCH_COMMAND_TIMEOUT_OVERRIDE
         .with(|timeout| timeout.set(Some(SHORT_FETCH_COMMAND_TIMEOUT)));
 
-    let error = super::remote::plan_remote_branch(&downstream, RepoHookLayer::Run, "main", None)
-        .expect_err("the fetch times out");
+    let error = super::remote::plan_remote_branch(
+        &downstream,
+        &crate::worktree::GitScope::for_process(),
+        "main",
+        None,
+    )
+    .expect_err("the fetch times out");
 
     assert_eq!(error.code, "branch_fetch_failed", "{error:?}");
     assert!(error.msg.contains("timed out"), "{error:?}");

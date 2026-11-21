@@ -848,7 +848,12 @@ async fn the_registry_resolves_homes_from_its_own_launch_environment() {
         )
     };
 
-    let narrow = environment(&["HOME"]).integration_homes().expect("homes");
+    let narrow = {
+        let registry = environment(&["HOME"]);
+        registry
+            .integration_homes(&registry.search_path_snapshot())
+            .expect("homes")
+    };
     let runtime_home = |homes: &ConfigHomes| {
         homes
             .targets(Some(&claude()), &HomeSelection::Runtime)
@@ -866,9 +871,12 @@ async fn the_registry_resolves_homes_from_its_own_launch_environment() {
         .to_path_buf();
     assert_eq!(profile_home, work);
 
-    let forwarding = environment(&["HOME", "CLAUDE_CONFIG_DIR"])
-        .integration_homes()
-        .expect("homes");
+    let forwarding = {
+        let registry = environment(&["HOME", "CLAUDE_CONFIG_DIR"]);
+        registry
+            .integration_homes(&registry.search_path_snapshot())
+            .expect("homes")
+    };
     assert_eq!(
         runtime_home(&forwarding),
         ambient.as_path(),

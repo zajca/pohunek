@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use pohunek_test_support::env::TestEnv;
 
 use super::fetch::fetch_origin;
-use super::{branch_exists, worktree_add_new, worktree_remove, RepoHookLayer};
+use super::{branch_exists, worktree_add_new, worktree_remove};
 
 /// Variables the child starts with: each points Git at a repository, index or
 /// worktree that does not exist.
@@ -49,6 +49,16 @@ const QUARANTINE_VAR: &str = "GIT_QUARANTINE_PATH";
 /// Variable naming the repository the child creates and the parent set as the
 /// ceiling, so the ceiling sits at the project root.
 const REPO_VAR: &str = "POHUNEK_TEST_GIT_REPO";
+
+/// The git scope of a daemon that follows no service manager.
+fn scope() -> super::GitScope {
+    super::GitScope::for_process()
+}
+
+/// `project::detect::git` on the process `PATH`, as project detection runs it.
+fn detected_git(cwd: &Path, args: &[&str]) -> Option<String> {
+    crate::project::detect::git(cwd, args, &crate::runtime::SearchPath::process())
+}
 
 /// Runs a setup `git` command with the test environment's scrubbed variables,
 /// so the ambient variables of the child never reach the fixture itself, and
@@ -107,19 +117,19 @@ fn daemon_git_under_ambient_git_variables() {
     std::fs::write(&shallow, format!("{head}\n")).expect("write shallow file");
     std::fs::write(&graft, format!("{head}\n")).expect("write graft file");
     assert_eq!(
-        crate::project::detect::git(&repo, &["rev-list", "--count", "HEAD"]).as_deref(),
+        detected_git(&repo, &["rev-list", "--count", "HEAD"]).as_deref(),
         Some("3"),
         "the daemon sees the full history"
     );
     assert!(
-        crate::project::detect::git(&repo, &["rev-parse", "--verify", "HEAD^"]).is_some(),
+        detected_git(&repo, &["rev-parse", "--verify", "HEAD^"]).is_some(),
         "the parent of HEAD resolves"
     );
     std::fs::remove_file(&shallow).expect("remove shallow file");
     std::fs::remove_file(&graft).expect("remove graft file");
 
     // Project detection addresses the project's repository.
-    let toplevel = crate::project::detect::git(&repo, &["rev-parse", "--show-toplevel"])
+    let toplevel = detected_git(&repo, &["rev-parse", "--show-toplevel"])
         .expect("detection reaches the project repository");
     assert_eq!(
         std::fs::canonicalize(toplevel).expect("canonical toplevel"),
@@ -130,7 +140,7 @@ fn daemon_git_under_ambient_git_variables() {
     // are often nested inside the project: detection still finds it.
     let nested = repo.join("crates/daemon/src");
     std::fs::create_dir_all(&nested).expect("create nested directory");
-    let toplevel = crate::project::detect::git(&nested, &["rev-parse", "--show-toplevel"])
+    let toplevel = detected_git(&nested, &["rev-parse", "--show-toplevel"])
         .expect("detection from a nested directory reaches the project repository");
     assert_eq!(
         std::fs::canonicalize(toplevel).expect("canonical toplevel"),
@@ -139,14 +149,10 @@ fn daemon_git_under_ambient_git_variables() {
 
     // A worktree operation addresses the same repository.
     let checkout = env.root().join("checkout");
-    worktree_add_new(&repo, RepoHookLayer::Run, &checkout, "feature", "main")
-        .expect("add worktree");
+    worktree_add_new(&repo, &scope(), &checkout, "feature", "main").expect("add worktree");
     assert!(checkout.join("README.md").is_file());
-    assert_eq!(
-        branch_exists(&repo, RepoHookLayer::Run, "feature"),
-        Ok(true)
-    );
-    worktree_remove(&repo, RepoHookLayer::Run, &checkout).expect("remove worktree");
+    assert_eq!(branch_exists(&repo, &scope(), "feature"), Ok(true));
+    worktree_remove(&repo, &scope(), &checkout).expect("remove worktree");
     assert!(!checkout.exists());
 
     // The quarantine marker forbids ref updates of any git child that sees it,
@@ -156,19 +162,13 @@ fn daemon_git_under_ambient_git_variables() {
         "the child starts with the quarantine marker set to an existing directory"
     );
     let quarantined = env.root().join("quarantined");
-    worktree_add_new(
-        &repo,
-        RepoHookLayer::Run,
-        &quarantined,
-        "quarantined-feature",
-        "main",
-    )
-    .expect("add worktree despite the quarantine marker");
+    worktree_add_new(&repo, &scope(), &quarantined, "quarantined-feature", "main")
+        .expect("add worktree despite the quarantine marker");
     assert_eq!(
-        branch_exists(&repo, RepoHookLayer::Run, "quarantined-feature"),
+        branch_exists(&repo, &scope(), "quarantined-feature"),
         Ok(true)
     );
-    worktree_remove(&repo, RepoHookLayer::Run, &quarantined).expect("remove quarantined worktree");
+    worktree_remove(&repo, &scope(), &quarantined).expect("remove quarantined worktree");
 
     // A replace ref substitutes `HEAD` with the first commit; the daemon applies
     // it like the fixture does.
@@ -177,7 +177,7 @@ fn daemon_git_under_ambient_git_variables() {
     let expected = fixture_git(&env, &repo, &["rev-list", "--count", "HEAD"]);
     assert_eq!(expected, "1");
     assert_eq!(
-        crate::project::detect::git(&repo, &["rev-list", "--count", "HEAD"]).as_deref(),
+        detected_git(&repo, &["rev-list", "--count", "HEAD"]).as_deref(),
         Some(expected.as_str()),
         "the daemon applies the repository's replace refs"
     );
@@ -275,8 +275,7 @@ fn daemon_worktree_add_ignores_command_scoped_hooks_path() {
     std::fs::remove_file(&marker).expect("remove marker");
 
     let checkout = env.root().join("checkout");
-    worktree_add_new(&repo, RepoHookLayer::Run, &checkout, "feature", "main")
-        .expect("add worktree");
+    worktree_add_new(&repo, &scope(), &checkout, "feature", "main").expect("add worktree");
     assert!(checkout.is_dir());
     assert!(
         !marker.exists(),
@@ -407,8 +406,7 @@ fn daemon_fetch_under_exec_path() {
     assert!(marker.is_file(), "the inherited exec path runs the helper");
     std::fs::remove_file(&marker).expect("remove marker");
 
-    fetch_origin(&repo, RepoHookLayer::Run, "main")
-        .expect_err("the fetch from an unreachable remote fails");
+    fetch_origin(&repo, &scope(), "main").expect_err("the fetch from an unreachable remote fails");
     assert!(
         !marker.exists(),
         "the daemon's fetch ran a helper from the inherited GIT_EXEC_PATH"
@@ -567,8 +565,7 @@ fn daemon_git_subprocesses_under_user_variables() {
 
     // The daemon's fetch reaches the same transport with the persistent
     // variables only.
-    fetch_origin(&repo, RepoHookLayer::Run, "main")
-        .expect_err("the fetch from an unreachable remote fails");
+    fetch_origin(&repo, &scope(), "main").expect_err("the fetch from an unreachable remote fails");
     let fetch_names = recorded_names(&fetch_record);
     for (name, _) in KEPT_USER_VARS {
         assert!(
@@ -591,7 +588,7 @@ fn daemon_git_subprocesses_under_user_variables() {
     // The checkout of a new worktree runs the smudge filter with the same set.
     worktree_add_new(
         &repo,
-        RepoHookLayer::Run,
+        &scope(),
         &env.root().join("checkout"),
         "feature",
         "main",
@@ -688,8 +685,8 @@ fn daemon_fetch_under_protocol_trust_marker() {
         "the inherited trust marker must refuse the user-allowed protocol"
     );
 
-    let fetched = fetch_origin(&repo, RepoHookLayer::Run, "main")
-        .expect("the daemon's fetch is user-initiated");
+    let fetched =
+        fetch_origin(&repo, &scope(), "main").expect("the daemon's fetch is user-initiated");
     assert_eq!(
         fetched.commit,
         fixture_git(&env, &source, &["rev-parse", "HEAD"])
