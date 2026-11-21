@@ -218,7 +218,7 @@ pub use resume::ProfileChange;
 use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
-pub use tmpdir::store_session_tmp_root;
+pub use tmpdir::{session_tmp_base_problem, store_session_tmp_root};
 pub(crate) use turn_events::{TurnEdge, TurnEvents, TurnId, TurnOwner, TurnVerdict};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -555,10 +555,12 @@ pub struct SessionRegistryConfig {
     /// repo+branch fails (no silent default).
     pub worktree_root: Option<PathBuf>,
     /// Root of the sessions' private temporary directories
-    /// (`<cache_dir>/session-tmp/<store key>`, see
+    /// (`<namespace.session_tmp_root>/<store key>`, see
     /// [`store_session_tmp_root`]); each launch exports its session's
-    /// directory below it as `TMPDIR`. `None` launches sessions with the
-    /// `TMPDIR` of their profile or of the forwarded daemon environment.
+    /// directory below it as `TMPDIR`. The configured root above the store
+    /// key must exist: the registry never creates it. `None` launches sessions
+    /// with the `TMPDIR` of their profile or of the forwarded daemon
+    /// environment.
     pub session_tmp_root: Option<PathBuf>,
     /// Wall-clock bound on each worktree/session lifecycle hook. A hook that
     /// exceeds it is terminated and recorded/logged as a non-fatal hook warning,

@@ -1548,8 +1548,8 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 /// Loads the installation recorded at `context.config_path()` and verifies
 /// its namespace inputs against the running process.
 ///
-/// The read is the upgrade-source read: a previous release's schema-2,
-/// schema-3 to schema-6 installation is reported, connected to,
+/// The read is the upgrade-source read: a previous release's schema-2 to
+/// schema-7 installation is reported, connected to,
 /// checked, and uninstalled by this version like a current one, while schemas
 /// this binary neither writes nor upgrades from stay refused.
 ///
@@ -1566,7 +1566,8 @@ fn verified_config(context: &Context) -> Result<ServiceConfig, Error> {
 ///
 /// See [`verified_connection`].
 fn verified_config_source(context: &Context) -> Result<UpgradeSource, Error> {
-    let source = ServiceConfig::load_upgrade_source(&context.config_path())?;
+    let source =
+        ServiceConfig::load_upgrade_source(&context.config_path(), &context.paths().cache_dir)?;
     source.config.verify_installation(
         context.uid(),
         &context.paths().state_dir,

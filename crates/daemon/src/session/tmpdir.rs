@@ -1,13 +1,21 @@
 //! The private temporary directory of each session.
 //!
 //! Every launched session gets `TMPDIR=<root>/<session id>`, where `root` is
-//! `<cache_dir>/session-tmp/<store key>` below the daemon's private cache
-//! directory ([`store_session_tmp_root`]), so concurrent agents never share
-//! temporary file names. A profile that sets `TMPDIR` in its `[env]` keeps its
-//! own value. The directory survives a stop and a resume of the same session
-//! and is deleted when the session is removed. Daemon startup deletes the
-//! directories that no startup evidence names, which a crash or a failed
-//! deletion can leave behind, and keeps them all when it cannot tell.
+//! `<base>/<store key>` and `base` is the configured session temporary root
+//! (`namespace.session_tmp_root` of `service.toml`, see
+//! [`store_session_tmp_root`]), so concurrent agents never share temporary file
+//! names. A profile that sets `TMPDIR` in its `[env]` keeps its own value. The
+//! directory survives a stop and a resume of the same session and is deleted
+//! when the session is removed. Daemon startup deletes the directories that no
+//! startup evidence names, which a crash or a failed deletion can leave behind,
+//! and keeps them all when it cannot tell.
+//!
+//! The daemon never creates `base`: on a filesystem that is not mounted, a
+//! created root would silently land in the empty mount point. A launch fails
+//! with `session_tmpdir_failed` when `base` is missing and with
+//! `session_tmpdir_unsafe` when it is not a `0700` directory of the daemon's
+//! user reached without a symlink; both name `base`. The store key directory
+//! and the session directories below `base` are created as needed.
 
 // Rust guideline compliant 2026-10-14
 
@@ -234,16 +242,16 @@ impl TmpdirOwners {
     }
 }
 
-/// The private temporary directory root of the store at `store_path` below
-/// `cache_root`: `<cache_root>/<store key>`, where the key is the first 16 hex
-/// digits of the SHA-256 of the store's canonical path. Daemons with different
-/// stores that share a cache directory therefore never share a root, and each
-/// startup sweep stays inside its own.
+/// The private temporary directory root of the store at `store_path` below the
+/// configured session temporary root `base`: `<base>/<store key>`, where the
+/// key is the first 16 hex digits of the SHA-256 of the store's canonical path.
+/// Daemons with different stores that share a `base` therefore never share a
+/// root, and each startup sweep stays inside its own.
 ///
 /// # Errors
 ///
 /// Returns the I/O error when the store's directory cannot be canonicalized.
-pub fn store_session_tmp_root(cache_root: &Path, store_path: &Path) -> std::io::Result<PathBuf> {
+pub fn store_session_tmp_root(base: &Path, store_path: &Path) -> std::io::Result<PathBuf> {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
 
@@ -265,7 +273,7 @@ pub fn store_session_tmp_root(cache_root: &Path, store_path: &Path) -> std::io::
     for byte in digest.iter().take(STORE_KEY_BYTES) {
         let _ = write!(key, "{byte:02x}");
     }
-    Ok(cache_root.join(key))
+    Ok(base.join(key))
 }
 
 /// Bytes of the store path digest that name a store's temporary root.
@@ -278,16 +286,19 @@ pub(super) fn session_tmpdir(root: &Path, id: &SessionId) -> PathBuf {
 
 /// Opens or creates the private temporary directory of `id`.
 ///
-/// The directory holding the store roots, the store's root and the session
-/// directory are created with mode 0700 and must be directories of the
-/// daemon's user with exactly that mode, reached without following a symlink.
+/// The configured root (the parent of `root`) must already exist. It and the
+/// store's root and the session directory below it must be directories of the
+/// daemon's user with mode 0700, reached without following a symlink; the
+/// store's root and the session directory are created when missing, the
+/// configured root never.
 ///
 /// # Errors
 ///
 /// Returns `session_tmpdir_unsafe` when an existing entry fails those checks,
-/// and `session_tmpdir_failed` when the directory cannot be created.
+/// and `session_tmpdir_failed` when the configured root is missing or a
+/// directory below it cannot be created.
 pub(super) fn ensure(root: &Path, id: &SessionId) -> Result<PathBuf, ProtocolError> {
-    let (Some(store_roots), Some(key)) = (root.parent(), root.file_name()) else {
+    let (Some(base), Some(key)) = (root.parent(), root.file_name()) else {
         return Err(ProtocolError::new(
             ErrorClass::Runtime,
             "session_tmpdir_failed",
@@ -298,9 +309,9 @@ pub(super) fn ensure(root: &Path, id: &SessionId) -> Result<PathBuf, ProtocolErr
             None,
         ));
     };
-    let store_roots_dir = TrustedDir::open_or_create_absolute(store_roots, PRIVATE_DIR_MODE)
-        .map_err(|error| tmpdir_error(&error))?;
-    let root_dir = store_roots_dir
+    let base_dir = TrustedDir::open_absolute(base, PRIVATE_DIR_MODE)
+        .map_err(|error| base_error(base, &error))?;
+    let root_dir = base_dir
         .open_or_create_child(key, PRIVATE_DIR_MODE)
         .map_err(|error| tmpdir_error(&error))?;
     let session_dir = root_dir
@@ -574,6 +585,44 @@ fn child_names(dir: &OwnedFd) -> std::io::Result<Vec<OsString>> {
         }
     }
     Ok(names)
+}
+
+/// Why the configured session temporary root `base` cannot be used, or `None`
+/// when it is an existing directory of the daemon's user with mode 0700
+/// reached without a symlink. Used by the start-up warning; creates nothing.
+#[must_use]
+pub fn session_tmp_base_problem(base: &Path) -> Option<String> {
+    match TrustedDir::open_absolute(base, PRIVATE_DIR_MODE) {
+        Ok(_) => None,
+        Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+            Some("it does not exist and the daemon never creates it".to_owned())
+        }
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+/// The launch error for a configured root `base` that cannot be opened: a
+/// missing root is `session_tmpdir_failed`, an unsafe one
+/// `session_tmpdir_unsafe`; both name `base`.
+fn base_error(base: &Path, error: &FsError) -> ProtocolError {
+    if error.io_kind() == Some(std::io::ErrorKind::NotFound) {
+        return ProtocolError::new(
+            ErrorClass::Runtime,
+            "session_tmpdir_failed",
+            format!(
+                "the configured session temporary root {} does not exist; \
+                 the daemon never creates it",
+                base.display()
+            ),
+            None,
+        );
+    }
+    let mut protocol = tmpdir_error(error);
+    protocol.msg = format!(
+        "the configured session temporary root {} is not usable: {error}",
+        base.display()
+    );
+    protocol
 }
 
 fn tmpdir_error(error: &FsError) -> ProtocolError {

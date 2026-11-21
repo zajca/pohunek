@@ -1284,11 +1284,15 @@ key lives and dies with the session.
 ## Temporary directory
 
 Each session's agent runs with `TMPDIR` set to the session's own directory,
-`<cache_dir>/session-tmp/<store key>/<session id>` below Pohunek's cache
-directory (`$XDG_CACHE_HOME/pohunek` or the platform cache path), so agents
-running side by side never overwrite each other's temporary files. The store
-key comes from the metadata store's path, so two daemons with different stores
-never share a directory. The directory is private
+`<session_tmp_root>/<store key>/<session id>`, so agents running side by side
+never overwrite each other's temporary files. `session_tmp_root` is
+`namespace.session_tmp_root` of `service.toml`: by default `<cache_dir>/session-tmp`
+below Pohunek's cache directory (`$XDG_CACHE_HOME/pohunek` or the platform cache
+path), or another absolute path the operator chose, for example on a data disk. The
+store key comes from the metadata store's path, so two daemons with different
+stores never share a directory. The daemon never creates `session_tmp_root` (an
+unmounted disk would otherwise get the root in its empty mount point); the
+installer creates only the default one, and a root the operator set must exist. The directory is private
 (mode 0700) and replaces a `TMPDIR` forwarded from the daemon's environment. A
 profile that sets `TMPDIR` in its `[env]` keeps that value instead. Stopping a
 session keeps the directory and resuming it reuses it; removing the session,
@@ -1300,7 +1304,10 @@ rejected that names the session, a worker or its claimed session, a
 service-manager job or a worker journal names it. When it cannot tell, because
 worker discovery, the job listing or the journal scan failed, or a rejected
 store line names no session, it deletes nothing. A launch whose directory is not a private directory of the daemon's user fails
-with `session_tmpdir_unsafe` before the agent starts.
+with `session_tmpdir_unsafe`, and one whose `session_tmp_root` is missing with
+`session_tmpdir_failed`, before the agent starts; the message names the root,
+and the daemon keeps serving other sessions. The daemon logs one warning
+(`session.tmp_root_unusable`) at start when the root is missing or unsafe.
 
 ## Retention
 

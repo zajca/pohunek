@@ -940,10 +940,10 @@ mod tests {
         assert!(working_directory_check(Platform::MacOs, &ok).is_none());
     }
 
-    /// A current-schema (7) `service.toml` with the given extra lines in `[limits]`.
+    /// A current-schema (8) `service.toml` with the given extra lines in `[limits]`.
     fn service_toml(extra_limits: &str) -> String {
         format!(
-            r#"schema_version = 7
+            r#"schema_version = 8
 prefix = "/home/u/.local"
 active_version = "0.35.2"
 
@@ -951,6 +951,7 @@ active_version = "0.35.2"
 uid = 1000
 state_root = "/home/u/.local/state/pohunek"
 runtime_root = "/run/user/1000/pohunek"
+session_tmp_root = "/home/u/.cache/pohunek/session-tmp"
 
 [deadlines]
 worker_connect_ms = 10000

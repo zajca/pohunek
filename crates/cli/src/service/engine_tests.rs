@@ -1531,8 +1531,8 @@ async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_l
     harness.context = discovering(&harness.context, &harness.root, "shell-a", &recorded);
     harness.install(V1).await.expect("install");
     let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     let before = config_bytes(&harness);
 
@@ -1556,8 +1556,8 @@ async fn refresh_path_refuses_an_older_schema_file_with_the_working_remedy_and_l
     );
     assert_eq!(config_bytes(&harness), before, "service.toml is untouched");
 
-    let newer = text.replacen("schema_version = 7", "schema_version = 8", 1);
-    std::fs::write(harness.context.config_path(), &newer).expect("write schema 8");
+    let newer = text.replacen("schema_version = 8", "schema_version = 9", 1);
+    std::fs::write(harness.context.config_path(), &newer).expect("write schema 9");
     let error = refresh(&harness, false).await.expect_err("newer schema");
     assert_eq!(error.code(), "service_refresh_config_schema", "{error}");
     let hint = error.hint().expect("hint");

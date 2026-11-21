@@ -62,12 +62,13 @@
 //!
 //! # Config migration
 //!
-//! A `service.toml` written by a previous release (`schema_version` 2, 3, 4, 5 or 6,
+//! A `service.toml` written by a previous release (`schema_version` 2 to 7,
 //! in contrast to this crate's [`SCHEMA_VERSION`]) is read only at the
 //! upgrade boundary, through `ServiceConfig::load_upgrade_source`, which
 //! assigns the documented defaults to the keys that schema lacks (input
 //! timings, the write stall bound, turn-wait timings, the `[hooks]` stderr
-//! tail size, and the `[events]` journal retention) explicitly. Its upgrade is a dedicated
+//! tail size, the `[events]` journal retention, and the cache-based
+//! `namespace.session_tmp_root`) explicitly. Its upgrade is a dedicated
 //! migration flavor of the transaction, journaled in the record's
 //! `config_backup` (`source_schema_version` and the SHA-256 of the exact
 //! pre-upgrade bytes), with two consequences for ordering:
@@ -790,12 +791,13 @@ impl<'a> Engine<'a> {
         );
         let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The file is read as an upgrade source, so a previous release's
-        // schema-2 to schema-6 installation upgrades into this one
+        // schema-2 to schema-7 installation upgrades into this one
         // instead of being refused: the migration below carries its exact bytes
         // and schema.
-        let source = load_config_for_upgrade(&config_path)?.ok_or(Error::NotInstalled {
-            path: config_path.clone(),
-        })?;
+        let source = load_config_for_upgrade(&config_path, &self.context.paths().cache_dir)?
+            .ok_or(Error::NotInstalled {
+                path: config_path.clone(),
+            })?;
         if let Some(record) = &resume {
             // A resumed migration verifies its backup journal before any
             // further effect, so a moved, missing, or altered backup fails
@@ -947,7 +949,7 @@ impl<'a> Engine<'a> {
         let layout = match plan {
             Plan::Fresh => {
                 let config_path = self.context.config_path();
-                load_config_for_upgrade(&config_path)?
+                load_config_for_upgrade(&config_path, &self.context.paths().cache_dir)?
                     .ok_or(Error::NotInstalled { path: config_path })?
                     .config
                     .layout()
@@ -973,9 +975,11 @@ impl<'a> Engine<'a> {
         // Only a fresh plan needs the installed version, which a rollback
         // would otherwise replace.
         let installed = match plan {
-            Plan::Fresh => {
-                load_config_for_upgrade(&self.context.config_path())?.map(|source| source.config)
-            }
+            Plan::Fresh => load_config_for_upgrade(
+                &self.context.config_path(),
+                &self.context.paths().cache_dir,
+            )?
+            .map(|source| source.config),
             Plan::Resume(_) | Plan::RollBack(_) => None,
         };
         if !swaps_daemon(
@@ -1030,11 +1034,11 @@ impl<'a> Engine<'a> {
         let registered = self.resolve_uninstall_pending(options, &mut report).await?;
         let config_path = self.context.config_path();
         // The uninstall reads the installed configuration as an upgrade
-        // source, so it removes a previous release's schema-2, schema-3,
-        // schema-4, schema-5 or schema-6 installation with this version as well, without
-        // a migration.
+        // source, so it removes a previous release's schema-2 to schema-7
+        // installation with this version as well, without a migration.
         let config = match (
-            load_config_for_upgrade(&config_path)?.map(|source| source.config),
+            load_config_for_upgrade(&config_path, &self.context.paths().cache_dir)?
+                .map(|source| source.config),
             &registered,
         ) {
             (Some(config), _) => config,
@@ -1294,6 +1298,8 @@ impl<'a> Engine<'a> {
         self.checkpoint(Step::StopDaemon)?;
 
         if record.step < Step::Config {
+            self.context
+                .prepare_default_session_tmp_root(config.session_tmp_root())?;
             config.write(&self.context.config_path())?;
             self.advance(record, Step::Config)?;
         }
@@ -1543,11 +1549,11 @@ impl<'a> Engine<'a> {
         record: &Record,
         backup: &ConfigBackup,
     ) -> Result<UpgradeSource, Error> {
-        let source = load_config_for_upgrade(&self.context.config_path())?.ok_or_else(|| {
-            Error::NotInstalled {
-                path: self.context.config_path(),
-            }
-        })?;
+        let source =
+            load_config_for_upgrade(&self.context.config_path(), &self.context.paths().cache_dir)?
+                .ok_or_else(|| Error::NotInstalled {
+                    path: self.context.config_path(),
+                })?;
         verify_migration_source(self.context, record, backup, &source)?;
         Ok(source)
     }
@@ -1672,7 +1678,7 @@ impl<'a> Engine<'a> {
         if record.operation != Operation::Upgrade {
             return Ok(());
         }
-        if load_config_for_upgrade(&self.context.config_path())?
+        if load_config_for_upgrade(&self.context.config_path(), &self.context.paths().cache_dir)?
             .is_some_and(|source| !source.config.search_path().is_empty())
         {
             return Ok(());
@@ -2179,7 +2185,8 @@ impl<'a> Engine<'a> {
             path: self.store.path(),
             detail: "migration rollback has no config backup".to_owned(),
         })?;
-        let current = ServiceConfig::load_upgrade_source(config_path)?;
+        let current =
+            ServiceConfig::load_upgrade_source(config_path, &self.context.paths().cache_dir)?;
         verify_pending_migration(self.context, &self.store, record, &current)?;
         let source = if record.step <= Step::StopDaemon {
             if record.step == Step::StopDaemon && digest_mismatch(current.original_bytes(), backup)
@@ -2188,7 +2195,11 @@ impl<'a> Engine<'a> {
                     .store
                     .read_config_backup()?
                     .ok_or_else(|| backup_error(self.store.config_backup_path(), "is missing"))?;
-                ServiceConfig::load_upgrade_source_bytes(&self.store.config_backup_path(), &bytes)?
+                ServiceConfig::load_upgrade_source_bytes(
+                    &self.store.config_backup_path(),
+                    &bytes,
+                    &self.context.paths().cache_dir,
+                )?
             } else {
                 current
             }
@@ -2197,7 +2208,11 @@ impl<'a> Engine<'a> {
                 .store
                 .read_config_backup()?
                 .ok_or_else(|| backup_error(self.store.config_backup_path(), "is missing"))?;
-            ServiceConfig::load_upgrade_source_bytes(config_path, &bytes)?
+            ServiceConfig::load_upgrade_source_bytes(
+                config_path,
+                &bytes,
+                &self.context.paths().cache_dir,
+            )?
         };
         if digest_mismatch(source.original_bytes(), backup) {
             let path = if record.step < Step::Config {
@@ -3314,9 +3329,10 @@ fn persisted_path_warnings(_context: &Context, _job: &JobPath) -> Vec<String> {
 /// configuration gives the job, with the launchd default the upgrade journaled
 /// while the previous job was loaded standing in when the job is not loaded.
 pub(crate) async fn journal_job_path(context: &Context, record: &Record) -> Result<JobPath, Error> {
-    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
-        path: context.config_path(),
-    })?;
+    let source = load_config_for_upgrade(&context.config_path(), &context.paths().cache_dir)?
+        .ok_or(Error::NotInstalled {
+            path: context.config_path(),
+        })?;
     job_path_for(
         context,
         &source.config,
@@ -3508,7 +3524,8 @@ pub(crate) fn upgrade_preflight(context: &Context) -> Result<(), Error> {
 /// Checks every directory install or upgrade writes into.
 ///
 /// Those are the prefix, `<prefix>/bin`, `<prefix>/libexec`, the versions
-/// directory, and the directory of `service.toml`; a missing one is judged
+/// directory, the directory of `service.toml`, and the default session
+/// temporary root; a missing one is judged
 /// by its nearest existing ancestor, below which it will be created.
 ///
 /// # Errors
@@ -3518,12 +3535,15 @@ pub(crate) fn check_layout_dirs(context: &Context, layout: &InstallLayout) -> Re
     let versions = layout.versions_dir();
     let bin = layout.bin_dir();
     let config_path = context.config_path();
+    let session_tmp_root =
+        pohunek_service_config::default_session_tmp_root(&context.paths().cache_dir);
     let directories = [
         Some(layout.prefix()),
         Some(bin.as_path()),
         versions.parent(),
         Some(versions.as_path()),
         config_path.parent(),
+        Some(session_tmp_root.as_path()),
     ];
     for directory in directories.into_iter().flatten() {
         layout::check_trusted(directory)?;
@@ -3676,12 +3696,12 @@ fn load_config(path: &Path) -> Result<Option<ServiceConfig>, Error> {
 /// Loads `service.toml` as an upgrade source, or `None` when it does not
 /// exist.
 ///
-/// The current schema and the previous schemas 2, 3, 4 and 5 are accepted; a
+/// The current schema and the previous schemas 2 to 7 are accepted; a
 /// schema the binary neither writes nor upgrades from is refused with its
 /// regular error, which names `pohunek service uninstall` and `install`.
-fn load_config_for_upgrade(path: &Path) -> Result<Option<UpgradeSource>, Error> {
+fn load_config_for_upgrade(path: &Path, cache_dir: &Path) -> Result<Option<UpgradeSource>, Error> {
     if file_exists(path)? {
-        Ok(Some(ServiceConfig::load_upgrade_source(path)?))
+        Ok(Some(ServiceConfig::load_upgrade_source(path, cache_dir)?))
     } else {
         Ok(None)
     }
@@ -3728,9 +3748,10 @@ pub(crate) async fn adoption_job_path(
     let Some(record) = pending else {
         return installed_job_path(context).await;
     };
-    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
-        path: context.config_path(),
-    })?;
+    let source = load_config_for_upgrade(&context.config_path(), &context.paths().cache_dir)?
+        .ok_or(Error::NotInstalled {
+            path: context.config_path(),
+        })?;
     let config = if record.operation == Operation::RefreshPath {
         let record_error = |detail: String| Error::Record {
             path: context.paths().state_dir.join(record::FILE_NAME),
@@ -3761,9 +3782,10 @@ async fn installed_job_path_in(
     journal_default: Option<JournalDefault<'_>>,
     usage: PathUse,
 ) -> Result<JobPath, Error> {
-    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
-        path: context.config_path(),
-    })?;
+    let source = load_config_for_upgrade(&context.config_path(), &context.paths().cache_dir)?
+        .ok_or(Error::NotInstalled {
+            path: context.config_path(),
+        })?;
     job_path_for(context, &source.config, journal_default, usage).await
 }
 
@@ -3774,9 +3796,10 @@ async fn installed_job_path_in(
 ///
 /// See [`job_path`].
 pub(crate) async fn installed_job_search_path(context: &Context) -> Result<JobPath, Error> {
-    let source = load_config_for_upgrade(&context.config_path())?.ok_or(Error::NotInstalled {
-        path: context.config_path(),
-    })?;
+    let source = load_config_for_upgrade(&context.config_path(), &context.paths().cache_dir)?
+        .ok_or(Error::NotInstalled {
+            path: context.config_path(),
+        })?;
     job_search_path(context, &source.config, None).await
 }
 
@@ -4553,8 +4576,11 @@ pub(crate) fn verify_pending_migration(
             ));
         }
         if record.step >= Step::StopDaemon {
-            let previous =
-                ServiceConfig::load_upgrade_source_bytes(&store.config_backup_path(), &bytes)?;
+            let previous = ServiceConfig::load_upgrade_source_bytes(
+                &store.config_backup_path(),
+                &bytes,
+                &context.paths().cache_dir,
+            )?;
             if previous.source_schema_version != backup.source_schema_version {
                 return Err(backup_error(
                     store.config_backup_path(),

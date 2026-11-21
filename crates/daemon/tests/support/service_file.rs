@@ -29,9 +29,18 @@ pub(crate) fn write_service_file(
     prefix: &Path,
     state_root: &Path,
     runtime_root: &Path,
+    session_tmp_root: &Path,
     allowlist: &[String],
 ) {
-    write_service_file_at(path, prefix, state_root, runtime_root, allowlist, "0.34.2");
+    write_service_file_at(
+        path,
+        prefix,
+        state_root,
+        runtime_root,
+        session_tmp_root,
+        allowlist,
+        "0.34.2",
+    );
 }
 
 /// [`write_service_file`] for an installation whose active version is
@@ -41,6 +50,7 @@ pub(crate) fn write_service_file_at(
     prefix: &Path,
     state_root: &Path,
     runtime_root: &Path,
+    session_tmp_root: &Path,
     allowlist: &[String],
     active_version: &str,
 ) {
@@ -50,6 +60,7 @@ pub(crate) fn write_service_file_at(
         uid: nix::unistd::Uid::effective().as_raw(),
         state_root: state_root.to_path_buf(),
         runtime_root: runtime_root.to_path_buf(),
+        session_tmp_root: session_tmp_root.to_path_buf(),
         deadlines: Deadlines {
             worker_connect: Duration::from_secs(20),
             worker_initialize: Duration::from_secs(45),

@@ -310,6 +310,27 @@ impl Context {
         ))
     }
 
+    /// Creates the session temporary root `configured` records when it is the
+    /// cache-based default, owner-private; any other value is left alone.
+    ///
+    /// The daemon never creates the configured root, so the installer provides
+    /// the one location it chose itself. A root the operator pointed elsewhere
+    /// (for example onto another disk) must exist before the daemon needs it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a filesystem error when the default root or an ancestor is
+    /// unsafe or cannot be created.
+    pub fn prepare_default_session_tmp_root(&self, configured: &Path) -> Result<(), Error> {
+        let default = pohunek_service_config::default_session_tmp_root(&self.paths.cache_dir);
+        if configured != default {
+            return Ok(());
+        }
+        TrustedDir::open_or_create_absolute(&default, PRIVATE_DIR_MODE)
+            .map(drop)
+            .map_err(|source| fs_error("prepare session temporary root", source))
+    }
+
     /// Derives this installation's namespace from the UID and canonical roots.
     ///
     /// # Errors

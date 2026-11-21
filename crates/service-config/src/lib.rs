@@ -12,7 +12,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 7
+//! schema_version = 8
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -20,6 +20,7 @@
 //! uid = 1000
 //! state_root = "/home/u/.local/state/pohunek"     # canonical application state dir
 //! runtime_root = "/run/user/1000/pohunek"         # canonical application runtime dir
+//! session_tmp_root = "/home/u/.cache/pohunek/session-tmp"   # absolute; must exist
 //!
 //! [deadlines]                                      # milliseconds, 1..=600000
 //! worker_connect_ms = 10000
@@ -78,6 +79,14 @@
 //!
 //! This crate validates allowlist patterns only syntactically; which names
 //! the installer allowlists by default is decided by its caller.
+//!
+//! `namespace.session_tmp_root` is the directory below which the daemon places
+//! each session's private `TMPDIR` (`<root>/<store key>/<session id>`). It is
+//! required and is not part of the job namespace. The daemon never creates the
+//! root itself: when the root sits on a filesystem that is not mounted, a
+//! created root would silently land in the empty mount point. A missing or
+//! unsafe root therefore fails the launch of a session, not the daemon start.
+//! The installer creates the root only when it is [`default_session_tmp_root`].
 //!
 //! `[waits]` bounds `session.wait_turn`: `turn_default_ms` applies when a
 //! caller omits its timeout, and `turn_max_ms` is the ceiling a requested
@@ -172,9 +181,18 @@
 //! has neither `[input]` nor `[waits]`, schema 3 has no `[waits]` and no
 //! `input.write_stall_timeout_ms`, schema 4 has no
 //! `input.write_stall_timeout_ms`, and none of them nor schema 5 has
-//! `[hooks]`, and none of schemas 2 to 6 has `[events]`. Every value a previous file records is kept. The previous
-//! schemas are read in their exact shapes: no release that wrote one could
-//! write an unknown key, so an unknown key in such a file is refused.
+//! `[hooks]`, and none of schemas 2 to 6 has `[events]`, and none of schemas 2
+//! to 7 has `namespace.session_tmp_root`. Every value a previous file records
+//! is kept. Schemas 2 to 6 are read in their exact shapes: no release that wrote
+//! one could write an unknown key, so an unknown key in such a file is refused.
+//! A schema-7 file is read like a current file, so its unknown keys are kept
+//! through the upgrade, as the schema-7 releases kept them.
+//!
+//! A schema-7 file does not record the cache directory, so the caller passes it
+//! and the upgrade assigns `namespace.session_tmp_root` explicitly as
+//! [`default_session_tmp_root`] of it, the location the daemon used before the
+//! key existed. The upgrade therefore moves nothing until the operator edits
+//! the key.
 //!
 //! `environment.search_path` is the executable search path the installer
 //! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
@@ -252,9 +270,9 @@ pub use error::ConfigError;
 /// binary never reads a file that lacks keys it requires. Version 3 holds
 /// `[input]`; version 4 adds `[waits]`; version 5 adds
 /// `input.write_stall_timeout_ms`; version 6 adds `[hooks]`; version 7 adds
-/// `[events]`. Schemas 2 to 6 are read only through
-/// [`ServiceConfig::load_upgrade_source`].
-pub const SCHEMA_VERSION: u32 = 7;
+/// `[events]`; version 8 adds `namespace.session_tmp_root`. Schemas 2 to 7 are
+/// read only through [`ServiceConfig::load_upgrade_source`].
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Input timings written on fresh installs and assigned explicitly when
 /// upgrading a schema-2, schema-3 or schema-4 service file, which lack some
@@ -1154,6 +1172,9 @@ pub struct ConfigSpec {
     pub state_root: PathBuf,
     /// Canonical application runtime directory (`<runtime>/pohunek`).
     pub runtime_root: PathBuf,
+    /// Directory below which each session's private `TMPDIR` is placed; the
+    /// daemon never creates it.
+    pub session_tmp_root: PathBuf,
     /// Supervision deadlines.
     pub deadlines: Deadlines,
     /// Environment names or trailing-`*` prefixes a worker may forward.
@@ -1200,6 +1221,7 @@ pub struct ServiceConfig {
     uid: u32,
     state_root: PathBuf,
     runtime_root: PathBuf,
+    session_tmp_root: PathBuf,
     namespace: Namespace,
     deadlines: Deadlines,
     environment_allowlist: Vec<String>,
@@ -1240,8 +1262,7 @@ impl ServiceConfig {
         if spec.uid == INVALID_UID {
             return Err(ConfigError::InvalidUid { uid: spec.uid });
         }
-        validate_path("namespace.state_root", &spec.state_root)?;
-        validate_path("namespace.runtime_root", &spec.runtime_root)?;
+        validate_namespace_paths(&spec)?;
         let deadlines = spec.deadlines;
         validate_duration("deadlines.worker_connect_ms", deadlines.worker_connect)?;
         validate_duration(
@@ -1312,6 +1333,7 @@ impl ServiceConfig {
             uid: spec.uid,
             state_root: spec.state_root,
             runtime_root: spec.runtime_root,
+            session_tmp_root: spec.session_tmp_root,
             namespace,
             deadlines,
             environment_allowlist: spec.environment_allowlist,
@@ -1351,27 +1373,33 @@ impl ServiceConfig {
         parse(path, &read_config_text(path)?)
     }
 
-    /// Reads a current or a schema-6, -5, -4, -3, or -2 service file for an installer upgrade.
+    /// Reads a current or a schema-7, -6, -5, -4, -3, or -2 service file for an installer upgrade.
     ///
     /// Schema 2 has no `[input]` or `[waits]` table, schema 3 no `[waits]`
     /// and no `input.write_stall_timeout_ms`, schema 4 no
-    /// `input.write_stall_timeout_ms`, schemas 2 to 5 no `[hooks]` table, and
-    /// schemas 2 to 6 no `[events]` table. This method supplies the documented
+    /// `input.write_stall_timeout_ms`, schemas 2 to 5 no `[hooks]` table,
+    /// schemas 2 to 6 no `[events]` table, and schemas 2 to 7 no
+    /// `namespace.session_tmp_root`. This method supplies the documented
     /// [`DEFAULT_INPUT_TIMING`], [`DEFAULT_WAIT_TIMING`],
-    /// [`DEFAULT_HOOK_STDERR_TAIL_BYTES`] and [`DEFAULT_EVENT_RETENTION`]
-    /// explicitly for the missing keys and tables and keeps every recorded
-    /// value; normal daemon and worker loads still require every key of the
-    /// current schema. The caller must preserve the source
+    /// [`DEFAULT_HOOK_STDERR_TAIL_BYTES`], [`DEFAULT_EVENT_RETENTION`] and
+    /// [`default_session_tmp_root`] of `cache_dir` explicitly for the missing
+    /// keys and tables and keeps every recorded value; normal daemon and
+    /// worker loads still require every key of the current schema. `cache_dir`
+    /// is the application cache directory (`<XDG_CACHE_HOME>/pohunek`); a
+    /// current file ignores it. The caller must preserve the source
     /// schema across the transaction and restore it if the old daemon is
     /// restarted on rollback.
     ///
     /// # Errors
     ///
     /// Returns the same trust and validation errors as [`Self::load`], and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, 6, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2 to 7 or
     /// [`SCHEMA_VERSION`].
-    pub fn load_upgrade_source(path: &Path) -> Result<UpgradeSource, ConfigError> {
-        Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes())
+    pub fn load_upgrade_source(
+        path: &Path,
+        cache_dir: &Path,
+    ) -> Result<UpgradeSource, ConfigError> {
+        Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes(), cache_dir)
     }
 
     /// Parses already-read bytes as a service file for an installer upgrade.
@@ -1380,24 +1408,27 @@ impl ServiceConfig {
     /// example to the digest a transaction record journals for the exact
     /// pre-upgrade file, and refuses a mismatch before using the result.
     /// `path` names the bytes in every error. `load_upgrade_source` is this
-    /// function over a trusted read.
+    /// function over a trusted read. `cache_dir` is the application cache
+    /// directory, as for [`Self::load_upgrade_source`].
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Parse`] for bytes that are not UTF-8, invalid
     /// TOML, or a missing, unknown, or mistyped key, and
-    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2, 3, 4, 5, 6, or
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2 to 7 or
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source_bytes(
         path: &Path,
         bytes: &[u8],
+        cache_dir: &Path,
     ) -> Result<UpgradeSource, ConfigError> {
         let original_text =
             String::from_utf8(bytes.to_vec()).map_err(|error| ConfigError::Parse {
                 path: path.to_path_buf(),
                 message: format!("file is not UTF-8: {error}"),
             })?;
-        let (config, source_schema_version) = parse_upgrade_source(path, &original_text)?;
+        let (config, source_schema_version) =
+            parse_upgrade_source(path, &original_text, cache_dir)?;
         Ok(UpgradeSource {
             config,
             source_schema_version,
@@ -1487,6 +1518,7 @@ impl ServiceConfig {
                 uid: self.uid,
                 state_root: utf8(&self.state_root).to_owned(),
                 runtime_root: utf8(&self.runtime_root).to_owned(),
+                session_tmp_root: utf8(&self.session_tmp_root).to_owned(),
             },
             deadlines: RawDeadlines {
                 worker_connect_ms: millis(self.deadlines.worker_connect),
@@ -1560,6 +1592,7 @@ impl ServiceConfig {
             uid: self.uid,
             state_root: self.state_root.clone(),
             runtime_root: self.runtime_root.clone(),
+            session_tmp_root: self.session_tmp_root.clone(),
             deadlines: self.deadlines,
             environment_allowlist: self.environment_allowlist.clone(),
             search_path: self.search_path.clone(),
@@ -1664,6 +1697,15 @@ impl ServiceConfig {
     #[must_use]
     pub fn runtime_root(&self) -> &Path {
         &self.runtime_root
+    }
+
+    /// Returns the recorded directory below which session temporary
+    /// directories are placed.
+    ///
+    /// The daemon never creates it, and it is not part of the job namespace.
+    #[must_use]
+    pub fn session_tmp_root(&self) -> &Path {
+        &self.session_tmp_root
     }
 
     /// Returns the job namespace derived from the recorded namespace inputs.
@@ -1835,6 +1877,34 @@ struct RawConfig {
     limits: RawLimits,
 }
 
+/// On-disk schema-7 shape accepted only for an explicit upgrade.
+///
+/// Like the current schema it ignores unknown keys outside `[namespace]` and
+/// `[environment]`, because the schema-7 releases tolerated them.
+#[derive(Debug, Deserialize)]
+struct RawConfigV7 {
+    schema_version: u32,
+    prefix: String,
+    active_version: String,
+    namespace: RawNamespaceV7,
+    deadlines: RawDeadlines,
+    environment: RawEnvironment,
+    sweep: RawSweep,
+    input: RawInput,
+    waits: RawWaits,
+    hooks: RawHooks,
+    events: RawEvents,
+    #[serde(default)]
+    checkout_trust: RawCheckoutTrust,
+    #[serde(default)]
+    inventory: RawInventory,
+    #[serde(default)]
+    worker_journals: RawWorkerJournals,
+    #[serde(default)]
+    notifications: RawNotifications,
+    limits: RawLimits,
+}
+
 /// Exact on-disk schema-6 shape accepted only for an explicit upgrade.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1842,7 +1912,7 @@ struct RawConfigV6 {
     schema_version: u32,
     prefix: String,
     active_version: String,
-    namespace: RawNamespace,
+    namespace: RawNamespaceV7,
     deadlines: RawDeadlines,
     environment: RawEnvironment,
     sweep: RawSweep,
@@ -1859,7 +1929,7 @@ struct RawConfigV5 {
     schema_version: u32,
     prefix: String,
     active_version: String,
-    namespace: RawNamespace,
+    namespace: RawNamespaceV7,
     deadlines: RawDeadlines,
     environment: RawEnvironment,
     sweep: RawSweep,
@@ -1875,7 +1945,7 @@ struct RawConfigV3 {
     schema_version: u32,
     prefix: String,
     active_version: String,
-    namespace: RawNamespace,
+    namespace: RawNamespaceV7,
     deadlines: RawDeadlines,
     environment: RawEnvironment,
     sweep: RawSweep,
@@ -1890,7 +1960,7 @@ struct RawConfigV4 {
     schema_version: u32,
     prefix: String,
     active_version: String,
-    namespace: RawNamespace,
+    namespace: RawNamespaceV7,
     deadlines: RawDeadlines,
     environment: RawEnvironment,
     sweep: RawSweep,
@@ -1906,7 +1976,7 @@ struct RawConfigV2 {
     schema_version: u32,
     prefix: String,
     active_version: String,
-    namespace: RawNamespace,
+    namespace: RawNamespaceV7,
     deadlines: RawDeadlines,
     environment: RawEnvironment,
     sweep: RawSweep,
@@ -1920,6 +1990,29 @@ struct RawNamespace {
     uid: u32,
     state_root: String,
     runtime_root: String,
+    session_tmp_root: String,
+}
+
+/// On-disk `[namespace]` table of schemas 2 to 7, which lack
+/// `session_tmp_root`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNamespaceV7 {
+    uid: u32,
+    state_root: String,
+    runtime_root: String,
+}
+
+impl RawNamespaceV7 {
+    /// The current table with `session_tmp_root` assigned explicitly.
+    fn upgraded(self, session_tmp_root: String) -> RawNamespace {
+        RawNamespace {
+            uid: self.uid,
+            state_root: self.state_root,
+            runtime_root: self.runtime_root,
+            session_tmp_root,
+        }
+    }
 }
 
 /// On-disk `[deadlines]` table in milliseconds.
@@ -2530,10 +2623,20 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             found: i64::from(raw.schema_version),
         });
     }
-    let mut config = config_from_raw(raw)?;
+    let config = config_from_raw(raw)?;
+    keep_unknown_keys(path, text, config)
+}
+
+/// Records the unknown keys of `text` in `config` so a rewrite reproduces them.
+///
+/// A file whose unknown part cannot be written back is refused here instead of
+/// when it is rewritten.
+fn keep_unknown_keys(
+    path: &Path,
+    text: &str,
+    mut config: ServiceConfig,
+) -> Result<ServiceConfig, ConfigError> {
     config.unknown = scan_unknown(path, text)?;
-    // A rewrite must reproduce the unknown keys, so a file whose unknown part
-    // cannot be written back is refused here instead of when it is rewritten.
     config.render().map_err(|_error| ConfigError::Parse {
         path: path.to_path_buf(),
         message: "the unknown keys cannot be written back to a valid file".to_owned(),
@@ -2541,28 +2644,80 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
     Ok(config)
 }
 
+/// The default `namespace.session_tmp_root` below `cache_dir`: the directory
+/// the daemon placed session temporary directories in before the key existed.
+///
+/// `cache_dir` is the application cache directory (`<XDG_CACHE_HOME>/pohunek`).
+#[must_use]
+pub fn default_session_tmp_root(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(pohunek_paths::SESSION_TMP_SUBDIR)
+}
+
+/// [`default_session_tmp_root`] of `cache_dir` as the on-disk string, validated
+/// like the configured value.
+fn default_session_tmp_root_text(cache_dir: &Path) -> Result<String, ConfigError> {
+    let root = default_session_tmp_root(cache_dir);
+    validate_path("namespace.session_tmp_root", &root)?;
+    Ok(utf8(&root).to_owned())
+}
+
 /// Parses the current or an exact previous schema at the installer upgrade boundary.
 ///
 /// A previous schema gets the documented defaults for the tables it lacks
-/// and keeps every value it records.
+/// and keeps every value it records. `cache_dir` is the application cache
+/// directory the default `namespace.session_tmp_root` of a previous schema is
+/// derived from.
 #[expect(
     clippy::too_many_lines,
     reason = "one arm per previous schema, each spelling its exact shape"
 )]
-fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32), ConfigError> {
+fn parse_upgrade_source(
+    path: &Path,
+    text: &str,
+    cache_dir: &Path,
+) -> Result<(ServiceConfig, u32), ConfigError> {
     let parse_error = |error: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
         message: diagnostic(text, &error),
     };
     let table: toml::Table = toml::from_str(text).map_err(parse_error)?;
+    // Only a previous schema derives the value; the current one records it.
+    let session_tmp_root = match table.get("schema_version") {
+        Some(toml::Value::Integer(2..=7)) => default_session_tmp_root_text(cache_dir)?,
+        _ => String::new(),
+    };
     match table.get("schema_version") {
+        Some(toml::Value::Integer(7)) => {
+            let previous: RawConfigV7 = toml::from_str(text).map_err(parse_error)?;
+            let raw = RawConfig {
+                schema_version: SCHEMA_VERSION,
+                prefix: previous.prefix,
+                active_version: previous.active_version,
+                namespace: previous.namespace.upgraded(session_tmp_root),
+                deadlines: previous.deadlines,
+                environment: previous.environment,
+                sweep: previous.sweep,
+                input: previous.input,
+                waits: previous.waits,
+                hooks: previous.hooks,
+                events: previous.events,
+                checkout_trust: previous.checkout_trust,
+                inventory: previous.inventory,
+                worker_journals: previous.worker_journals,
+                notifications: previous.notifications,
+                limits: previous.limits,
+            };
+            debug_assert_eq!(previous.schema_version, 7);
+            let config = keep_unknown_keys(path, text, config_from_raw(raw)?)?;
+            Ok((config, 7))
+        }
         Some(toml::Value::Integer(2)) => {
             let previous: RawConfigV2 = toml::from_str(text).map_err(parse_error)?;
             let raw = RawConfig {
                 schema_version: SCHEMA_VERSION,
                 prefix: previous.prefix,
                 active_version: previous.active_version,
-                namespace: previous.namespace,
+                namespace: previous.namespace.upgraded(session_tmp_root),
                 deadlines: previous.deadlines,
                 environment: previous.environment,
                 sweep: previous.sweep,
@@ -2590,7 +2745,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 schema_version: SCHEMA_VERSION,
                 prefix: previous.prefix,
                 active_version: previous.active_version,
-                namespace: previous.namespace,
+                namespace: previous.namespace.upgraded(session_tmp_root),
                 deadlines: previous.deadlines,
                 environment: previous.environment,
                 sweep: previous.sweep,
@@ -2618,7 +2773,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 schema_version: SCHEMA_VERSION,
                 prefix: previous.prefix,
                 active_version: previous.active_version,
-                namespace: previous.namespace,
+                namespace: previous.namespace.upgraded(session_tmp_root),
                 deadlines: previous.deadlines,
                 environment: previous.environment,
                 sweep: previous.sweep,
@@ -2642,7 +2797,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 schema_version: SCHEMA_VERSION,
                 prefix: previous.prefix,
                 active_version: previous.active_version,
-                namespace: previous.namespace,
+                namespace: previous.namespace.upgraded(session_tmp_root),
                 deadlines: previous.deadlines,
                 environment: previous.environment,
                 sweep: previous.sweep,
@@ -2666,7 +2821,7 @@ fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32),
                 schema_version: SCHEMA_VERSION,
                 prefix: previous.prefix,
                 active_version: previous.active_version,
-                namespace: previous.namespace,
+                namespace: previous.namespace.upgraded(session_tmp_root),
                 deadlines: previous.deadlines,
                 environment: previous.environment,
                 sweep: previous.sweep,
@@ -2725,6 +2880,7 @@ impl RawConfig {
                 uid: 0,
                 state_root: String::new(),
                 runtime_root: String::new(),
+                session_tmp_root: String::new(),
             },
             deadlines: RawDeadlines {
                 worker_connect_ms: 0,
@@ -3053,6 +3209,7 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
         uid: raw.namespace.uid,
         state_root: PathBuf::from(raw.namespace.state_root),
         runtime_root: PathBuf::from(raw.namespace.runtime_root),
+        session_tmp_root: PathBuf::from(raw.namespace.session_tmp_root),
         deadlines: Deadlines {
             worker_connect: Duration::from_millis(raw.deadlines.worker_connect_ms),
             worker_initialize: Duration::from_millis(raw.deadlines.worker_initialize_ms),
@@ -3266,6 +3423,13 @@ pub fn validate_prefix(prefix: &Path) -> Result<InstallLayout, ConfigError> {
 }
 
 /// Validates one recorded path key.
+/// Validates the three `[namespace]` roots of `spec`.
+fn validate_namespace_paths(spec: &ConfigSpec) -> Result<(), ConfigError> {
+    validate_path("namespace.state_root", &spec.state_root)?;
+    validate_path("namespace.runtime_root", &spec.runtime_root)?;
+    validate_path("namespace.session_tmp_root", &spec.session_tmp_root)
+}
+
 fn validate_path(key: &'static str, path: &Path) -> Result<(), ConfigError> {
     match path_error(path) {
         None => Ok(()),

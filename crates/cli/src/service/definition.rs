@@ -86,6 +86,9 @@ pub(crate) fn config_with_search_path(
         uid: context.uid(),
         state_root,
         runtime_root,
+        session_tmp_root: pohunek_service_config::default_session_tmp_root(
+            &context.paths().cache_dir,
+        ),
         deadlines: Deadlines {
             worker_connect: settings::WORKER_CONNECT,
             worker_initialize: settings::WORKER_INITIALIZE,

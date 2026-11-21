@@ -64,7 +64,7 @@ registers one daemon job: the systemd user unit
 `pohunek-<ns>-daemon.service` plus the slice `pohunek-<ns>-sessions.slice` on
 Linux, or the launchd agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS.
-The owner-private `service.toml` (schema 7) records `[input]`
+The owner-private `service.toml` (schema 8) records `[input]`
 `initial_startup_grace_ms = 5000`, `submit_delay_ms = 150` and
 `write_stall_timeout_ms = 3000` on a fresh
 install. These host-wide values control the maximum wait for an input-ready
@@ -137,6 +137,16 @@ invalid or repeated entry makes the configuration load fail with the named key a
 position. An absent table or an empty list trusts no repository, which is also the state of
 a daemon started without `service.toml`. The installer omits the table while the list is
 empty, and a previous release reports it as an unknown table.
+`namespace.session_tmp_root` is the directory below which each session's private
+`TMPDIR` lives (`<root>/<store key>/<session id>`). A fresh install and an upgrade of
+a schema-7 file record `<cache_dir>/session-tmp` explicitly, so nothing moves until you
+edit the key; point it at a short absolute path on another disk (for example `/t/st`)
+to keep session scratch off the cache filesystem, then restart the daemon. The
+installer creates the default root only. The daemon never creates the configured root,
+so create a root you chose yourself (mode 0700, owned by you, no symlink in the path)
+before the daemon needs it: while it is missing or unsafe a session launch fails with
+`session_tmpdir_failed` or `session_tmpdir_unsafe` naming it, the daemon keeps serving,
+and it logs one `session.tmp_root_unusable` warning at start.
 The `[events]` table bounds the event journal `<data>/events/events.jsonl`:
 `max_file_bytes = 33554432` (one file, `1048576..=1073741824`),
 `max_files = 8` (files kept including the active one, `2..=64`) and

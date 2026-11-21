@@ -409,10 +409,17 @@ fn pending_migration(
         store.write_config_backup(bytes).expect("write backup");
     }
     if step >= Step::Config {
-        let mut spec = pohunek_service_config::ServiceConfig::load_upgrade_source(config)
-            .expect("schema-2 source")
-            .config
-            .to_spec();
+        let cache_dir = state
+            .parent()
+            .and_then(Path::parent)
+            .expect("the fixture root")
+            .join("cache")
+            .join("pohunek");
+        let mut spec =
+            pohunek_service_config::ServiceConfig::load_upgrade_source(config, &cache_dir)
+                .expect("schema-2 source")
+                .config
+                .to_spec();
         VERSION.clone_into(&mut spec.active_version);
         pohunek_service_config::ServiceConfig::new(spec)
             .expect("target configuration")
@@ -663,7 +670,7 @@ fn check_reports_no_migration_when_the_installed_version_is_already_active() {
 
 #[test]
 fn check_refuses_a_config_this_version_neither_writes_nor_migrates() {
-    for version in [1, 8] {
+    for version in [1, 9] {
         let host = Host::schema_of(version);
         let (success, envelope) = check(&host);
         assert!(!success, "{envelope}: schema {version} is not a source");
