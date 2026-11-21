@@ -354,7 +354,7 @@ pub(crate) async fn assistant_state(
 
 /// Appends the assistant package line of an upgrade that has something to
 /// tell: an older selected package or a daemon that could not be asked.
-fn render_assistant(text: &mut String, state: &report::AssistantPackageReport) {
+pub(crate) fn render_assistant(text: &mut String, state: &report::AssistantPackageReport) {
     match state.status {
         report::AssistantPackageStatus::Outdated => {
             let _ = writeln!(

@@ -117,6 +117,15 @@ async fn the_upgrade_reports_an_older_assistant_package_with_the_update_command(
     assert_eq!(outdated.core_version, VERSION);
     assert_eq!(outdated.command.as_deref(), Some("pohunek setup"));
     assert_eq!(outdated.package_id, ASSISTANT_PACKAGE);
+    let text = upgrade_assistant::render(&outdated);
+    for needle in [OLDER_VERSION, VERSION, "pohunek setup", ASSISTANT_PACKAGE] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    let json = serde_json::to_value(&outdated).expect("the report serializes");
+    assert_eq!(json["status"], "outdated", "{json}");
+    assert_eq!(json["command"], "pohunek setup", "{json}");
+    assert_eq!(json["version"], OLDER_VERSION, "{json}");
+    assert_eq!(json["core_version"], VERSION, "{json}");
 
     let (current, current_digest) = context_archive(&dir, VERSION);
     let (code, updated) = harness
@@ -133,6 +142,7 @@ async fn the_upgrade_reports_an_older_assistant_package_with_the_update_command(
     assert_eq!(code, 0, "{updated}");
     let state = upgrade_assistant::state(VERSION, &paths).await;
     assert_eq!(state.status, AssistantPackageStatus::Current, "{state:?}");
+    assert_eq!(upgrade_assistant::render(&state), "", "{state:?}");
     assert_eq!(state.version.as_deref(), Some(VERSION));
     assert_eq!(state.command, None, "{state:?}");
 
@@ -144,4 +154,7 @@ async fn the_upgrade_reports_an_older_assistant_package_with_the_update_command(
         "{unchecked:?}"
     );
     assert!(unchecked.detail.is_some(), "{unchecked:?}");
+    let text = upgrade_assistant::render(&unchecked);
+    assert!(text.contains("was not checked"), "{text}");
+    assert!(text.contains("pohunek plugin list"), "{text}");
 }

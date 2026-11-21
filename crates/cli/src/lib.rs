@@ -43,6 +43,15 @@ pub mod upgrade_assistant {
     ) -> AssistantPackageReport {
         crate::commands::service::assistant_state(core_version, Ok(Paths::from_base(base))).await
     }
+
+    /// The text the upgrade prints for `state`; empty when there is nothing to
+    /// tell.
+    #[must_use]
+    pub fn render(state: &AssistantPackageReport) -> String {
+        let mut text = String::new();
+        crate::commands::service::render_assistant(&mut text, state);
+        text
+    }
 }
 mod target;
 #[cfg(test)]
