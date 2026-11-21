@@ -1038,6 +1038,24 @@ fn warn_unusable_session_tmp_root(base: &Path) {
     }
 }
 
+/// Returns the per-store session temporary root below the root `service.toml`
+/// records, warning once when that root is unusable.
+fn configured_store_tmp_root(
+    service: &ServiceConfig,
+    store_path: &Path,
+) -> Result<PathBuf, DaemonError> {
+    let tmp_root = service.session_tmp_root().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "service.toml records no namespace.session_tmp_root",
+        )
+    })?;
+    warn_unusable_session_tmp_root(tmp_root);
+    Ok(pohunek_daemon::session::store_session_tmp_root(
+        tmp_root, store_path,
+    )?)
+}
+
 /// Builds the session registry with the worker supervisor of `mode`.
 ///
 /// `store_path` names the metadata store whose key separates this daemon's
@@ -1069,16 +1087,7 @@ async fn build_session_registry(
                 warn!(%shortfall, "service.toml shutdown bounds do not fit the exit timeout");
             }
             apply_service_settings(&mut config, &service);
-            let tmp_root = service.session_tmp_root().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "service.toml records no namespace.session_tmp_root",
-                )
-            })?;
-            warn_unusable_session_tmp_root(tmp_root);
-            config.session_tmp_root = Some(pohunek_daemon::session::store_session_tmp_root(
-                tmp_root, store_path,
-            )?);
+            config.session_tmp_root = Some(configured_store_tmp_root(&service, store_path)?);
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             let manager_path = follow_manager_path(&service).await;
             if let Some(manager_path) = &manager_path {
