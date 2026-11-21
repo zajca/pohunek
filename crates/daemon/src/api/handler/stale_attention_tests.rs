@@ -91,13 +91,14 @@ async fn removing_a_session_leaves_no_open_needs_you_record() {
     fixture.activity(&session, "working").await;
     let _inhibitor = pause_clock().await;
     ok(fixture.call(method::SESSION_STOP, json!(session)).await);
+    // The stop's own resolution reaches the projector before the late report.
+    tokio::time::advance(debounce() + FLUSH_SLACK).await;
+    settle().await;
 
     // A report that reaches the daemon after the stop is the record a removal
     // must not leave behind.
     needs_you(&fixture, &session).await;
-    tokio::time::advance(debounce() + FLUSH_SLACK).await;
-    settle().await;
-    let before = fixture.inbox().await;
+    let before = Box::pin(surfaced_inbox(&fixture)).await;
     assert_eq!(open_records(&before), 1, "{before:?}");
     ok(fixture.call(method::SESSION_REMOVE, json!(session)).await);
     settle().await;
