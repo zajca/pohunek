@@ -144,7 +144,16 @@ pub(crate) fn base_environment<P: AsRef<str>>(
     source: &EnvironmentSource,
 ) -> Result<BaseEnv, EnvError> {
     match source {
-        EnvironmentSource::Process => BaseEnv::from_allowlist(allowlist, std::env::vars_os()),
+        // `PATH` is the one variable a daemon that follows its service manager
+        // refreshes; the rest is what the process started with.
+        EnvironmentSource::Process => {
+            let mut variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+            if let Some(path) = super::manager_path::current_manager_path() {
+                variables.retain(|(name, _)| name != "PATH");
+                variables.push((OsString::from("PATH"), path));
+            }
+            BaseEnv::from_allowlist(allowlist, variables)
+        }
         EnvironmentSource::Fixed(variables) => BaseEnv::from_allowlist(
             allowlist,
             variables

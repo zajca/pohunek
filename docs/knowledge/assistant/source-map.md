@@ -476,6 +476,9 @@ Daemon, sessions, integrations, and project state:
 - `crates/platform/src/shell_env/` — executable search-path policy: bounded
   login-shell discovery, path validation, and executable resolution (see
   `docs/knowledge/guides/environment-resolution.md`).
+- `crates/daemon/src/runtime/manager_path.rs` — the systemd user manager's
+  `PATH` a daemon follows on each request, and the one search path every daemon
+  `PATH` read uses (see `docs/knowledge/guides/environment-resolution.md`).
 - `docs/knowledge/guides/environment-resolution.md` — how the daemon and
   agents resolve `PATH` and executables.
 - `crates/platform/src/process/sweep.rs` — ownership-marker sweep of a lost

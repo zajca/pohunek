@@ -518,9 +518,10 @@ pub(crate) fn executable_refusal(program: &str) -> Option<String> {
     }
 }
 
-/// The `PATH` agent executables are resolved on: the daemon's own.
+/// The `PATH` agent executables are resolved on: the daemon's own, or its
+/// service manager's when the daemon follows it.
 fn executable_search_path() -> Option<std::ffi::OsString> {
-    let path = std::env::var_os("PATH");
+    let path = crate::runtime::manager_path::search_path();
     #[cfg(test)]
     let path = crate::test_support::with_thread_launch_path(path);
     path

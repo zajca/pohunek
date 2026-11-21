@@ -1039,7 +1039,7 @@ fn collect_probe(
 /// the first executable file. Mirrors the agent launch-path probe rather than
 /// reporting a non-executable placeholder as available.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    let path_var = crate::runtime::manager_path::search_path()?;
     which_on_path_value(name, &path_var)
 }
 

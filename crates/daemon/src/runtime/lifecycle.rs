@@ -303,9 +303,19 @@ pub struct SupervisionConfig {
     /// Backend naming of worker stdout and stderr files; `None` when the
     /// backend keeps job output elsewhere (systemd journal, dev/test children).
     pub worker_logs: Option<LogNaming>,
+    /// The service manager whose `PATH` the daemon follows; `None` keeps the
+    /// `PATH` the daemon process started with.
+    pub manager_path: Option<super::manager_path::ManagerPath>,
 }
 
 impl SupervisionConfig {
+    /// Makes the daemon follow the service manager's `PATH`.
+    #[must_use]
+    pub fn with_manager_path(mut self, manager_path: super::manager_path::ManagerPath) -> Self {
+        self.manager_path = Some(manager_path);
+        self
+    }
+
     /// Replaces the variables the environment allowlist is applied to.
     ///
     /// Hermetic tests pass the environment of their fixture so agent children
@@ -385,6 +395,7 @@ impl SubprocessWorkerEnvironment {
             bootstrap_environment,
             working_directory: self.home.clone(),
             worker_logs: None,
+            manager_path: None,
         }
     }
 }

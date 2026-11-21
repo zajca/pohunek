@@ -175,7 +175,21 @@ job as `PATH` (the launchd plist `EnvironmentVariables`). The daemon forwards
 `PATH` to workers and agents through the existing `[environment] allowlist`,
 which stays the only channel: no other variable is added, and no secret or
 interactive environment is captured. Linux and systemd keep `search_path = []`:
-the daemon inherits the user manager's environment and no `PATH` is written. The
+the daemon inherits the user manager's environment and no `PATH` is written.
+That environment can change after the daemon started: a user unit starts at
+login, before the desktop session imports its environment (version-manager
+shims, a profile's `PATH`). A daemon that runs as its own unit with an empty
+`search_path` and a unit that sets no `PATH` (no `Environment=PATH=`,
+`ExecSearchPath=`, `EnvironmentFile=`, `PassEnvironment=PATH` or
+`UnsetEnvironment=PATH`, in the unit or a drop-in) therefore reads the manager's
+`PATH` again when it inspects the host, runs a doctor, or starts or resumes a session (at most once a second, bounded by the
+installation's service-manager call deadline) and uses it for every executable
+lookup, the doctor's agent checks, hooks and the environment it gives new
+agents, so a probe and a launch agree. Only `PATH` follows the manager; other
+forwarded variables keep the value the process started with. A manager that does
+not answer, or has no `PATH`, leaves the `PATH` the daemon started with. Running
+sessions keep the environment they launched with. macOS and a recorded
+`search_path` are unchanged. The
 install, upgrade and rollback judge that job with the `PATH` the unit really gets: the
 user manager's, replaced by an `ExecSearchPath=` (joined with `:`) and then by an `Environment=PATH=` of a drop-in of the daemon unit (the install replaces the unit file itself, so a `PATH` set only there does not count). Where the unit has no file yet, or a rollback removed it, its drop-in files are read from disk in file-name order across directories (a higher-priority directory wins a shared name, a `/dev/null` link disables it, hidden and backup files are skipped).
 A unit setting the CLI cannot read (an `EnvironmentFile=` that sets `PATH`,

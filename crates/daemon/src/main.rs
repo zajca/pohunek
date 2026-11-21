@@ -63,8 +63,10 @@ use pohunek_daemon::runtime::lifecycle::{
     LogNaming, DEV_OPEN_FILES, DEV_SWEEP_GRACE, DEV_WORKER_CONNECT, DEV_WORKER_EXIT_TIMEOUT,
     DEV_WORKER_INITIALIZE,
 };
+#[cfg(target_os = "linux")]
+use pohunek_daemon::runtime::manager_path::{FollowGate, SystemdUserManager};
 use pohunek_daemon::runtime::{
-    EnvironmentSource, LaunchEnvironment, SubprocessWorkerLauncher, SupervisionConfig,
+    EnvironmentSource, LaunchEnvironment, ManagerPath, SubprocessWorkerLauncher, SupervisionConfig,
     WorkerLauncher,
 };
 use pohunek_daemon::session::upgrade_preflight::{
@@ -162,6 +164,16 @@ const REMOTE_LISTENER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// referencing it, so it is answered before any environment, path, logging,
 /// lock, or socket work.
 const VERSION_FLAG: &str = "--version";
+
+/// Reuse window of a read of the manager's `PATH`. Requests inside it share the
+/// read, so a burst of requests costs one bus round trip, and a `PATH` the
+/// desktop session imported shows within this window.
+#[cfg(target_os = "linux")]
+const MANAGER_PATH_MAX_AGE: Duration = Duration::from_secs(1);
+
+/// Variable the service manager sets for the processes of a service unit.
+#[cfg(target_os = "linux")]
+const INVOCATION_ID_VARIABLE: &str = "INVOCATION_ID";
 
 /// Sole argument that prints the adoption preflight of the installed state.
 ///
@@ -1047,6 +1059,10 @@ async fn build_session_registry(
             }
             apply_service_settings(&mut config, &service);
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
+            let manager_path = follow_manager_path(&service).await;
+            if let Some(manager_path) = &manager_path {
+                manager_path.refresh().await;
+            }
             info!(
                 service.namespace = %service.namespace(),
                 service.version = service.active_version(),
@@ -1067,6 +1083,7 @@ async fn build_session_registry(
                     bootstrap_environment,
                     working_directory,
                     worker_logs,
+                    manager_path,
                 },
                 supervisor,
             )
@@ -1100,6 +1117,7 @@ async fn build_session_registry(
                     bootstrap_environment,
                     working_directory,
                     worker_logs: None,
+                    manager_path: None,
                 },
                 Arc::new(SubprocessWorkerLauncher::new()),
             )
@@ -1185,6 +1203,44 @@ async fn native_supervisor(
     )
     .await?;
     Ok((Arc::new(supervisor), None))
+}
+
+/// The service manager `PATH` the daemon follows, when its job inherits it.
+///
+/// The daemon follows only when it runs under a service manager, the recorded
+/// `search_path` is empty and the unit sets no `PATH`; otherwise its `PATH` is
+/// what it started with. Each read of the manager is bounded by the same
+/// deadline as the worker supervisor's calls.
+#[cfg(target_os = "linux")]
+async fn follow_manager_path(service: &ServiceConfig) -> Option<ManagerPath> {
+    let gate = FollowGate {
+        service_managed: std::env::var_os(INVOCATION_ID_VARIABLE).is_some(),
+        search_path_recorded: !service.search_path().entries().is_empty(),
+    };
+    let deadline = service.deadlines().launchctl_command;
+    let manager = SystemdUserManager::new(deadline);
+    let followed = ManagerPath::follow(
+        Arc::new(manager),
+        &service.namespace().daemon_unit(),
+        gate,
+        MANAGER_PATH_MAX_AGE,
+        deadline,
+    )
+    .await;
+    if followed.is_some() {
+        info!("the daemon follows the service manager's PATH");
+    }
+    followed
+}
+
+/// Only systemd has a user manager environment to follow.
+#[cfg(not(target_os = "linux"))]
+#[expect(
+    clippy::unused_async,
+    reason = "the signature is shared with the systemd target, which reads the bus"
+)]
+async fn follow_manager_path(_service: &ServiceConfig) -> Option<ManagerPath> {
+    None
 }
 
 /// Creates the launchd supervisor that runs workers as `gui/<uid>` jobs.

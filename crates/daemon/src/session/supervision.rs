@@ -857,6 +857,21 @@ pub(super) struct RetryState {
 }
 
 impl SessionRegistry {
+    /// Re-reads the service manager's `PATH` when the daemon follows it, so
+    /// the request about to run resolves and launches agents on the `PATH` the
+    /// manager holds now.
+    pub(crate) async fn refresh_manager_path(&self) {
+        if let Some(manager_path) = self
+            .inner
+            .config
+            .supervision
+            .as_ref()
+            .and_then(|supervision| supervision.manager_path.as_ref())
+        {
+            manager_path.refresh().await;
+        }
+    }
+
     /// Reaps the processes an ended generation's runtime left behind.
     ///
     /// Runs [`sweep_runtime`] until a pass selects nothing, at most

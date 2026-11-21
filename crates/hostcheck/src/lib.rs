@@ -126,20 +126,46 @@ pub const fn current_platform() -> Platform {
 /// the bounded `launchctl` domain probe.
 #[must_use]
 pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
+    standard_checks_on(inputs, std::env::var_os("PATH").as_deref())
+}
+
+/// [`standard_checks`] where the Linux binary probes search `search_path`.
+///
+/// A daemon whose `PATH` follows its service manager passes that `PATH`, so the
+/// probes name what a launch would find. The macOS list reads the process
+/// environment regardless.
+#[must_use]
+pub fn standard_checks_on(
+    inputs: StandardCheckInputs<'_>,
+    search_path: Option<&OsStr>,
+) -> Vec<DoctorCheck> {
     match current_platform() {
         Platform::MacOs => {
             let facts = MacosFacts::collect(&inputs, &ProcessRunner::launchctl());
             macos::standard_checks(&inputs, &facts)
         }
-        _ => linux_checks(inputs),
+        _ => linux_checks_on(inputs, search_path),
     }
 }
 
 /// The Linux probe list: agents, directories, and the configured overlays.
 #[must_use]
 pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
-    let mut checks = vec![binary("git", true)];
-    checks.extend(AGENT_PROGRAMS.iter().map(|name| binary(name, false)));
+    linux_checks_on(inputs, std::env::var_os("PATH").as_deref())
+}
+
+/// [`linux_checks`] where the binary probes search `search_path`.
+#[must_use]
+pub fn linux_checks_on(
+    inputs: StandardCheckInputs<'_>,
+    search_path: Option<&OsStr>,
+) -> Vec<DoctorCheck> {
+    let mut checks = vec![binary_with_path("git", true, search_path, "")];
+    checks.extend(
+        AGENT_PROGRAMS
+            .iter()
+            .map(|name| binary_with_path(name, false, search_path, "")),
+    );
     checks.extend([
         dir_writable(
             "socket_dir_writable",
