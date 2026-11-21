@@ -1207,10 +1207,10 @@ async fn native_supervisor(
 
 /// The service manager `PATH` the daemon follows, when its job inherits it.
 ///
-/// The daemon follows only when it runs as the unit's own process, the recorded
+/// The daemon follows only when it runs under a service manager, the recorded
 /// `search_path` is empty and the unit sets no `PATH`; otherwise its `PATH` is
-/// what it started with. Every bus call is bounded by the same deadline as the
-/// worker supervisor's.
+/// what it started with. Each read of the manager is bounded by the same
+/// deadline as the worker supervisor's calls.
 #[cfg(target_os = "linux")]
 async fn follow_manager_path(service: &ServiceConfig) -> Option<ManagerPath> {
     if !service.search_path().entries().is_empty()
@@ -1218,15 +1218,19 @@ async fn follow_manager_path(service: &ServiceConfig) -> Option<ManagerPath> {
     {
         return None;
     }
-    let manager = SystemdUserManager::new(service.deadlines().launchctl_command);
-    if !manager
-        .unit_inherits_search_path(&service.namespace().daemon_unit())
-        .await
-    {
-        return None;
+    let deadline = service.deadlines().launchctl_command;
+    let manager = SystemdUserManager::new(deadline);
+    let followed = ManagerPath::follow(
+        Arc::new(manager),
+        &service.namespace().daemon_unit(),
+        MANAGER_PATH_MAX_AGE,
+        deadline,
+    )
+    .await;
+    if followed.is_some() {
+        info!("the daemon follows the service manager's PATH");
     }
-    info!("the daemon follows the service manager's PATH");
-    Some(ManagerPath::new(Arc::new(manager), MANAGER_PATH_MAX_AGE))
+    followed
 }
 
 /// Only systemd has a user manager environment to follow.

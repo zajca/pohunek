@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use pohunek_platform::supervisor::UnitEnvironment;
 use tracing::{debug, warn};
 
 /// The manager `PATH` the last read returned; `None` when the daemon uses its
@@ -73,6 +74,9 @@ pub type ManagerFuture<'a, T> =
 pub trait ManagerEnvironment: std::fmt::Debug + Send + Sync {
     /// Returns the manager's `PATH`, or `None` when it has none.
     fn search_path(&self) -> ManagerFuture<'_, Option<OsString>>;
+
+    /// Returns the environment settings the manager holds for `unit`.
+    fn unit_environment<'a>(&'a self, unit: &'a str) -> ManagerFuture<'a, UnitEnvironment>;
 }
 
 /// The `PATH` of the daemon's service manager, read at most once per
@@ -94,20 +98,49 @@ impl Eq for ManagerPath {}
 struct Inner {
     source: Arc<dyn ManagerEnvironment>,
     max_age: Duration,
+    deadline: Duration,
     last_read: tokio::sync::Mutex<Option<Instant>>,
 }
 
 impl ManagerPath {
-    /// Follows `source`; a read younger than `max_age` is reused.
+    /// Follows `source`; a read younger than `max_age` is reused, and a read
+    /// that takes longer than `deadline` counts as unanswered.
     #[must_use]
-    pub fn new(source: Arc<dyn ManagerEnvironment>, max_age: Duration) -> Self {
+    pub fn new(source: Arc<dyn ManagerEnvironment>, max_age: Duration, deadline: Duration) -> Self {
         Self {
             inner: Arc::new(Inner {
                 source,
                 max_age,
+                deadline,
                 last_read: tokio::sync::Mutex::new(None),
             }),
         }
+    }
+
+    /// Follows `source` when the job of `unit` takes the manager's `PATH` as it
+    /// is: the unit is loaded and nothing in it or its drop-ins can set a
+    /// `PATH`. An unreadable unit, or one that may set a `PATH`, answers `None`,
+    /// and the daemon keeps the `PATH` it started with.
+    pub async fn follow(
+        source: Arc<dyn ManagerEnvironment>,
+        unit: &str,
+        max_age: Duration,
+        deadline: Duration,
+    ) -> Option<Self> {
+        let environment = match tokio::time::timeout(deadline, source.unit_environment(unit)).await
+        {
+            Ok(Ok(environment)) => environment,
+            Ok(Err(error)) => {
+                warn!(%error, "the daemon unit's environment is unreadable; the manager PATH is not followed");
+                return None;
+            }
+            Err(_elapsed) => {
+                warn!("the daemon unit's environment was not read in time; the manager PATH is not followed");
+                return None;
+            }
+        };
+        (environment.load_state == "loaded" && !environment.may_set_search_path())
+            .then(|| Self::new(source, max_age, deadline))
     }
 
     /// Reads the manager `PATH` unless a recent read is still fresh, and makes
@@ -120,7 +153,10 @@ impl ManagerPath {
         if last_read.is_some_and(|at| at.elapsed() < self.inner.max_age) {
             return;
         }
-        match self.inner.source.search_path().await {
+        let read = tokio::time::timeout(self.inner.deadline, self.inner.source.search_path())
+            .await
+            .unwrap_or_else(|_elapsed| Err(ManagerReadError::new("the read timed out")));
+        match read {
             Ok(path) => {
                 let changed = current_manager_path() != path;
                 store(path);
@@ -165,21 +201,6 @@ impl SystemdUserManager {
     pub fn new(timeout: Duration) -> Self {
         Self { timeout }
     }
-
-    /// Whether the job of `unit` takes the manager's `PATH` as it is, so a
-    /// daemon following the manager sees what its job would get; an unreadable
-    /// unit answers no.
-    pub async fn unit_inherits_search_path(&self, unit: &str) -> bool {
-        match pohunek_platform::supervisor::systemd::unit_environment(unit, self.timeout).await {
-            Ok(environment) => {
-                environment.load_state == "loaded" && !environment.may_set_search_path()
-            }
-            Err(error) => {
-                warn!(%error, "the daemon unit's environment is unreadable; the manager PATH is not followed");
-                false
-            }
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -189,6 +210,14 @@ impl ManagerEnvironment for SystemdUserManager {
             pohunek_platform::supervisor::systemd::user_manager_environment(self.timeout)
                 .await
                 .map(|entries| search_path_of(&entries))
+                .map_err(|error| ManagerReadError::new(error.to_string()))
+        })
+    }
+
+    fn unit_environment<'a>(&'a self, unit: &'a str) -> ManagerFuture<'a, UnitEnvironment> {
+        Box::pin(async move {
+            pohunek_platform::supervisor::systemd::unit_environment(unit, self.timeout)
+                .await
                 .map_err(|error| ManagerReadError::new(error.to_string()))
         })
     }

@@ -15,30 +15,35 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use pohunek_platform::supervisor::UnitEnvironment;
 use protocol::{method, DaemonDoctorResult, HostCapabilities, Request};
 use serde_json::Value;
 
 use pohunek_daemon::api::{handle_request, DaemonState, HealthInfo, OverlaySource};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::runtime::{
-    ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError, SubprocessWorkerEnvironment,
-    SubprocessWorkerLauncher,
+    LaunchEnvironment, ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError,
+    SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
+use pohunek_test_support::wait::HANG_GUARD;
 
 /// The scenario starts no worker, so the worker executable only has to be a
 /// well-formed absolute path.
 const WORKER_PLACEHOLDER: &str = "/nonexistent/pohunek-sessiond";
 
 /// The agent program, a bare name, every row looks for.
-const AGENT: &str = "fixture-agent";
+const AGENT: &str = "claude";
 
 /// The host profile that launches [`AGENT`].
 const PROFILE: &str = "fixture";
 
 /// Reuse window of the manager read: zero, so every request reads the manager.
 const NO_REUSE: Duration = Duration::ZERO;
+
+/// Deadline of one manager read; the fake answers at once, so it never counts.
+const READ_DEADLINE: Duration = HANG_GUARD;
 
 /// What the fake manager answers next.
 #[derive(Debug, Clone)]
@@ -49,15 +54,34 @@ enum Answer {
 }
 
 #[derive(Debug, Clone)]
-struct FakeManager(Arc<Mutex<Answer>>);
+struct FakeManager(Arc<Mutex<Answer>>, Arc<Mutex<UnitEnvironment>>);
 
 impl FakeManager {
+    fn answering(answer: Answer) -> Self {
+        Self(
+            Arc::new(Mutex::new(answer)),
+            Arc::new(Mutex::new(UnitEnvironment {
+                load_state: "loaded".to_owned(),
+                ..UnitEnvironment::default()
+            })),
+        )
+    }
+
     fn answer(&self, answer: Answer) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = answer;
     }
 }
 
 impl ManagerEnvironment for FakeManager {
+    fn unit_environment<'a>(&'a self, _unit: &'a str) -> ManagerFuture<'a, UnitEnvironment> {
+        let unit = self
+            .1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        Box::pin(async move { Ok(unit) })
+    }
+
     fn search_path(&self) -> ManagerFuture<'_, Option<OsString>> {
         let answer = self
             .0
@@ -114,7 +138,11 @@ async fn state(root: &Path, manager: &FakeManager) -> DaemonState {
             environment
                 .supervision(PathBuf::from(WORKER_PLACEHOLDER))
                 .with_environment_source(support::hermetic_environment_source())
-                .with_manager_path(ManagerPath::new(Arc::new(manager.clone()), NO_REUSE)),
+                .with_manager_path(ManagerPath::new(
+                    Arc::new(manager.clone()),
+                    NO_REUSE,
+                    READ_DEADLINE,
+                )),
         ),
         ..support::hermetic_registry_config()
     };
@@ -156,16 +184,23 @@ async fn inspected(state: &DaemonState) -> Option<String> {
     runtime.path
 }
 
-/// The status of the daemon doctor's `bin:` check of the agent.
-async fn doctor_status(state: &DaemonState) -> protocol::DoctorStatus {
+/// The statuses of the daemon doctor's `bin:` check of the agent and of the
+/// check of the profile that launches it.
+async fn doctor_status(state: &DaemonState) -> [protocol::DoctorStatus; 2] {
     let doctor: DaemonDoctorResult = call(state, method::DAEMON_DOCTOR).await;
-    doctor
-        .report
-        .checks
-        .into_iter()
-        .find(|check| check.name == format!("agent_profile_{PROFILE}"))
-        .expect("the doctor checks the agent")
-        .status
+    let status = |name: String| {
+        doctor
+            .report
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("the doctor reports {name}"))
+            .status
+    };
+    [
+        status(format!("bin:{AGENT}")),
+        status(format!("agent_profile_{PROFILE}")),
+    ]
 }
 
 /// A daemon started while the manager `PATH` has no agent directory.
@@ -192,9 +227,7 @@ impl Started {
         install_agent(&manager_dir);
         let mut process = ProcessEnv::lock();
         process.set("PATH", &process_dir);
-        let manager = FakeManager(Arc::new(Mutex::new(Answer::Path(
-            process_dir.clone().into(),
-        ))));
+        let manager = FakeManager::answering(Answer::Path(process_dir.clone().into()));
         let state = state(root.path(), &manager).await;
         Self {
             _root: root,
@@ -230,7 +263,7 @@ async fn a_daemon_started_before_the_manager_path_gains_an_agent_dir_finds_it() 
     assert_eq!(inspected(&started.state).await, None);
     assert_eq!(
         doctor_status(&started.state).await,
-        protocol::DoctorStatus::Fail
+        [protocol::DoctorStatus::Warn, protocol::DoctorStatus::Fail]
     );
 
     started.manager.answer(Answer::Path(started.with_agent()));
@@ -238,7 +271,16 @@ async fn a_daemon_started_before_the_manager_path_gains_an_agent_dir_finds_it() 
     started.found().await;
     assert_eq!(
         doctor_status(&started.state).await,
-        protocol::DoctorStatus::Ok
+        [protocol::DoctorStatus::Ok, protocol::DoctorStatus::Ok]
+    );
+    // An agent launched now inherits the manager's PATH too.
+    let launch = LaunchEnvironment::subprocess_default()
+        .launch_search_path()
+        .expect("the launch environment builds")
+        .expect("the launch has a PATH");
+    assert!(
+        std::env::split_paths(&launch).any(|dir| dir == started.manager_dir),
+        "the launch PATH carries the agent directory"
     );
 }
 
@@ -281,4 +323,81 @@ async fn a_manager_that_does_not_answer_leaves_the_process_path() {
         std::env::var_os("PATH").as_deref(),
         Some(OsStr::new(&started.process_dir))
     );
+}
+
+/// R5: a daemon follows the manager only when its unit cannot decide its own
+/// `PATH`.
+#[tokio::test]
+async fn a_unit_that_decides_its_own_path_is_not_followed() {
+    let source = |unit: UnitEnvironment| {
+        let manager = FakeManager::answering(Answer::NoPath);
+        *manager.1.lock().expect("unit settings") = unit;
+        Arc::new(manager)
+    };
+    let loaded = || UnitEnvironment {
+        load_state: "loaded".to_owned(),
+        ..UnitEnvironment::default()
+    };
+    let follow = |unit: UnitEnvironment| {
+        ManagerPath::follow(source(unit), "unit.service", NO_REUSE, READ_DEADLINE)
+    };
+
+    assert!(follow(loaded()).await.is_some(), "an inheriting unit");
+    assert!(
+        follow(UnitEnvironment {
+            environment: vec!["PATHEXT=/x".to_owned(), "CLAUDE_CONFIG_DIR=/c".to_owned()],
+            ..loaded()
+        })
+        .await
+        .is_some(),
+        "other variables do not matter"
+    );
+    let deciding = [
+        (
+            "Environment=PATH=",
+            UnitEnvironment {
+                environment: vec!["PATH=/opt/bin".to_owned()],
+                ..loaded()
+            },
+        ),
+        (
+            "ExecSearchPath=",
+            UnitEnvironment {
+                exec_search_path: vec!["/opt/bin".to_owned()],
+                ..loaded()
+            },
+        ),
+        (
+            "EnvironmentFile=",
+            UnitEnvironment {
+                environment_files: vec![("/etc/pohunek.env".to_owned(), true)],
+                ..loaded()
+            },
+        ),
+        (
+            "PassEnvironment=PATH",
+            UnitEnvironment {
+                pass_environment: vec!["PATH".to_owned()],
+                ..loaded()
+            },
+        ),
+        (
+            "UnsetEnvironment=PATH",
+            UnitEnvironment {
+                unset_environment: vec!["PATH".to_owned()],
+                ..loaded()
+            },
+        ),
+        (
+            "stale until a daemon-reload",
+            UnitEnvironment {
+                need_daemon_reload: true,
+                ..loaded()
+            },
+        ),
+        ("not loaded", UnitEnvironment::default()),
+    ];
+    for (setting, unit) in deciding {
+        assert!(follow(unit).await.is_none(), "{setting}");
+    }
 }

@@ -425,7 +425,9 @@ async fn handle_negotiated(
     state: &DaemonState,
     selected_version: protocol::ProtocolVersion,
 ) -> Response {
-    state.sessions.refresh_manager_path().await;
+    if resolves_executables(request.method()) {
+        state.sessions.refresh_manager_path().await;
+    }
 
     if let Some(target) = mutation_target(request) {
         if state
@@ -795,6 +797,19 @@ fn refuse_spawn(
 
 /// The methods only the owner may call: they change the parent link a
 /// session's rights follow, or the profile files its rights are read from.
+/// Whether the method looks up or launches agent executables, so it runs on
+/// the service manager's current `PATH`.
+fn resolves_executables(name: &str) -> bool {
+    matches!(
+        name,
+        method::HOST_INSPECT
+            | method::DAEMON_DOCTOR
+            | method::INTEGRATION_DOCTOR
+            | method::SESSION_NEW
+            | method::SESSION_RESUME
+    )
+}
+
 fn owner_only_method(name: &str) -> bool {
     matches!(
         name,

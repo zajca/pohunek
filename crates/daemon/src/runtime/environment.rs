@@ -123,6 +123,16 @@ impl LaunchEnvironment {
         &self.allowlist
     }
 
+    /// The `PATH` an agent launched under this configuration inherits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the base environment cannot be built.
+    pub fn launch_search_path(&self) -> Result<Option<OsString>, String> {
+        let base = self.base().map_err(|error| error.to_string())?;
+        Ok(base.get("PATH").map(OsString::from))
+    }
+
     /// The base environment a launch under this configuration inherits.
     pub(crate) fn base(&self) -> Result<BaseEnv, EnvError> {
         base_environment(&self.allowlist, &self.source)
