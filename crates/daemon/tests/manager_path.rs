@@ -163,58 +163,117 @@ async fn doctor_status(state: &DaemonState) -> protocol::DoctorStatus {
         .status
 }
 
-/// One scenario, in order, because the search path is process-wide state.
+/// A daemon started while the manager `PATH` has no agent directory.
+///
+/// The search path is process-wide state, so each scenario runs in its own
+/// process.
+struct Started {
+    _root: tempfile::TempDir,
+    process_dir: PathBuf,
+    manager_dir: PathBuf,
+    manager: FakeManager,
+    state: DaemonState,
+    _process: ProcessEnv,
+}
+
+impl Started {
+    async fn new() -> Self {
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let process_dir = root.path().join("process-bin");
+        let manager_dir = root.path().join("manager-bin");
+        std::fs::create_dir_all(&process_dir).expect("process directory");
+        std::fs::set_permissions(&process_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-private process directory");
+        install_agent(&manager_dir);
+        let mut process = ProcessEnv::lock();
+        process.set("PATH", &process_dir);
+        let manager = FakeManager(Arc::new(Mutex::new(Answer::Path(
+            process_dir.clone().into(),
+        ))));
+        let state = state(root.path(), &manager).await;
+        Self {
+            _root: root,
+            process_dir,
+            manager_dir,
+            manager,
+            state,
+            _process: process,
+        }
+    }
+
+    /// The manager's `PATH` with the agent directory in front.
+    fn with_agent(&self) -> OsString {
+        std::env::join_paths([&self.manager_dir, &self.process_dir]).expect("join PATH")
+    }
+
+    /// The agent path `host.inspect` reports, which must be the manager's.
+    async fn found(&self) -> String {
+        let found = inspected(&self.state).await.expect("the agent is found");
+        assert_eq!(Path::new(&found), self.manager_dir.join(AGENT));
+        found
+    }
+}
+
+/// R2: the daemon started before the manager `PATH` gained the agent
+/// directory; the next request finds the agent, and the doctor agrees.
 #[tokio::test]
 async fn a_daemon_started_before_the_manager_path_gains_an_agent_dir_finds_it() {
     if !in_own_process() {
         return;
     }
-    let root = pohunek_test_support::tempdir().expect("scratch directory");
-    let process_dir = root.path().join("process-bin");
-    let manager_dir = root.path().join("manager-bin");
-    std::fs::create_dir_all(&process_dir).expect("process directory");
-    std::fs::set_permissions(&process_dir, std::fs::Permissions::from_mode(0o700))
-        .expect("owner-private process directory");
-    install_agent(&manager_dir);
-    let mut process = ProcessEnv::lock();
-    process.set("PATH", &process_dir);
+    let started = Started::new().await;
+    assert_eq!(inspected(&started.state).await, None);
+    assert_eq!(
+        doctor_status(&started.state).await,
+        protocol::DoctorStatus::Fail
+    );
 
-    let manager = FakeManager(Arc::new(Mutex::new(Answer::Path(process_dir.clone().into()))));
-    let state = state(root.path(), &manager).await;
+    started.manager.answer(Answer::Path(started.with_agent()));
 
-    // R2: the daemon started without the agent directory.
-    assert_eq!(inspected(&state).await, None);
-    assert_eq!(doctor_status(&state).await, protocol::DoctorStatus::Fail);
+    started.found().await;
+    assert_eq!(
+        doctor_status(&started.state).await,
+        protocol::DoctorStatus::Ok
+    );
+}
 
-    // The desktop session imports its environment: the next request sees it.
-    let with_agent = std::env::join_paths([&manager_dir, &process_dir]).expect("join PATH");
-    manager.answer(Answer::Path(with_agent));
-    let found = inspected(&state).await.expect("the agent is found");
-    assert_eq!(Path::new(&found), manager_dir.join(AGENT));
-    assert_eq!(doctor_status(&state).await, protocol::DoctorStatus::Ok);
+/// R3: the agent directory leaves the manager `PATH` again; the daemon
+/// follows.
+#[tokio::test]
+async fn an_agent_dir_the_manager_path_loses_is_missing_again() {
+    if !in_own_process() {
+        return;
+    }
+    let started = Started::new().await;
+    started.manager.answer(Answer::Path(started.with_agent()));
+    started.found().await;
 
-    // R3: the directory leaves the manager's PATH again.
-    manager.answer(Answer::Path(process_dir.clone().into()));
-    assert_eq!(inspected(&state).await, None);
+    started
+        .manager
+        .answer(Answer::Path(started.process_dir.clone().into()));
 
-    // R4: an unreachable manager, or one without a PATH, leaves the process
-    // PATH, which here has no agent.
-    manager.answer(Answer::Path(
-        std::env::join_paths([&manager_dir]).expect("join PATH"),
-    ));
-    assert!(inspected(&state).await.is_some());
-    manager.answer(Answer::Unreachable);
-    assert_eq!(inspected(&state).await, None);
-    manager.answer(Answer::Path(
-        std::env::join_paths([&manager_dir]).expect("join PATH"),
-    ));
-    assert!(inspected(&state).await.is_some());
-    manager.answer(Answer::NoPath);
-    assert_eq!(inspected(&state).await, None);
+    assert_eq!(inspected(&started.state).await, None);
+}
 
-    // The process PATH itself stays what the process started with.
+/// R4: a manager that cannot answer, or that has no `PATH`, leaves the `PATH`
+/// the daemon process started with; the process environment itself is never
+/// changed.
+#[tokio::test]
+async fn a_manager_that_does_not_answer_leaves_the_process_path() {
+    if !in_own_process() {
+        return;
+    }
+    let started = Started::new().await;
+    for silent in [Answer::Unreachable, Answer::NoPath] {
+        started.manager.answer(Answer::Path(started.with_agent()));
+        started.found().await;
+
+        started.manager.answer(silent);
+
+        assert_eq!(inspected(&started.state).await, None);
+    }
     assert_eq!(
         std::env::var_os("PATH").as_deref(),
-        Some(OsStr::new(&process_dir))
+        Some(OsStr::new(&started.process_dir))
     );
 }
