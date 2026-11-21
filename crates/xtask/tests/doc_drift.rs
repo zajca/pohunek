@@ -25,6 +25,21 @@ const PROTOCOL_SOURCE: &str = "crates/protocol/src/version.rs";
 const WORKER_SOURCE: &str = "crates/worker-protocol/src/version.rs";
 const STORE_SOURCE: &str = "crates/daemon/src/store/schema.rs";
 
+/// The runtime package guide and the feature registry snapshot.
+const FEATURE_GUIDE: &str = "docs/knowledge/guides/runtime-packages.md";
+const FEATURE_SNAPSHOT: &str = "crates/daemon/src/agent/host/fixtures/features.txt";
+
+/// A runtime package guide whose feature table has one row per `(id, since)`.
+fn feature_guide(rows: &[(&str, &str)]) -> String {
+    let mut page =
+        String::from("# Runtime packages\n\n| Feature | Since | Gated |\n|---|---|---|\n");
+    for (id, since) in rows {
+        writeln!(page, "| `{id}` | {since} | `[x]` |").expect("write to a string");
+    }
+    page.push_str("\nAfter the table.\n");
+    page
+}
+
 /// A protocol version source with the declaration shapes of the real crate.
 fn protocol_source(version: u32) -> String {
     format!(
@@ -178,7 +193,7 @@ impl Checkout {
         );
         checkout.write(
             "docs/knowledge/index.md",
-            "# Index\n\n[onboarding](guides/onboarding.md) [map](assistant/source-map.md)\n",
+            "# Index\n\n[onboarding](guides/onboarding.md) [map](assistant/source-map.md) [packages](guides/runtime-packages.md)\n",
         );
         checkout.write(
             "docs/knowledge/assistant/source-map.md",
@@ -186,6 +201,11 @@ impl Checkout {
         );
         checkout.write("docs/cli.md", &reference(&[], &[]));
         checkout.write(ONBOARDING_GUIDE, &committed_onboarding_guide());
+        checkout.write(FEATURE_SNAPSHOT, "alpha-v1 0.38.0\nbeta-v1 0.39.0\n");
+        checkout.write(
+            FEATURE_GUIDE,
+            &feature_guide(&[("beta-v1", "0.39.0"), ("alpha-v1", "0.38.0")]),
+        );
         checkout
     }
 
@@ -208,7 +228,8 @@ impl Checkout {
         self.write("docs/knowledge/guides/page.md", body);
         self.write(
             "docs/knowledge/index.md",
-            "# Index\n\n[page](guides/page.md) [onboarding](guides/onboarding.md) [map](assistant/source-map.md)\n",
+            "# Index\n\n[page](guides/page.md) [onboarding](guides/onboarding.md) [map](assistant/source-map.md) \
+             [packages](guides/runtime-packages.md)\n",
         );
         self.failed_checks()
     }
@@ -328,7 +349,7 @@ fn retired_pages_and_the_history_log_are_not_held_to_the_current_tree() {
     checkout.write(
         "docs/knowledge/index.md",
         "# Index\n\n[old](guides/old.md) [log](log.md) [onboarding](guides/onboarding.md) \
-         [map](assistant/source-map.md)\n",
+         [map](assistant/source-map.md) [packages](guides/runtime-packages.md)\n",
     );
     assert_eq!(checkout.failed_checks(), Vec::<&str>::new());
 }
@@ -799,4 +820,32 @@ fn the_parsed_window_is_the_built_window() {
         problems_at(&checkout, "docs/features.md:5 "),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn a_feature_without_a_docs_row_fails_the_feature_table_check() {
+    let checkout = Checkout::consistent();
+    checkout.write(FEATURE_GUIDE, &feature_guide(&[("alpha-v1", "0.38.0")]));
+    assert_eq!(checkout.failed_checks(), vec!["feature-table"]);
+}
+
+#[test]
+fn a_docs_row_without_a_feature_or_with_another_release_fails_the_feature_table_check() {
+    let extra = Checkout::consistent();
+    extra.write(
+        FEATURE_GUIDE,
+        &feature_guide(&[
+            ("alpha-v1", "0.38.0"),
+            ("beta-v1", "0.39.0"),
+            ("gamma-v1", "0.40.0"),
+        ]),
+    );
+    assert_eq!(extra.failed_checks(), vec!["feature-table"]);
+
+    let moved = Checkout::consistent();
+    moved.write(
+        FEATURE_GUIDE,
+        &feature_guide(&[("alpha-v1", "0.38.0"), ("beta-v1", "0.40.0")]),
+    );
+    assert_eq!(moved.failed_checks(), vec!["feature-table"]);
 }

@@ -1729,6 +1729,14 @@ session-side retention and adopted-pin refresh in `session/package_pins.rs`.
 | Third-party package | The archive digest the owner supplies (`--sha256`). `plugin link` copies a developer directory and installs it disabled. | Shipped. Never serves a reserved id. |
 | Daemon, overlay, session worker or GUI extension | None. | Unsupported. Protocol methods, overlay providers, worker behavior and GUI code stay compiled and audited in core or in the client that owns them. |
 
+The core's side of the descriptor contract is observable without installing
+anything: `host.inspect` carries `runtime_api` (`SUPPORTED_RUNTIME_API`) and
+`runtime_features` (the ids of the append-only feature registry in
+`crates/daemon/src/agent/host/features.rs`), also with `skip_runtime_probes`,
+and `pohunek plugin compat` prints them with the core and protocol versions. A
+daemon that omits the fields is unknown, not an empty support list, and the
+command fails with `plugin_compat_unsupported` instead of reporting one.
+
 An integration handler may also contribute per-launch input
 (`crates/daemon/src/integration/launch_input.rs`). The handler's contributor
 returns pure data for one launch: environment pairs, root-position arguments

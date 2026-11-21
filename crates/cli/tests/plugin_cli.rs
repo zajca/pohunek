@@ -1677,3 +1677,55 @@ fn an_update_over_a_selected_package_of_unknown_origin_keeps_the_downgrade_guard
         "the downgrade is refused before any committing install: {recorded:?}"
     );
 }
+
+/// A daemon that answers `host.inspect` the way a release before the compat
+/// report does: no `runtime_api` and no `runtime_features`.
+fn daemon_without_the_compat_report(method: &str, _params: &Value) -> Value {
+    match method {
+        "host.inspect" => capabilities(true),
+        other => panic!("unexpected method {other}"),
+    }
+}
+
+/// Row 4 of #1659 D3: against a daemon whose `host.inspect` omits the compat
+/// fields, `plugin compat` reports them as unknown with a typed error, never
+/// as an empty list, and the client still decodes that daemon's reply.
+#[test]
+fn plugin_compat_against_a_daemon_without_the_report_is_unknown() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_without_the_compat_report);
+
+    let output = fixture.run(&["plugin", "compat", "--json"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_text(&output));
+    let document = stdout_json(&output);
+    assert_eq!(document["err"]["code"], "plugin_compat_unsupported");
+    assert!(
+        document.get("ok").is_none(),
+        "no false empty report: {document}"
+    );
+    let human = fixture.run(&["plugin", "compat"]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(
+        !String::from_utf8_lossy(&human.stdout).contains("features"),
+        "no report on stdout: {}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    let inspect = fixture.run(&["host", "inspect", "local", "--json"]);
+    assert_eq!(inspect.status.code(), Some(0), "{}", stderr_text(&inspect));
+    let reply = &stdout_json(&inspect)["ok"];
+    assert_eq!(reply["daemon_version"], "0.38.0", "the old reply decodes");
+    assert!(
+        reply.get("runtime_api").is_none() && reply.get("runtime_features").is_none(),
+        "the old reply stays as the daemon sent it: {reply}"
+    );
+    let recorded = daemon.finish();
+    assert!(
+        recorded
+            .iter()
+            .any(|(method, params)| method == "host.inspect"
+                && params["skip_runtime_probes"] == true),
+        "the compat command asks for the flags only: {recorded:?}"
+    );
+}

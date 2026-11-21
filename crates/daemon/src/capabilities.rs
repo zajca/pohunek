@@ -20,8 +20,9 @@ use protocol::{
 use tracing::debug;
 
 use crate::agent::host::{
-    LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy, VersionRefusal,
-    RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
+    runtime_feature_ids, LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn,
+    VersionProbePolicy, VersionRefusal, RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID,
+    SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID, SUPPORTED_RUNTIME_API,
 };
 use crate::agent::profile::options;
 use crate::agent::{which_executable, ProfileRegistry, ResolvedAgent, ValidatedLaunchProgram};
@@ -163,7 +164,7 @@ pub(crate) fn host_capabilities(
 }
 
 /// The capability snapshot without any runtime inventory: the feature flags,
-/// the daemon version and `git`, with empty `supported_agents` and `runtimes`.
+/// the daemon version, `git` and the runtime API report, with empty `supported_agents` and `runtimes`.
 ///
 /// This is what `host.inspect` answers for a client that only needs the flags;
 /// it resolves and probes no program besides `git`.
@@ -437,6 +438,8 @@ fn capability_snapshot(
         integration_agent_skill_supported: true,
         // Filled by the `host.inspect` handler from the registry's config dir.
         host_hooks: None,
+        runtime_api: Some(SUPPORTED_RUNTIME_API),
+        runtime_features: runtime_feature_ids().map(str::to_owned).collect(),
     }
 }
 

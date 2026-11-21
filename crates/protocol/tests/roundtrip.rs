@@ -3957,6 +3957,8 @@ fn host_capabilities_json_shape_roundtrips() {
         integration_agent_skill_supported: true,
         package_index_apply_supported: true,
         host_hooks: None,
+        runtime_api: Some(1),
+        runtime_features: vec!["launch-env-v1".to_owned()],
         session_new_skip_repo_hooks_supported: false,
     };
 
@@ -4004,7 +4006,9 @@ fn host_capabilities_json_shape_roundtrips() {
             "package_create_preset_supported": true,
             "package_remove_profile_supported": true,
             "integration_agent_skill_supported": true,
-            "package_index_apply_supported": true
+            "package_index_apply_supported": true,
+            "runtime_api": 1,
+            "runtime_features": ["launch-env-v1"]
         })
     );
 

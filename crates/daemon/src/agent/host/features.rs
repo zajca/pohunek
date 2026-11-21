@@ -194,6 +194,12 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
     },
 ];
 
+/// The ids of [`RUNTIME_FEATURES`], in registry order: what `host.inspect`
+/// reports as `runtime_features`.
+pub(crate) fn runtime_feature_ids() -> impl Iterator<Item = &'static str> {
+    RUNTIME_FEATURES.iter().map(|feature| feature.id)
+}
+
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
 pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
