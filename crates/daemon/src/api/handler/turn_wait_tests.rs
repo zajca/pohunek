@@ -151,6 +151,26 @@ impl Fixture {
         Self::assemble(root, sessions)
     }
 
+    /// Replaces the daemon over the same data directory, as a daemon restart
+    /// does: the sessions do not survive in the new registry, the notification
+    /// store does, and startup reconciliation runs before the API serves.
+    pub(super) async fn restarted(self) -> Self {
+        let root = Arc::clone(&self.root);
+        drop(self);
+        let agents = root.path().join("agents");
+        let sessions = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                agents_dir: Some(agents),
+                ..SessionRegistryConfig::default()
+            },
+            official_host(),
+        );
+        let notifications = NotificationService::open(&root.path().join("data"))
+            .expect("notification service opens");
+        crate::notifications::resolve_stale_attention(&sessions, &notifications).await;
+        Self::assemble(root, sessions)
+    }
+
     fn assemble(root: Arc<tempfile::TempDir>, sessions: SessionRegistry) -> Self {
         let notifications = NotificationService::open(&root.path().join("data"))
             .expect("notification service opens");

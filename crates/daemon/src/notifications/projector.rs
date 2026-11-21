@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::events::{EventOrigin, ProducedEvent};
 use crate::session::{SessionRegistry, TurnEdge, TurnId};
@@ -198,6 +198,78 @@ async fn resync_from_registry(
         state
             .handle_session_snapshot_blocking(notifications, attention, &session, read_at)
             .await;
+    }
+}
+
+/// Acknowledges every open attention record whose session no longer waits for
+/// the owner, as the registry reads it now.
+///
+/// Run once after startup reconciliation: the projector only sees transitions
+/// that happen while it runs, so a record the previous daemon left open for a
+/// session that was removed, ended, lost its runtime or went back to work
+/// while the daemon was down would otherwise stay unread forever. A session
+/// that is blocked or idle keeps its record, exactly as it does while the
+/// daemon runs. Returns how many sessions had records acknowledged.
+pub async fn resolve_stale_attention(
+    sessions: &SessionRegistry,
+    notifications: &NotificationService,
+) -> usize {
+    let open = notifications.active_attention_sessions();
+    if open.is_empty() {
+        return 0;
+    }
+    let live: HashMap<SessionId, SessionInfo> = sessions
+        .list()
+        .await
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect();
+    let stale: Vec<SessionId> = open
+        .into_iter()
+        .filter(|id| live.get(id).is_none_or(session_no_longer_waits))
+        .collect();
+    let service = notifications.clone();
+    let resolved = run_projector_blocking(move || {
+        let mut count = 0;
+        for id in &stale {
+            match service.resolve_session_notifications(&attention_dedupe_key(id), None) {
+                Ok(records) if !records.is_empty() => count += 1,
+                Ok(_) => {}
+                Err(error) => warn!(
+                    session.id = %id.0,
+                    error = %error,
+                    "failed to acknowledge a stale attention record at startup"
+                ),
+            }
+        }
+        count
+    })
+    .await
+    .unwrap_or_else(|error| {
+        warn!(error = %error, "stale attention reconciliation task panicked");
+        0
+    });
+    if resolved > 0 {
+        info!(
+            notification.stale_sessions = resolved,
+            "acknowledged attention records of sessions that no longer wait"
+        );
+    }
+    resolved
+}
+
+/// Whether `session` is in a state in which it cannot wait for the owner: it
+/// ended, runs on a lost runtime, or reports active work.
+fn session_no_longer_waits(session: &SessionInfo) -> bool {
+    match session.state {
+        SessionState::Stopped | SessionState::Done | SessionState::Failed => true,
+        SessionState::Starting | SessionState::Running => {
+            session
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+                || session.activity == Some(AgentActivity::Working)
+        }
     }
 }
 
@@ -645,6 +717,11 @@ impl ProjectorState {
                     self.handle_explicit_stop(attention, &payload.session);
                 }
             }
+            event::SESSION_REMOVED => {
+                if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
+                    self.forget_session(attention, &payload.session.id);
+                }
+            }
             _ => {}
         }
         Vec::new()
@@ -817,6 +894,18 @@ impl ProjectorState {
             self.record_approvals.remove(&session.id);
             self.blocked_replay_candidates.remove(&session.id);
         }
+    }
+
+    /// A removed session needs nothing from the owner any more: its attention
+    /// records resolve and the projector keeps no state for it.
+    fn forget_session(&mut self, attention: &AttentionCoordinator, session_id: &SessionId) {
+        resolve_session_notifications(attention, session_id);
+        self.lifecycle_by_session.remove(session_id);
+        self.activity_by_session.remove(session_id);
+        self.blocked_kind_by_session.remove(session_id);
+        self.record_backed_blocks.remove(session_id);
+        self.record_approvals.remove(session_id);
+        self.blocked_replay_candidates.remove(session_id);
     }
 
     fn handle_explicit_stop(&mut self, attention: &AttentionCoordinator, session: &SessionInfo) {

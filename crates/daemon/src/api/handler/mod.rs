@@ -27,6 +27,8 @@ mod package;
 mod project;
 mod session;
 #[cfg(test)]
+mod stale_attention_tests;
+#[cfg(test)]
 #[cfg(test)]
 mod turn_wait_tests;
 mod util;
