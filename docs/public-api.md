@@ -3118,6 +3118,52 @@ running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.
 
+After a committed `pohunek service upgrade`, the report's `assistant` object
+describes the assistant context package `pohunek.context.assistant` of the
+upgraded daemon: `package_id`, `status` (`current`, `outdated`, `absent`,
+`unselected` or `unchecked`, read after the step), `version` (the selected one,
+`null` when none), `core_version`, `detail` and `command`. An upgrade to a newer
+version that is not `--repair` and not `--no-assistant-package` also installs the
+package: it asks the signed plugin index for the highest version listed for the
+new core and installs it through the daemon, which verifies the signature,
+revocations, freshness and archive digest as for `pohunek setup`. The step makes
+no index request when the package is already current. `assistant.install` is
+present when the step did something and carries `result`, `version` and `digest`
+(for `installed`), `replaced_version` and `replaced_digest` (the previously
+selected one, so `pohunek plugin select pohunek.context.assistant --digest
+<replaced_digest>` selects it again), `detail` and `command`; the fields that do
+not apply are `null`. `result` is one of:
+
+- `installed`: a newer version is installed and selected in one registry commit;
+  the old version stays installed. The daemon verifies the signed index and the
+  archive digest for it, as for `pohunek setup`;
+- `not_published`: the index lists no version newer than the selected one for the
+  new core (the package is published after the core release, and the official
+  index lists it only once it is admitted), so the old package is kept;
+  `command` is `pohunek setup`;
+- `held`: the selected version is disabled, or a version is installed and none
+  is selected (no index request is made), or the listed version is installed
+  and not selected or disabled (found after the index is read; a daemon
+  install of an installed digest keeps its recorded state, so only
+  `plugin select` changes the selection, and the step changes none); `command` names the
+  `plugin enable` and `plugin select` steps;
+- `failed`: the index or the archive could not be fetched, or the index or the
+  digest was refused (`detail` carries the reason); the daemon installs nothing
+  it did not verify, `status` and `version` are read after the attempt and
+  `command` is `pohunek setup`;
+- `skipped`: `--no-assistant-package` was given; no index request was made.
+
+An absent package is installed; an explicit `plugin select` of an older version
+that still serves is replaced, as `pohunek setup` replaces it, unless the listed
+version is already installed (`held`, above). No result fails the
+upgrade or rolls the core back, the exit code stays 0, and a failed or rolled-back
+upgrade carries no `assistant` object. A run that is not a forward move to this
+build's version (a rollback with `--from <previous>`, an unchanged version, a
+`--repair`) reports the state only (`--no-assistant-package` still reports
+`skipped`), and a newer selected package keeps serving
+after a rollback. A fresh `pohunek service install` does not install the package;
+`pohunek setup` does.
+
 `pohunek service install --repair` and `pohunek service upgrade --repair` are the
 supported recovery for a refused (`service_version_untrusted`) or missing version
 directory. The flag acts only on the directory of the version the run installs: a
@@ -3514,7 +3560,7 @@ reached before its check is `would_lose_recovery` with `reference_unverified_wit
 never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
 the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline
 grows with it). The flag reaches only this release's upgrade preflight: a rollback's preflight runs the previous release's daemon with the default
-budget. The flag is sent to the daemon as `--probe-budget-secs` only when it differs from the default. An installer user (`packaging/install-daemon.sh`) cannot pass a budget, so it runs the archive's own commands: `<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then `<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`. The wrapper runs both under `pohunek service lock` and passes `--accept-runtime-loss` to both when given; after a successful run it prints the hook asset step (`pohunek integration doctor` and `pohunek integration install --agent <agent>`), which a direct `service upgrade` does not print.  For a runtime that declares a version probe, the
+budget. The flag is sent to the daemon as `--probe-budget-secs` only when it differs from the default. An installer user (`packaging/install-daemon.sh`) cannot pass a budget, so it runs the archive's own commands: `<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then `<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`. The wrapper runs both under `pohunek service lock` and passes `--accept-runtime-loss` to both when given (`--no-assistant-package` goes to `service upgrade` only); after a successful run it prints the hook asset step (`pohunek integration doctor` and `pohunek integration install --agent <agent>`), which a direct `service upgrade` does not print.  For a runtime that declares a version probe, the
 preflight runs the same isolated, bounded probe resume runs (the frozen program
 with the probe's arguments, a private `HOME` and working directory), so
 `service check` executes those programs. It writes no pohunek state. Identical

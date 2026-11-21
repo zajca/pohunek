@@ -531,11 +531,13 @@ is refused the same way.
 `--accept-runtime-loss` is the one consent for the service-managed upgrade below;
 there is no second flag. See [debug session runtime](debug-session-runtime.md).
 
-After a core upgrade, move the assistant context package to the version that
-matches it. `pohunek service upgrade` never installs it: its report prints an
-`assistant` line (and `--json` an `assistant` object) when the selected version
-is older than the core, and `pohunek setup` installs the version the plugin
-index lists. Without the index, `pohunek plugin update pohunek.context.assistant
+After a core upgrade, the assistant context package moves to the version that
+matches it. `pohunek service upgrade` installs the version the plugin index
+lists for the new core and prints an `assistant` line (and `--json` an
+`assistant` object with `install.result`). An index that does not list it yet
+gives `not_published`, and `pohunek setup` installs it later; a package you
+disabled or did not select stays as set; `--no-assistant-package` skips the
+step on a host without access to the index. Without the index, `pohunek plugin update pohunek.context.assistant
 <archive> --sha256 <digest>` installs and selects it (a plain `plugin install` leaves the old version
 selected); see `docs/install.md`, "Install the assistant package", and the
 [context package guide](../guides/runtime-packages.md#declaring-a-context-package).

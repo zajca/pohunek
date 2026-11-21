@@ -23,7 +23,7 @@ use pohunek_service_config::runtimes::{
 };
 
 use crate::client::Client;
-use crate::commands::{plugin, render_json, setup_assistant};
+use crate::commands::{plugin, render_json, setup_assistant, upgrade_assistant};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::service::runtimes::{kept_selection_line, profile_detail, replaces_newer_warning};
@@ -102,6 +102,15 @@ pub(crate) enum Action {
             value_parser = clap::value_parser!(u64).range(MIN_PROBE_BUDGET_SECS..=MAX_PROBE_BUDGET_SECS)
         )]
         preflight_budget: Option<u64>,
+        /// Do not install the assistant context package after the upgrade.
+        ///
+        /// By default a committed upgrade to a newer version installs and
+        /// selects the `pohunek.context.assistant` version the signed plugin
+        /// index lists for the new core, and reports the outcome. The step asks
+        /// the network; use the flag on a host without access to the index. The
+        /// upgrade itself never fails or rolls back because of the package.
+        #[arg(long)]
+        no_assistant_package: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -258,11 +267,17 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             accept_runtime_loss,
             repair,
             preflight_budget,
+            no_assistant_package,
             json,
         } => {
             let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
             let report = service::upgrade(from, accept_runtime_loss, budget, repair).await?;
-            let report = with_assistant(report, Paths::resolve()).await;
+            let options = upgrade_assistant::Options {
+                opt_out: no_assistant_package,
+                repair,
+                index_url: None,
+            };
+            let report = upgrade_assistant::reconcile(report, Paths::resolve(), &options).await;
             emit(json, &report, render_upgrade)
         }
         Action::RefreshPath {
@@ -303,15 +318,6 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `report` with the assistant package state of the upgraded installation.
-pub(crate) async fn with_assistant(
-    mut report: report::UpgradeReport,
-    paths: Result<Paths, CliError>,
-) -> report::UpgradeReport {
-    report.assistant = Some(assistant_state(&report.to_version, paths).await);
-    report
-}
-
 /// The assistant context package as the upgraded daemon lists it, compared
 /// with the core the upgrade installed. A daemon that cannot be asked is
 /// reported as `unchecked`; it never fails the upgrade, which has finished.
@@ -331,6 +337,7 @@ pub(crate) async fn assistant_state(
         core_version: core_version.to_owned(),
         detail: None,
         command: None,
+        install: None,
     };
     let listed = match listed {
         Ok(listed) => listed,
@@ -364,8 +371,14 @@ pub(crate) async fn assistant_state(
 }
 
 /// Appends the assistant package line of an upgrade that has something to
-/// tell: an older selected package or a daemon that could not be asked.
+/// tell: what the install step did, an older selected package or a daemon
+/// that could not be asked.
 pub(crate) fn render_assistant(text: &mut String, state: &report::AssistantPackageReport) {
+    if let Some(install) = &state.install {
+        if render_install_outcome(text, state, install) {
+            return;
+        }
+    }
     match state.status {
         report::AssistantPackageStatus::Outdated => {
             let _ = writeln!(
@@ -394,6 +407,57 @@ pub(crate) fn render_assistant(text: &mut String, state: &report::AssistantPacka
         | report::AssistantPackageStatus::Absent
         | report::AssistantPackageStatus::Unselected => {}
     }
+}
+
+/// Appends the line of the install step; `false` for an opt-out, which prints
+/// the line of the package state instead.
+fn render_install_outcome(
+    text: &mut String,
+    state: &report::AssistantPackageReport,
+    install: &report::AssistantInstall,
+) -> bool {
+    let detail = install.detail.as_deref().unwrap_or("-");
+    let command = install
+        .command
+        .as_deref()
+        .unwrap_or(setup_assistant::UPDATE_COMMAND);
+    match install.result {
+        report::AssistantInstallResult::Installed => {
+            let current = install.version.as_deref().unwrap_or("-");
+            let change = match install.replaced_version.as_deref() {
+                Some(old) => format!("{old} -> {current}"),
+                None => current.to_owned(),
+            };
+            let _ = writeln!(
+                text,
+                "assistant  {} {change} installed from the plugin index",
+                state.package_id
+            );
+        }
+        report::AssistantInstallResult::NotPublished => {
+            let _ = writeln!(
+                text,
+                "assistant  {} was not updated: {detail}; run `{command}` once the index lists it",
+                state.package_id
+            );
+        }
+        report::AssistantInstallResult::Held => {
+            let _ = writeln!(
+                text,
+                "assistant  {} was left as you set it: {detail}; `{command}` undoes it",
+                state.package_id
+            );
+        }
+        report::AssistantInstallResult::Failed => {
+            let _ = writeln!(
+                text,
+                "assistant  {} was not installed: {detail}; run `{command}` to retry",
+                state.package_id
+            );
+        }
+        report::AssistantInstallResult::Skipped => return false,
+    }
+    true
 }
 
 fn emit<T: serde::Serialize>(
@@ -1457,6 +1521,7 @@ mod tests {
                 accept_runtime_loss: false,
                 repair: false,
                 preflight_budget: None,
+                no_assistant_package: false,
                 json: false
             }
         ));
@@ -1467,7 +1532,15 @@ mod tests {
                 accept_runtime_loss: true,
                 repair: false,
                 preflight_budget: None,
+                no_assistant_package: false,
                 json: true
+            }
+        ));
+        assert!(matches!(
+            parse(&["upgrade", "--no-assistant-package"]),
+            Action::Upgrade {
+                no_assistant_package: true,
+                ..
             }
         ));
         assert!(matches!(

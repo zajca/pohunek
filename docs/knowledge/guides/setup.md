@@ -262,9 +262,10 @@ daemon verifies the index and the archive digest, and every outcome without that
 verification (index unreachable or without the package, a document the daemon
 refuses, a daemon without the index channel) is a gap that ends the run with
 `setup_incomplete` and the manual command of `docs/install.md`. `pohunek service
-upgrade` does not install the package; its report names `pohunek setup` when the
-selected package is older than the new core, and `pohunek assistant` prints the
-same note for an older bundle.
+upgrade` installs the package itself after a committed upgrade to a newer version
+(`--no-assistant-package` skips it) and reports the outcome as `assistant.install`,
+with `not_published` and `pohunek setup` while the index does not list it yet;
+`pohunek assistant` prints a note for an older bundle.
 `--hooks none|all|<agent[:profile]>,...` (default `all`) limits the hooks to
 none or to the listed agent homes: the preview, the result and `--dry-run
 --json` then list only the selected homes (and the gaps about their profile
