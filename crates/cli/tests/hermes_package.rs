@@ -3349,16 +3349,17 @@ async fn hermes_launches_only_from_the_installed_official_package() {
         no_bundle["err"]["code"], "assistant_package_missing",
         "{no_bundle}"
     );
-    // A bundle older than the core names the command that updates it; one at
-    // the core's version carries no note.
-    install_assistant_context_package(&harness, &cwd, "0.0.1", false).await;
+    // A bundle older than the serving daemon (which reports `0.0.0-test`)
+    // names the command that updates it; one at the daemon's version carries
+    // no note.
+    install_assistant_context_package(&harness, &cwd, "0.0.0-alpha.1", false).await;
     let (code, picked) = assistant().await;
     assert_eq!(code, 0, "{picked}");
     assert_eq!(picked["ok"]["agent"], "hermes", "{picked}");
     let note = picked["ok"]["knowledge_bundle_note"]
         .as_str()
         .expect("an older bundle carries a note");
-    assert!(note.contains("0.0.1"), "{note}");
+    assert!(note.contains("0.0.0-alpha.1"), "{note}");
     assert!(note.contains("pohunek setup"), "{note}");
     let human = harness
         .run(&[
@@ -3372,7 +3373,7 @@ async fn hermes_launches_only_from_the_installed_official_package() {
         String::from_utf8_lossy(&human.stdout).contains("note: the assistant package"),
         "{human:?}"
     );
-    install_assistant_context_package(&harness, &cwd, env!("CARGO_PKG_VERSION"), true).await;
+    install_assistant_context_package(&harness, &cwd, "0.0.0-test", true).await;
     let (code, current) = assistant().await;
     assert_eq!(code, 0, "{current}");
     assert!(
