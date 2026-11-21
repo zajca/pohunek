@@ -3135,14 +3135,16 @@ selected one, so `pohunek plugin select pohunek.context.assistant --digest
 not apply are `null`. `result` is one of:
 
 - `installed`: a newer version is installed and selected in one registry commit;
-  the old version stays installed;
+  the old version stays installed. A listed version that is already installed and
+  enabled while an older one is selected (after a rollback with `plugin select`)
+  is selected without a download and reported the same way;
 - `not_published`: the index lists no version newer than the selected one for the
   new core (the package is published after the core release, and the official
   index lists it only once it is admitted), so the old package is kept;
   `command` is `pohunek setup`;
 - `held`: the selected version is disabled, or a version is installed and none
   is selected (no index request is made), or the listed version is installed
-  and not selected (found after the index is read); `command` names the
+  and disabled (found after the index is read); `command` names the
   `plugin enable` and `plugin select` steps;
 - `failed`: the index or the archive could not be fetched, or the index or the
   digest was refused (`detail` carries the reason); the daemon installs nothing
@@ -3556,7 +3558,7 @@ reached before its check is `would_lose_recovery` with `reference_unverified_wit
 never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
 the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline
 grows with it). The flag reaches only this release's upgrade preflight: a rollback's preflight runs the previous release's daemon with the default
-budget. The flag is sent to the daemon as `--probe-budget-secs` only when it differs from the default. An installer user (`packaging/install-daemon.sh`) cannot pass a budget, so it runs the archive's own commands: `<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then `<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`. The wrapper runs both under `pohunek service lock` and passes `--accept-runtime-loss` to both when given; after a successful run it prints the hook asset step (`pohunek integration doctor` and `pohunek integration install --agent <agent>`), which a direct `service upgrade` does not print.  For a runtime that declares a version probe, the
+budget. The flag is sent to the daemon as `--probe-budget-secs` only when it differs from the default. An installer user (`packaging/install-daemon.sh`) cannot pass a budget, so it runs the archive's own commands: `<archive dir>/pohunek service check --preflight-budget <SECONDS>`, then `<archive dir>/pohunek service upgrade --from <archive dir> --preflight-budget <SECONDS>`. The wrapper runs both under `pohunek service lock` and passes `--accept-runtime-loss` to both when given (`--no-assistant-package` goes to `service upgrade` only); after a successful run it prints the hook asset step (`pohunek integration doctor` and `pohunek integration install --agent <agent>`), which a direct `service upgrade` does not print.  For a runtime that declares a version probe, the
 preflight runs the same isolated, bounded probe resume runs (the frozen program
 with the probe's arguments, a private `HOME` and working directory), so
 `service check` executes those programs. It writes no pohunek state. Identical

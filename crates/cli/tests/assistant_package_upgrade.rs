@@ -439,11 +439,14 @@ async fn a_refused_install_changes_nothing_and_a_later_good_index_installs() {
     assert_failed(&document, "the index lists");
     assert_eq!(rig.listed().await, before);
 
-    // The index is signed by a key the release does not endorse.
+    // The index is signed by a key the release does not endorse, with a
+    // sequence above the good document's: the daemon must not record it.
     let entry = assistant_index::assistant_entry(&archive, VERSION, rig.server.url(&archive_path));
     let stranger = test_key();
-    rig.server
-        .set(INDEX_PATH, rig.keys.document(&stranger, now(), vec![entry]));
+    rig.server.set(
+        INDEX_PATH,
+        rig.keys.document(&stranger, now() + 1000, vec![entry]),
+    );
     rig.server.set(&archive_path, archive.bytes.clone());
     let document = document_of_upgrade(&rig).await;
     assert_failed(&document, "package_untrusted");
@@ -506,8 +509,95 @@ async fn a_store_that_cannot_be_written_leaves_the_selection_unchanged() {
     assert_eq!(leftovers.len(), before.len(), "{leftovers:?}");
 }
 
-/// A package the owner disabled, or the owner's choice of another version,
-/// stays as set: nothing is asked of the index and nothing changes.
+/// The rollback flow: the listed version is installed and enabled, the owner
+/// selected an older one, and a later upgrade selects the listed version again
+/// without downloading it and reports the version it replaced. A listed
+/// version the owner disabled stays as set.
+#[tokio::test]
+async fn an_installed_listed_version_is_selected_again_after_a_rollback() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    let old_digest = rig.install_by_digest(OLDER_VERSION).await;
+    let archive = rig.publish(VERSION);
+    let first = document_of_upgrade(&rig).await;
+    assert_eq!(install_of(&first)["result"], "installed", "{first}");
+
+    let (code, selected) = rig
+        .install
+        .json(&[
+            "plugin",
+            "select",
+            ASSISTANT_PACKAGE,
+            "--digest",
+            &old_digest,
+        ])
+        .await;
+    assert_eq!(code, 0, "{selected}");
+    assert_eq!(
+        rig.selected().await.expect("selected").version,
+        OLDER_VERSION
+    );
+    let archive_path = assistant_index::archive_path(VERSION);
+    let downloads = |rig: &Rig| {
+        rig.server
+            .requests()
+            .iter()
+            .filter(|path| **path == archive_path)
+            .count()
+    };
+    let before = downloads(&rig);
+
+    let document = document_of_upgrade(&rig).await;
+    let install = install_of(&document);
+    assert_eq!(install["result"], "installed", "{document}");
+    assert_eq!(install["digest"], archive.digest.as_str(), "{document}");
+    assert_eq!(install["replaced_version"], OLDER_VERSION, "{document}");
+    assert_eq!(install["replaced_digest"], old_digest, "{document}");
+    assert_eq!(document["assistant"]["status"], "current", "{document}");
+    let selected = rig.selected().await.expect("a version is selected");
+    assert_eq!(selected.digest, archive.digest.as_str());
+    assert!(selected.enabled);
+    assert_eq!(
+        downloads(&rig),
+        before,
+        "an installed version is selected, not downloaded again"
+    );
+
+    let (code, back) = rig
+        .install
+        .json(&[
+            "plugin",
+            "select",
+            ASSISTANT_PACKAGE,
+            "--digest",
+            &old_digest,
+        ])
+        .await;
+    assert_eq!(code, 0, "{back}");
+    let (code, disabled) = rig
+        .install
+        .json(&[
+            "plugin",
+            "disable",
+            ASSISTANT_PACKAGE,
+            "--digest",
+            archive.digest.as_str(),
+        ])
+        .await;
+    assert_eq!(code, 0, "{disabled}");
+    let held = document_of_upgrade(&rig).await;
+    assert_eq!(install_of(&held)["result"], "held", "{held}");
+    assert_eq!(
+        rig.selected().await.expect("selected").version,
+        OLDER_VERSION,
+        "a disabled listed version is not selected"
+    );
+}
+
+/// A package the owner disabled stays as set: nothing is asked of the index
+/// and nothing changes.
 #[tokio::test]
 async fn a_package_the_owner_disabled_is_left_as_set() {
     if !pohunek_test_support::process_env::in_own_process() {

@@ -89,6 +89,13 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
+# The command a refusal hint tells the owner to run again, with the opt-out an
+# offline host relies on.
+rerun=$0
+if [ "$no_assistant_package" -eq 1 ]; then
+    rerun="$0 --no-assistant-package"
+fi
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 archive_dir=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
@@ -109,9 +116,9 @@ if [ -e "$legacy_unit_dir/pohunekd.service" ]; then
     echo "nothing was changed" >&2
     if [ "$(uname -s)" = Linux ]; then
         echo "install release v0.40.1 first (it migrates the host to the service-managed daemon)," >&2
-        echo "then re-run $0 from this release" >&2
+        echo "then re-run $rerun from this release" >&2
     else
-        echo "this host never ran that install: remove the file and re-run $0" >&2
+        echo "this host never ran that install: remove the file and re-run $rerun" >&2
     fi
     exit 1
 fi
@@ -125,7 +132,7 @@ if [ -e "$legacy_manifest" ]; then
     echo "$legacy_manifest is a pending migration manifest of a pre-service install;" >&2
     echo "nothing was changed" >&2
     echo "install release v0.40.1 first (its daemon imports the manifest)," >&2
-    echo "then re-run $0 from this release" >&2
+    echo "then re-run $rerun from this release" >&2
     exit 1
 fi
 
@@ -153,7 +160,7 @@ fi
 if ! status_json=$("$archive_dir/pohunek" service status --json); then
     printf '%s\n' "$status_json" >&2
     echo "\`pohunek service status --json\` failed; nothing was changed" >&2
-    echo "fix the reported problem and re-run $0" >&2
+    echo "fix the reported problem and re-run $rerun" >&2
     exit 1
 fi
 if ! printf '%s\n' "$status_json" | grep -q '"pending_transaction"'; then
@@ -202,7 +209,7 @@ normalize_prefix() {
 }
 refuse_prefix() {
     echo "$1" >&2
-    echo "nothing was changed; fix the install prefix and re-run $0" >&2
+    echo "nothing was changed; fix the install prefix and re-run $rerun" >&2
     exit 1
 }
 requested_prefix=${POHUNEK_INSTALL_PREFIX:-}
@@ -266,18 +273,18 @@ fi
 if ! check_json=$("$archive_dir/pohunek" "$@"); then
     printf '%s\n' "$check_json" >&2
     echo "\`pohunek service $service_action\` would refuse this host;" >&2
-    echo "nothing was changed; fix the reported problem and re-run $0" >&2
+    echo "nothing was changed; fix the reported problem and re-run $rerun" >&2
     if printf '%s\n' "$check_json" | grep -q 'service_upgrade_sessions_at_risk'; then
         echo "live sessions the upgrade would not carry over are listed above" >&2
         if printf '%s\n' "$check_json" | grep -q 'the path a pending search-path refresh'; then
             echo "a search-path refresh is pending and the refusal judged with the path its rollback restores:" >&2
-            echo "run the same pohunek that started the refresh with: service refresh-path (without a dry run) to finish it, then re-run $0 without --accept-runtime-loss" >&2
+            echo "run the same pohunek that started the refresh with: service refresh-path (without a dry run) to finish it, then re-run $rerun without --accept-runtime-loss" >&2
         elif printf '%s\n' "$check_json" | grep -q 'the search path this upgrade judged with is:'; then
             echo "the refusal names the recorded search path; if a runtime moved since it was recorded, do not accept the loss:" >&2
-            echo "run $archive_dir/pohunek service refresh-path --dry-run, then $archive_dir/pohunek service refresh-path, then re-run $0 without --accept-runtime-loss" >&2
-            echo "otherwise re-run $0 --accept-runtime-loss to accept losing the listed sessions" >&2
+            echo "run $archive_dir/pohunek service refresh-path --dry-run, then $archive_dir/pohunek service refresh-path, then re-run $rerun without --accept-runtime-loss" >&2
+            echo "otherwise re-run $rerun --accept-runtime-loss to accept losing the listed sessions" >&2
         else
-            echo "re-run $0 --accept-runtime-loss to accept losing them" >&2
+            echo "re-run $rerun --accept-runtime-loss to accept losing them" >&2
         fi
     fi
     exit 1

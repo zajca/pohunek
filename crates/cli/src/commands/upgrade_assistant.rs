@@ -9,6 +9,8 @@
 
 // Rust guideline compliant 2026-11-21
 
+use protocol::{method, PackageSelectParams};
+
 use crate::client::Client;
 use crate::commands::plugin::{self, Error};
 use crate::commands::plugin_index;
@@ -160,37 +162,57 @@ async fn install(
         return not_published(core, selected_version);
     }
     let digest = resolved.digest.as_str().to_owned();
-    if let Some(held) = listed.packages.iter().find(|info| {
+    let installed = listed.packages.iter().find(|info| {
         info.package.id == resolved.id
             && info.digest == resolved.digest
             && info.fault.is_none()
             && !info.revoked
-    }) {
-        // The listed digest is installed and healthy but not selected: the
-        // owner selected another version, and a reinstall of the same digest
-        // keeps the daemon's selection as it is.
-        return outcome(
-            AssistantInstallResult::Held,
-            Some(format!(
-                "version {} is installed but not selected, which the upgrade leaves as it is",
-                held.package.version
-            )),
-            Some(format!(
-                "pohunek plugin enable {PACKAGE_ID} --digest {digest} && pohunek plugin select {PACKAGE_ID} --digest {digest}"
-            )),
-        );
+    });
+    if let Some(held) = installed {
+        if !held.enabled {
+            // The owner disabled the listed digest: it stays as set.
+            return outcome(
+                AssistantInstallResult::Held,
+                Some(format!(
+                    "version {} is installed but disabled, which the upgrade leaves as it is",
+                    held.package.version
+                )),
+                Some(format!(
+                    "pohunek plugin enable {PACKAGE_ID} --digest {digest} && pohunek plugin select {PACKAGE_ID} --digest {digest}"
+                )),
+            );
+        }
+        // The listed digest is installed and enabled while an older version
+        // serves: selecting it is the upgrade, and nothing is downloaded.
+        return match client
+            .call::<method::PackageSelect>(PackageSelectParams {
+                digest: resolved.digest.clone(),
+            })
+            .await
+        {
+            Ok(_) => installed_outcome(version, digest, selected),
+            Err(error) => failed(error.to_string()),
+        };
     }
     match setup_assistant::install(&mut client, &version, &digest, options.index_url).await {
-        Ok(()) => AssistantInstall {
-            result: AssistantInstallResult::Installed,
-            version: Some(version),
-            digest: Some(digest),
-            replaced_version: selected.map(|info| info.package.version.to_string()),
-            replaced_digest: selected.map(|info| info.digest.as_str().to_owned()),
-            detail: None,
-            command: None,
-        },
+        Ok(()) => installed_outcome(version, digest, selected),
         Err(detail) => failed(detail),
+    }
+}
+
+fn installed_outcome(
+    version: String,
+    digest: String,
+    replaced: Option<&protocol::PackageInfo>,
+) -> AssistantInstall {
+    AssistantInstall {
+        result: AssistantInstallResult::Installed,
+        version: Some(version),
+        digest: Some(digest),
+        replaced_version: replaced.map(|info| info.package.version.to_string()),
+        replaced_digest: replaced.map(|info| info.digest.as_str().to_owned()),
+        detail: None,
+        command: None,
     }
 }
 
