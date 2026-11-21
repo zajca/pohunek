@@ -16,18 +16,22 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use pohunek_platform::supervisor::UnitEnvironment;
-use protocol::{method, DaemonDoctorResult, HostCapabilities, Request};
+use protocol::{
+    method, DaemonDoctorResult, HostCapabilities, Request, SessionNewParams, ENV_DAEMON_ID,
+    ENV_SESSION_ID,
+};
 use serde_json::Value;
 
 use pohunek_daemon::api::{handle_request, DaemonState, HealthInfo, OverlaySource};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::runtime::{
-    LaunchEnvironment, ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError,
+    FollowGate, ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError,
     SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
-use pohunek_test_support::wait::HANG_GUARD;
+use pohunek_test_support::wait::{wait_until, HANG_GUARD};
+use pohunek_test_support::worker_binary;
 
 /// The scenario starts no worker, so the worker executable only has to be a
 /// well-formed absolute path.
@@ -42,8 +46,19 @@ const PROFILE: &str = "fixture";
 /// Reuse window of the manager read: zero, so every request reads the manager.
 const NO_REUSE: Duration = Duration::ZERO;
 
-/// Deadline of one manager read; the fake answers at once, so it never counts.
+/// Deadline of one manager read; only the manager that never answers reaches it.
 const READ_DEADLINE: Duration = HANG_GUARD;
+
+/// A store location a launched agent must keep as the process had it; the
+/// manager interface carries `PATH` and nothing else.
+const STORE_VARIABLE: &str = "CLAUDE_CONFIG_DIR";
+const STORE_VALUE: &str = "/process/claude-config";
+
+/// A daemon that follows a service manager's job and records no `search_path`.
+const FOLLOWING: FollowGate = FollowGate {
+    service_managed: true,
+    search_path_recorded: false,
+};
 
 /// What the fake manager answers next.
 #[derive(Debug, Clone)]
@@ -51,6 +66,8 @@ enum Answer {
     Path(OsString),
     NoPath,
     Unreachable,
+    /// Never answers; only the read deadline ends the wait.
+    Hang,
 }
 
 #[derive(Debug, Clone)]
@@ -93,23 +110,41 @@ impl ManagerEnvironment for FakeManager {
                 Answer::Path(path) => Ok(Some(path)),
                 Answer::NoPath => Ok(None),
                 Answer::Unreachable => Err(ManagerReadError::new("the fake manager is down")),
+                Answer::Hang => std::future::pending().await,
             }
         })
     }
 }
 
-/// Writes an executable `claude` into `directory`.
-fn install_agent(directory: &Path) {
+/// Writes an executable `claude` into `directory` that records the `PATH` and
+/// the store variable it runs with into `record`.
+fn install_agent(directory: &Path, record: &Path) {
     std::fs::create_dir_all(directory).expect("create the agent directory");
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
         .expect("make the agent directory owner-private");
     let program = directory.join(AGENT);
-    std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("write the agent");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$PATH\" \"${STORE_VARIABLE}\" > '{}'\n",
+            record.display()
+        ),
+    )
+    .expect("write the agent");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
         .expect("make the agent executable");
 }
 
-async fn state(root: &Path, manager: &FakeManager) -> DaemonState {
+/// How the registry under test starts agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launches {
+    /// No agent starts; the base environment is a fixed one.
+    Never,
+    /// A real worker starts the agent on the daemon's process environment.
+    Really,
+}
+
+async fn state(root: &Path, manager: &FakeManager, launches: Launches) -> DaemonState {
     let socket = root.join("daemon.sock");
     let environment = SubprocessWorkerEnvironment {
         runtime_home: root.join("worker/runtime"),
@@ -120,6 +155,18 @@ async fn state(root: &Path, manager: &FakeManager) -> DaemonState {
         home: root.join("worker"),
         daemon_socket: socket.clone(),
     };
+    for directory in [
+        "worker/runtime/pohunek/workers",
+        "worker/state/pohunek/workers",
+        "worker/data/pohunek",
+        "worker/config/pohunek",
+        "worker/cache/pohunek",
+    ] {
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .recursive(true)
+            .create(root.join(directory))
+            .expect("create the owner-private worker directory");
+    }
     let agents = root.join("agents");
     std::fs::create_dir(&agents).expect("create the agents directory");
     std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o700))
@@ -129,21 +176,25 @@ async fn state(root: &Path, manager: &FakeManager) -> DaemonState {
         format!("base = \"shell\"\nprogram = \"{AGENT}\"\n"),
     )
     .expect("write the profile");
+    let manager_path = ManagerPath::new(Arc::new(manager.clone()), NO_REUSE, READ_DEADLINE);
+    let supervision = match launches {
+        Launches::Never => environment
+            .supervision(PathBuf::from(WORKER_PLACEHOLDER))
+            .with_environment_source(support::hermetic_environment_source()),
+        Launches::Really => {
+            let mut supervision = environment.supervision(worker_binary());
+            supervision.environment_allowlist =
+                ["PATH", "HOME", STORE_VARIABLE].map(str::to_owned).to_vec();
+            supervision
+        }
+    };
     let config = SessionRegistryConfig {
         agents_dir: Some(agents),
+        host_state_dir: Some(root.join("host-state")),
         socket_path: Some(socket),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
         worker_state_root: Some(environment.state_home.join("pohunek/workers")),
-        supervision: Some(
-            environment
-                .supervision(PathBuf::from(WORKER_PLACEHOLDER))
-                .with_environment_source(support::hermetic_environment_source())
-                .with_manager_path(ManagerPath::new(
-                    Arc::new(manager.clone()),
-                    NO_REUSE,
-                    READ_DEADLINE,
-                )),
-        ),
+        supervision: Some(supervision.with_manager_path(manager_path)),
         ..support::hermetic_registry_config()
     };
     let registry =
@@ -208,7 +259,7 @@ async fn doctor_status(state: &DaemonState) -> [protocol::DoctorStatus; 2] {
 /// The search path is process-wide state, so each scenario runs in its own
 /// process.
 struct Started {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     process_dir: PathBuf,
     manager_dir: PathBuf,
     manager: FakeManager,
@@ -218,25 +269,82 @@ struct Started {
 
 impl Started {
     async fn new() -> Self {
+        Self::with(Launches::Never).await
+    }
+
+    async fn with(launches: Launches) -> Self {
         let root = pohunek_test_support::tempdir().expect("scratch directory");
         let process_dir = root.path().join("process-bin");
         let manager_dir = root.path().join("manager-bin");
         std::fs::create_dir_all(&process_dir).expect("process directory");
         std::fs::set_permissions(&process_dir, std::fs::Permissions::from_mode(0o700))
             .expect("owner-private process directory");
-        install_agent(&manager_dir);
+        install_agent(&manager_dir, &root.path().join("launched.txt"));
         let mut process = ProcessEnv::lock();
-        process.set("PATH", &process_dir);
+        process
+            .set("PATH", &process_dir)
+            .set(STORE_VARIABLE, STORE_VALUE)
+            .remove(ENV_DAEMON_ID)
+            .remove(ENV_SESSION_ID);
         let manager = FakeManager::answering(Answer::Path(process_dir.clone().into()));
-        let state = state(root.path(), &manager).await;
+        let state = state(root.path(), &manager, launches).await;
         Self {
-            _root: root,
+            root,
             process_dir,
             manager_dir,
             manager,
             state,
             _process: process,
         }
+    }
+
+    /// Starts the agent through `session.new` and returns the `PATH` and the
+    /// store variable the agent process recorded.
+    async fn launched(&self) -> (Vec<PathBuf>, String) {
+        let params = SessionNewParams {
+            client_request_id: None,
+            name: None,
+            agent: PROFILE.to_owned(),
+            cwd: Some(self.root.path().to_path_buf()),
+            cols: 80,
+            rows: 24,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            extended_input_ready_wait: None,
+            branch_source: None,
+            on_diverged: None,
+            input_ack_timeout_ms: None,
+            metadata: std::collections::BTreeMap::new(),
+            secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
+            fetch_ref: None,
+            agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
+        };
+        let request = Request::new(
+            "manager-path",
+            method::SESSION_NEW,
+            serde_json::to_value(params).expect("session.new params"),
+        )
+        .expect("valid request");
+        handle_request(&request, &self.state)
+            .await
+            .into_result()
+            .unwrap_or_else(|error| panic!("session.new failed: {error}"));
+        let record = self.root.path().join("launched.txt");
+        let recorded = wait_until("the agent to record its environment", || async {
+            let text = tokio::fs::read_to_string(&record).await.ok()?;
+            (text.matches('\n').count() == 2).then_some(text)
+        })
+        .await;
+        let (path, store) = recorded.split_once('\n').expect("two recorded lines");
+        (
+            std::env::split_paths(path).collect(),
+            store.trim_end().to_owned(),
+        )
     }
 
     /// The manager's `PATH` with the agent directory in front.
@@ -273,14 +381,31 @@ async fn a_daemon_started_before_the_manager_path_gains_an_agent_dir_finds_it() 
         doctor_status(&started.state).await,
         [protocol::DoctorStatus::Ok, protocol::DoctorStatus::Ok]
     );
-    // An agent launched now inherits the manager's PATH too.
-    let launch = LaunchEnvironment::subprocess_default()
-        .launch_search_path()
-        .expect("the launch environment builds")
-        .expect("the launch has a PATH");
-    assert!(
-        std::env::split_paths(&launch).any(|dir| dir == started.manager_dir),
-        "the launch PATH carries the agent directory"
+}
+
+/// R2 at the launch: `session.new` resolves the agent on the manager's `PATH`
+/// and the agent runs with that `PATH`.
+///
+/// R7: only `PATH` follows the manager; the agent keeps the process's value of
+/// every other variable.
+#[tokio::test]
+async fn a_session_started_after_the_manager_path_gains_an_agent_dir_runs_the_agent() {
+    if !in_own_process() {
+        return;
+    }
+    let started = Started::with(Launches::Really).await;
+    started.manager.answer(Answer::Path(started.with_agent()));
+
+    let (path, store) = started.launched().await;
+
+    assert_eq!(
+        path,
+        std::env::split_paths(&started.with_agent()).collect::<Vec<_>>(),
+        "the agent runs with the manager's PATH"
+    );
+    assert_eq!(
+        store, STORE_VALUE,
+        "the store variable keeps the process value"
     );
 }
 
@@ -325,7 +450,24 @@ async fn a_manager_that_does_not_answer_leaves_the_process_path() {
     );
 }
 
-/// R5: a daemon follows the manager only when its unit cannot decide its own
+/// R4: a manager that never answers is given up on at the read deadline and
+/// the daemon returns to its process `PATH`.
+#[tokio::test(start_paused = true)]
+async fn a_manager_that_never_answers_leaves_the_process_path() {
+    if !in_own_process() {
+        return;
+    }
+    let started = Started::new().await;
+    started.manager.answer(Answer::Path(started.with_agent()));
+    started.found().await;
+
+    started.manager.answer(Answer::Hang);
+
+    assert_eq!(inspected(&started.state).await, None);
+}
+
+/// R5: a daemon follows the manager only when it runs under a service
+/// manager, records no `search_path` and its unit cannot decide its own
 /// `PATH`.
 #[tokio::test]
 async fn a_unit_that_decides_its_own_path_is_not_followed() {
@@ -339,10 +481,45 @@ async fn a_unit_that_decides_its_own_path_is_not_followed() {
         ..UnitEnvironment::default()
     };
     let follow = |unit: UnitEnvironment| {
-        ManagerPath::follow(source(unit), "unit.service", NO_REUSE, READ_DEADLINE)
+        ManagerPath::follow(
+            source(unit),
+            "unit.service",
+            FOLLOWING,
+            NO_REUSE,
+            READ_DEADLINE,
+        )
     };
 
     assert!(follow(loaded()).await.is_some(), "an inheriting unit");
+    for (reason, gate) in [
+        (
+            "the daemon is not a service manager's job",
+            FollowGate {
+                service_managed: false,
+                ..FOLLOWING
+            },
+        ),
+        (
+            "the service configuration records a search_path",
+            FollowGate {
+                search_path_recorded: true,
+                ..FOLLOWING
+            },
+        ),
+    ] {
+        assert!(
+            ManagerPath::follow(
+                source(loaded()),
+                "unit.service",
+                gate,
+                NO_REUSE,
+                READ_DEADLINE
+            )
+            .await
+            .is_none(),
+            "{reason}"
+        );
+    }
     assert!(
         follow(UnitEnvironment {
             environment: vec!["PATHEXT=/x".to_owned(), "CLAUDE_CONFIG_DIR=/c".to_owned()],

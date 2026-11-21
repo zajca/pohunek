@@ -25,4 +25,6 @@ pub use launcher::{
     SubprocessWorkerLauncher, WorkerLaunchError, WorkerLaunchFuture, WorkerLauncher,
 };
 pub use lifecycle::{SubprocessWorkerEnvironment, SupervisionConfig};
-pub use manager_path::{ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError};
+pub use manager_path::{
+    FollowGate, ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError,
+};

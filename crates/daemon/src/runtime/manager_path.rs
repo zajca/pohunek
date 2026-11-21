@@ -79,6 +79,16 @@ pub trait ManagerEnvironment: std::fmt::Debug + Send + Sync {
     fn unit_environment<'a>(&'a self, unit: &'a str) -> ManagerFuture<'a, UnitEnvironment>;
 }
 
+/// What the daemon's own configuration says about where its `PATH` comes
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FollowGate {
+    /// The daemon runs as a job of a service manager.
+    pub service_managed: bool,
+    /// The service configuration records a `search_path` for the job.
+    pub search_path_recorded: bool,
+}
+
 /// The `PATH` of the daemon's service manager, read at most once per
 /// `max_age`.
 #[derive(Debug, Clone)]
@@ -118,15 +128,20 @@ impl ManagerPath {
     }
 
     /// Follows `source` when the job of `unit` takes the manager's `PATH` as it
-    /// is: the unit is loaded and nothing in it or its drop-ins can set a
-    /// `PATH`. An unreadable unit, or one that may set a `PATH`, answers `None`,
-    /// and the daemon keeps the `PATH` it started with.
+    /// is: the daemon runs under a service manager, its configuration records
+    /// no `search_path`, the unit is loaded and nothing in it or its drop-ins
+    /// can set a `PATH`. Otherwise, and for an unreadable unit, it answers
+    /// `None` and the daemon keeps the `PATH` it started with.
     pub async fn follow(
         source: Arc<dyn ManagerEnvironment>,
         unit: &str,
+        gate: FollowGate,
         max_age: Duration,
         deadline: Duration,
     ) -> Option<Self> {
+        if !gate.service_managed || gate.search_path_recorded {
+            return None;
+        }
         let environment = match tokio::time::timeout(deadline, source.unit_environment(unit)).await
         {
             Ok(Ok(environment)) => environment,

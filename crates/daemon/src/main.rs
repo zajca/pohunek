@@ -64,7 +64,7 @@ use pohunek_daemon::runtime::lifecycle::{
     DEV_WORKER_INITIALIZE,
 };
 #[cfg(target_os = "linux")]
-use pohunek_daemon::runtime::manager_path::SystemdUserManager;
+use pohunek_daemon::runtime::manager_path::{FollowGate, SystemdUserManager};
 use pohunek_daemon::runtime::{
     EnvironmentSource, LaunchEnvironment, ManagerPath, SubprocessWorkerLauncher, SupervisionConfig,
     WorkerLauncher,
@@ -1213,16 +1213,16 @@ async fn native_supervisor(
 /// deadline as the worker supervisor's calls.
 #[cfg(target_os = "linux")]
 async fn follow_manager_path(service: &ServiceConfig) -> Option<ManagerPath> {
-    if !service.search_path().entries().is_empty()
-        || std::env::var_os(INVOCATION_ID_VARIABLE).is_none()
-    {
-        return None;
-    }
+    let gate = FollowGate {
+        service_managed: std::env::var_os(INVOCATION_ID_VARIABLE).is_some(),
+        search_path_recorded: !service.search_path().entries().is_empty(),
+    };
     let deadline = service.deadlines().launchctl_command;
     let manager = SystemdUserManager::new(deadline);
     let followed = ManagerPath::follow(
         Arc::new(manager),
         &service.namespace().daemon_unit(),
+        gate,
         MANAGER_PATH_MAX_AGE,
         deadline,
     )
