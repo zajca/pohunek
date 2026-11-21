@@ -3949,6 +3949,18 @@ higher-ranked record is kept and an equal-ranked later record replaces the
 earlier one, so a provider hook report pending beside a user report is the one
 committed.
 
+Removing a session resolves its attention records like a terminal state does
+(below). Once after
+startup reconciliation, the daemon acknowledges every open attention record
+(`unread` or `read`) whose session is absent from the registry, is `stopped`,
+`done` or `failed`, or runs on a `lost` runtime, so a record the previous
+daemon left open across an upgrade or a host restart is never listed as unread
+for a session that no longer waits. A session that is still live keeps its
+record whatever its activity: only a `working` transition the running daemon
+observes resolves it. Each acknowledged record emits
+`notification_updated`, the signal for a client to dismiss a shown
+notification.
+
 When a session enters `working`, or reaches a terminal lifecycle state, the
 daemon resolves `attention:<session_id>` and `turn:<session_id>`. Pending
 records and signals with those keys are dropped before they ever persist, and
