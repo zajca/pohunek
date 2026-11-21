@@ -85,6 +85,29 @@ async fn a_restarted_daemon_lists_no_needs_you_record_for_a_session_it_does_not_
 }
 
 #[tokio::test]
+async fn the_startup_pass_keeps_the_record_of_a_live_session() {
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let waiting = fixture.session("stale-keep-waiting").await;
+    let busy = fixture.session("stale-keep-busy").await;
+    fixture.activity(&waiting, "working").await;
+    fixture.activity(&busy, "working").await;
+    let _inhibitor = pause_clock().await;
+    needs_you(&fixture, &waiting).await;
+    needs_you(&fixture, &busy).await;
+    let surfaced = Box::pin(surfaced_inbox(&fixture)).await;
+    assert!(open_records(&surfaced) >= 1, "{surfaced:?}");
+    tokio::time::advance(debounce() + FLUSH_SLACK).await;
+    settle().await;
+    let before = open_records(&fixture.inbox().await);
+    assert_eq!(before, 2);
+
+    assert_eq!(fixture.resolve_stale_attention().await, 0);
+
+    let inbox = fixture.inbox().await;
+    assert_eq!(open_records(&inbox), before, "{inbox:?}");
+}
+
+#[tokio::test]
 async fn removing_a_session_leaves_no_open_needs_you_record() {
     let fixture = Fixture::new(SessionRegistryConfig::default());
     let session = fixture.session("stale-remove").await;

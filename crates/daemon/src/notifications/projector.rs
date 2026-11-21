@@ -206,10 +206,9 @@ async fn resync_from_registry(
 ///
 /// Run once after startup reconciliation: the projector only sees transitions
 /// that happen while it runs, so a record the previous daemon left open for a
-/// session that was removed, ended, lost its runtime or went back to work
-/// while the daemon was down would otherwise stay unread forever. A session
-/// that is blocked or idle keeps its record, exactly as it does while the
-/// daemon runs. Returns how many sessions had records acknowledged.
+/// session that was removed, ended or lost its runtime while the daemon was
+/// down would otherwise stay unread forever. A live session keeps its record;
+/// only a transition the running daemon observes resolves it. Returns how many sessions had records acknowledged.
 pub async fn resolve_stale_attention(
     sessions: &SessionRegistry,
     notifications: &NotificationService,
@@ -258,18 +257,16 @@ pub async fn resolve_stale_attention(
     resolved
 }
 
-/// Whether `session` is in a state in which it cannot wait for the owner: it
-/// ended, runs on a lost runtime, or reports active work.
+/// Whether `session` cannot wait for the owner: it ended or runs on a lost
+/// runtime. The stored activity of a live session is not evidence, because
+/// detector transitions are not persisted.
 fn session_no_longer_waits(session: &SessionInfo) -> bool {
     match session.state {
         SessionState::Stopped | SessionState::Done | SessionState::Failed => true,
-        SessionState::Starting | SessionState::Running => {
-            session
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
-                || session.activity == Some(AgentActivity::Working)
-        }
+        SessionState::Starting | SessionState::Running => session
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == RuntimeState::Lost),
     }
 }
 

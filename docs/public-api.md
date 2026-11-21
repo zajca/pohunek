@@ -4024,10 +4024,11 @@ Removing a session resolves its attention records like a terminal state does
 (below). Once after
 startup reconciliation, the daemon acknowledges every open attention record
 (`unread` or `read`) whose session is absent from the registry, is `stopped`,
-`done` or `failed`, runs on a `lost` runtime, or reports activity `working`, so
-a record the previous daemon left open across an upgrade or a host restart is
-never listed as unread for a session that no longer waits. A `blocked` or
-`idle` session keeps its record. Each acknowledged record emits
+`done` or `failed`, or runs on a `lost` runtime, so a record the previous
+daemon left open across an upgrade or a host restart is never listed as unread
+for a session that no longer waits. A session that is still live keeps its
+record whatever its activity: only a `working` transition the running daemon
+observes resolves it. Each acknowledged record emits
 `notification_updated`, the signal for a client to dismiss a shown
 notification.
 
