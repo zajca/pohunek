@@ -9,8 +9,8 @@
 //! takes one [`SearchPath`] snapshot from that read and moves it to every
 //! resolver, `git` spawn and hook it reaches, so a probe, a worktree bind and a
 //! launch agree on what runs even while another operation refreshes. Work that
-//! starts no agent (diff, retention, removal, session-stop hooks, cwd tracking)
-//! takes the registry's last read without reading the manager again. The state
+//! starts no agent (diff, retention, removal, session-stop hooks, cwd tracking,
+//! project add, show and candidates) takes the registry's last read without reading the manager again. The state
 //! belongs to the [`ManagerPath`] of a registry; no process-wide copy exists, so
 //! two registries never share it.
 //!
@@ -205,13 +205,6 @@ impl ManagerPath {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    /// The `PATH` this daemon resolves executables on and gives its agents:
-    /// the manager's when a refresh has read one, else the process's.
-    #[must_use]
-    pub fn search_path(&self) -> Option<OsString> {
-        self.manager_path().or_else(|| std::env::var_os("PATH"))
     }
 
     fn store(&self, path: Option<OsString>) {

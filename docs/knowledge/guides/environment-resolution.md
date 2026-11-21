@@ -184,8 +184,15 @@ shims, a profile's `PATH`). A daemon that runs as its own unit with an empty
 `UnsetEnvironment=PATH`, in the unit or a drop-in) therefore reads the manager's
 `PATH` again when it inspects the host, runs a doctor, or starts or resumes a session (at most once a second, bounded by the
 installation's service-manager call deadline) and uses it for every executable
-lookup, the doctor's agent checks, hooks and the environment it gives new
-agents, so a probe and a launch agree. Only `PATH` follows the manager; other
+lookup (including `git` and the hook interpreter), the doctor's agent checks,
+the `PATH` hooks run with and the environment it gives new agents, so a probe and
+a launch agree. One create takes the `PATH` once and uses that one value for its
+probe, base environment, worktree bind and hooks, checkout trust, the
+`SessionStart` hook and the launch; a resume does the same for its probe, base
+environment, checkout trust and launch. Work that starts no agent (session diff,
+retention, removal, session-stop and agent-state hooks, working-directory
+tracking, `project add`, `project show`, `project candidates`) uses the last value the daemon read without reading the manager
+again. Only `PATH` follows the manager; other
 forwarded variables keep the value the process started with. A manager that does
 not answer, or has no `PATH`, leaves the `PATH` the daemon started with. Running
 sessions keep the environment they launched with. macOS and a recorded

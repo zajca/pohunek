@@ -2089,12 +2089,12 @@ pub(crate) struct HookContext {
     pub search_path: crate::runtime::SearchPath,
 }
 
-/// Build the env-clear allowlist a hook runs with: `PATH`/`HOME` passed through
-/// from the daemon's own env, plus the non-secret `POHUNEK_*` context. No daemon
-/// handshake var is ever included.
+/// Build the env-clear allowlist a hook runs with: `PATH` from the operation's
+/// search path, `HOME` from the daemon's own env, plus the non-secret
+/// `POHUNEK_*` context. No daemon handshake var is ever included.
 fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
     let mut env = Vec::new();
-    // Pass through PATH/HOME so a hook can find `git`/`npm`/etc. and resolve `~`.
+    // PATH/HOME let a hook find `git`/`npm`/etc. and resolve `~`.
     if let Some(path) = ctx.search_path.as_os_str() {
         env.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
     }
