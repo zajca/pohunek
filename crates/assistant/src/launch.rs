@@ -95,6 +95,8 @@ pub struct KnowledgeInfo {
     pub bundle_path: Option<String>,
     pub snapshot_path: String,
     pub version: String,
+    /// Version of the daemon that serves the bundle.
+    pub daemon_version: String,
     pub label: &'static str,
 }
 
@@ -116,6 +118,8 @@ pub struct LaunchMeta {
     pub intent: Intent,
     pub agent: String,
     pub knowledge_bundle_version: String,
+    /// Version of the daemon that serves the bundle.
+    pub daemon_version: String,
     pub snapshot_included: bool,
     pub auto_started_daemon: bool,
     pub knowledge: &'static str,
@@ -256,6 +260,7 @@ pub async fn prepare_with_options(
         bundle_path: Some(materialized.bundle_path.clone()),
         snapshot_path: materialized.snapshot_path.clone(),
         version: materialized.version,
+        daemon_version: capabilities.daemon_version.clone(),
         label: "materialized",
     };
 
@@ -315,6 +320,7 @@ pub async fn start_prepared_with_options(
             intent: prepared.intent,
             agent: prepared.selection.name,
             knowledge_bundle_version: prepared.knowledge.version,
+            daemon_version: prepared.knowledge.daemon_version,
             snapshot_included: prepared.snapshot_included,
             auto_started_daemon: prepared.auto_started_daemon,
             knowledge: prepared.knowledge.label,

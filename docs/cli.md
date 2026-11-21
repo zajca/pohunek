@@ -642,7 +642,7 @@ selected host. Codex, Claude Code and Hermes are served only by their official
 packages: on a host with none of them (and no capable host profile) the
 assistant answers `no_capable_agent`, whose hint names the package install.
 
-When the knowledge bundle of the launch is older than this pohunek release (the
+When the knowledge bundle of the launch is older than the daemon that serves it (the
 package versions track the core releases and are compared by semantic version
 precedence; a version that cannot be ordered never counts as older), the human
 output prints `note: the assistant package ... is older than pohunek <core>`
@@ -651,8 +651,9 @@ after the `knowledge:` line, and `--json` carries the same text in
 `--print-prompt`). The note names `pohunek setup`, which replaces the older
 selected package with the version the plugin index lists; a package the owner
 disabled or did not select stays as set and `setup` names the `plugin enable`
-and `plugin select` steps. The launch itself is unchanged. The note compares with
-the CLI's release; for a remote host, run the command on that host.
+and `plugin select` steps. The launch itself is unchanged. The note compares the
+bundle with the version of the daemon that serves it (the target host's daemon,
+not the CLI), so run the command on that host.
 
 Keep a request out of the process list with `--request-stdin`. The CLI reads
 bounded UTF-8 text from stdin and trims surrounding whitespace. An empty

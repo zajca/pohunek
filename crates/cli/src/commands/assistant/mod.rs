@@ -136,9 +136,10 @@ struct AssistantMeta<'a> {
     knowledge: &'a str,
 }
 
-/// The note for a bundle of `version` that is older than this release.
-fn bundle_note(version: &str) -> Option<String> {
-    crate::commands::setup_assistant::outdated_note(version, crate::service::VERSION)
+/// The note for a bundle of `version` that is older than the daemon
+/// (`daemon_version`) that serves it.
+fn bundle_note(version: &str, daemon_version: &str) -> Option<String> {
+    crate::commands::setup_assistant::outdated_note(version, daemon_version)
 }
 
 /// Run `pohunek assistant`.
@@ -253,7 +254,10 @@ fn print_prompt(
                 bundle_path: prepared.knowledge.bundle_path.as_deref(),
                 snapshot_path: &prepared.knowledge.snapshot_path,
                 knowledge_bundle_version: &prepared.knowledge.version,
-                knowledge_bundle_note: bundle_note(&prepared.knowledge.version),
+                knowledge_bundle_note: bundle_note(
+                    &prepared.knowledge.version,
+                    &prepared.knowledge.daemon_version,
+                ),
                 knowledge: prepared.knowledge.label,
             })?
         );
@@ -267,7 +271,10 @@ fn print_prompt(
             "knowledge: {} ({})",
             prepared.knowledge.version, prepared.knowledge.label
         );
-        if let Some(note) = bundle_note(&prepared.knowledge.version) {
+        if let Some(note) = bundle_note(
+            &prepared.knowledge.version,
+            &prepared.knowledge.daemon_version,
+        ) {
             println!("note: {note}");
         }
         if let Some(bundle_path) = &prepared.knowledge.bundle_path {
@@ -329,7 +336,10 @@ fn emit_launch_output(
                     intent: opts.intent.as_str(),
                     agent: &result.assistant.agent,
                     knowledge_bundle_version: &result.assistant.knowledge_bundle_version,
-                    knowledge_bundle_note: bundle_note(&result.assistant.knowledge_bundle_version,),
+                    knowledge_bundle_note: bundle_note(
+                        &result.assistant.knowledge_bundle_version,
+                        &result.assistant.daemon_version,
+                    ),
                     snapshot_included: result.assistant.snapshot_included,
                     auto_started_daemon: result.assistant.auto_started_daemon,
                     knowledge: result.assistant.knowledge,
@@ -368,7 +378,10 @@ fn emit_launch_output(
             "knowledge: {} ({})",
             result.assistant.knowledge_bundle_version, result.assistant.knowledge
         );
-        if let Some(note) = bundle_note(&result.assistant.knowledge_bundle_version) {
+        if let Some(note) = bundle_note(
+            &result.assistant.knowledge_bundle_version,
+            &result.assistant.daemon_version,
+        ) {
             println!("note: {note}");
         }
         println!(
