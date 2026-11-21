@@ -33,6 +33,15 @@ pub mod service;
 pub mod upgrade_assistant {
     //! The assistant package state `pohunek service upgrade` reports, asked of
     //! the daemon that serves the installation `base` describes.
+    //!
+    //! Test seam: `tests/release_upgrade.rs` runs the real `pohunek service
+    //! upgrade` under a real service manager, but it is opt-in on Linux
+    //! (`POHUNEK_SYSTEMD_E2E=1`) and stages neither an older assistant package
+    //! selected before the swap nor a stopped daemon after it, which the
+    //! `outdated` and `unchecked` rows need. `tests/service_upgrade.rs` calls
+    //! the engine below the CLI action that attaches the assistant state. The
+    //! scenario in `tests/assistant_package_upgrade.rs` therefore drives the
+    //! functions the upgrade calls against a daemon of the harness.
     use crate::paths::Paths;
     use crate::service::report::AssistantPackageReport;
 

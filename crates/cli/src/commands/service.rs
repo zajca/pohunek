@@ -340,23 +340,25 @@ pub(crate) async fn assistant_state(
             return state;
         }
     };
-    let mut installed = listed
+    if listed
         .packages
         .iter()
-        .filter(|info| info.package.id.to_string() == setup_assistant::PACKAGE_ID)
-        .peekable();
-    if installed.peek().is_some() {
+        .any(|info| info.package.id.to_string() == setup_assistant::PACKAGE_ID)
+    {
         state.status = report::AssistantPackageStatus::Unselected;
     }
-    if let Some(selected) = installed.find(|info| info.selected) {
-        let version = selected.package.version.to_string();
-        if setup_assistant::is_older(&version, core_version) {
+    if let Some(selected) = setup_assistant::selected_package(
+        &listed.packages,
+        setup_assistant::PACKAGE_ID,
+        core_version,
+    ) {
+        if selected.older {
             state.status = report::AssistantPackageStatus::Outdated;
             state.command = Some(setup_assistant::UPDATE_COMMAND.to_owned());
         } else {
             state.status = report::AssistantPackageStatus::Current;
         }
-        state.version = Some(version);
+        state.version = Some(selected.info.package.version.to_string());
     }
     state
 }
