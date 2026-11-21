@@ -34,10 +34,13 @@ pub mod upgrade_assistant {
     //! The assistant package state `pohunek service upgrade` reports, asked of
     //! the daemon that serves the installation `base` describes.
     //!
-    //! Test seam: the report is produced after the upgrade swapped the daemon
-    //! through a service manager, which no harness runs, so the scenario in
-    //! `tests/assistant_package_upgrade.rs` drives the same functions the
-    //! upgrade calls against a real `pohunekd` instead.
+    //! Test seam: `tests/release_upgrade.rs` and `tests/service_upgrade.rs` run
+    //! a real upgrade under a real service manager, but both are opt-in on
+    //! Linux (`POHUNEK_SYSTEMD_E2E=1`) and neither stages an older assistant
+    //! package selected before the swap or a stopped daemon after it, which the
+    //! `outdated`, `unselected` and `unchecked` rows need. The scenario in
+    //! `tests/assistant_package_upgrade.rs` therefore drives the functions the
+    //! upgrade calls against a real `pohunekd`.
     use crate::paths::Paths;
     use crate::service::report::AssistantPackageReport;
 
