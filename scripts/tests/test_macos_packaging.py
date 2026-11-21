@@ -257,6 +257,33 @@ class BuildReleaseTest(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "%s/out/target/aarch64-apple-darwin/release" % ROOT)
 
 
+class BuildKitTest(unittest.TestCase):
+    def test_the_kit_component_builds_the_four_kit_binaries_with_the_pinned_environment(self):
+        root = Path(tempfile.mkdtemp(prefix="pohunek-build-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        tools = root / "tools"
+        tools.mkdir()
+        record = root / "args"
+        for name, text in (
+            ("uname", '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n'),
+            ("rustc", "#!/bin/sh\necho /fake/sysroot\n"),
+            ("cargo", '#!/bin/sh\nprintf "%s\\n" "$MACOSX_DEPLOYMENT_TARGET" "$@" > "$RECORD"\n'),
+        ):
+            path = tools / name
+            path.write_text(text)
+            path.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (tools, os.environ["PATH"]), RECORD=str(record))
+        result = subprocess.run(
+            [str(MACOS / "build-release"), "kit"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = record.read_text().split()
+        self.assertEqual(lines[0], (MACOS / "DEPLOYMENT_TARGET").read_text().strip())
+        self.assertIn("--locked", lines)
+        bins = [lines[i + 1] for i, word in enumerate(lines) if word == "--bin"]
+        self.assertEqual(bins, ["pohunek", "pohunekd", "pohunek-sessiond", "pohunek-plugin-kit"])
+
+
 class BuildFlagsTest(unittest.TestCase):
     def test_remap_flags_survive_spaces_and_keep_the_callers_flags(self):
         root = Path(tempfile.mkdtemp(prefix="pohunek build "))
