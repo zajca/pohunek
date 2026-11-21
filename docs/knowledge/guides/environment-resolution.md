@@ -182,7 +182,7 @@ shims, a profile's `PATH`). A daemon that runs as its own unit with an empty
 `search_path` and a unit that sets no `PATH` (no `Environment=PATH=`,
 `ExecSearchPath=`, `EnvironmentFile=`, `PassEnvironment=PATH` or
 `UnsetEnvironment=PATH`, in the unit or a drop-in) therefore reads the manager's
-`PATH` again when it handles a request (at most once a second, bounded by the
+`PATH` again when it inspects the host, runs a doctor, or starts or resumes a session (at most once a second, bounded by the
 installation's service-manager call deadline) and uses it for every executable
 lookup, the doctor's agent checks, hooks and the environment it gives new
 agents, so a probe and a launch agree. Only `PATH` follows the manager; other
