@@ -44,6 +44,21 @@ pub mod upgrade_assistant {
         crate::commands::service::assistant_state(core_version, Ok(Paths::from_base(base))).await
     }
 
+    /// `report` carrying the assistant package state, as `service upgrade`
+    /// finishes it.
+    pub async fn attach(
+        report: crate::service::report::UpgradeReport,
+        base: &pohunek_paths::BasePaths,
+    ) -> crate::service::report::UpgradeReport {
+        crate::commands::service::with_assistant(report, Ok(Paths::from_base(base))).await
+    }
+
+    /// The text `service upgrade` prints for `report`.
+    #[must_use]
+    pub fn render_report(report: &crate::service::report::UpgradeReport) -> String {
+        crate::commands::service::render_upgrade(report)
+    }
+
     /// The text the upgrade prints for `state`; empty when there is nothing to
     /// tell.
     #[must_use]

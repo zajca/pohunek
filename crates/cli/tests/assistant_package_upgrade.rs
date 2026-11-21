@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 
 use package::{build_archive, read_archive, ArchiveEntry, Limits};
-use pohunek_cli::service::report::AssistantPackageStatus;
+use pohunek_cli::service::report::{AcceptanceGroups, AssistantPackageStatus, UpgradeReport};
 use pohunek_cli::service::VERSION;
 use pohunek_cli::upgrade_assistant;
 use pohunek_paths::{BasePaths, PathEnv, Platform};
@@ -79,6 +79,30 @@ fn base_paths(harness: &Harness) -> BasePaths {
     .expect("resolve the harness paths")
 }
 
+/// An upgrade report to `to_version` with nothing else to tell.
+fn upgrade_report(to_version: &str) -> UpgradeReport {
+    UpgradeReport {
+        warnings: Vec::new(),
+        from_version: "0.0.1".to_owned(),
+        to_version: to_version.to_owned(),
+        unchanged: false,
+        resumed: false,
+        rolled_back: None,
+        removed_versions: Vec::new(),
+        kept_versions: Vec::new(),
+        gc_error: None,
+        preflight: None,
+        accepted_runtime_loss: false,
+        acceptance: AcceptanceGroups::default(),
+        config_schema_migration: None,
+        runtimes: None,
+        integrations: Vec::new(),
+        repair: None,
+        refused_entries: Vec::new(),
+        assistant: None,
+    }
+}
+
 /// The upgrade's view of the package follows what the daemon lists: absent,
 /// older than the core with the update command, current after the update, and
 /// unchecked once the daemon is gone.
@@ -126,6 +150,38 @@ async fn the_upgrade_reports_an_older_assistant_package_with_the_update_command(
     assert_eq!(json["command"], "pohunek setup", "{json}");
     assert_eq!(json["version"], OLDER_VERSION, "{json}");
     assert_eq!(json["core_version"], VERSION, "{json}");
+
+    // The finished upgrade report carries the state in `--json` and prints the
+    // line in its text.
+    let finished = upgrade_assistant::attach(upgrade_report(VERSION), &paths).await;
+    let document = serde_json::to_value(&finished).expect("the upgrade report serializes");
+    assert_eq!(document["assistant"]["status"], "outdated", "{document}");
+    assert_eq!(document["assistant"]["version"], OLDER_VERSION, "{document}");
+    assert_eq!(document["assistant"]["core_version"], VERSION, "{document}");
+    let upgrade_text = upgrade_assistant::render_report(&finished);
+    assert!(
+        upgrade_text.contains("pohunek setup") && upgrade_text.contains(OLDER_VERSION),
+        "{upgrade_text}"
+    );
+
+    // A selected version that cannot be ordered is never reported as older.
+    let (unordered, unordered_digest) = context_archive(&dir, "nightly");
+    let (code, updated) = harness
+        .json(&[
+            "plugin",
+            "update",
+            ASSISTANT_PACKAGE,
+            path_str(&unordered),
+            "--sha256",
+            &unordered_digest,
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{updated}");
+    let state = upgrade_assistant::state(VERSION, &paths).await;
+    assert_eq!(state.status, AssistantPackageStatus::Current, "{state:?}");
+    assert_eq!(state.version.as_deref(), Some("nightly"), "{state:?}");
+    assert_eq!(upgrade_assistant::render(&state), "", "{state:?}");
 
     let (current, current_digest) = context_archive(&dir, VERSION);
     let (code, updated) = harness

@@ -646,7 +646,7 @@ When the knowledge bundle of the launch is older than the daemon that serves it 
 package versions track the core releases and are compared by semantic version
 precedence; a version that cannot be ordered never counts as older), the human
 output prints `note: the assistant package ... is older than pohunek <core>`
-after the `knowledge:` line, and `--json` carries the same text in
+on stderr (stdout stays the launch result), and `--json` carries the same text in
 `knowledge_bundle_note` (of the launch result's `assistant` object, and of
 `--print-prompt`). The note names `pohunek setup`, which replaces the older
 selected package with the version the plugin index lists; a package the owner

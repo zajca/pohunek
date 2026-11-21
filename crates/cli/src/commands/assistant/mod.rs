@@ -275,7 +275,7 @@ fn print_prompt(
             &prepared.knowledge.version,
             &prepared.knowledge.daemon_version,
         ) {
-            println!("note: {note}");
+            eprintln!("note: {note}");
         }
         if let Some(bundle_path) = &prepared.knowledge.bundle_path {
             println!("bundle: {bundle_path}");
@@ -382,7 +382,7 @@ fn emit_launch_output(
             &result.assistant.knowledge_bundle_version,
             &result.assistant.daemon_version,
         ) {
-            println!("note: {note}");
+            eprintln!("note: {note}");
         }
         println!(
             "snapshot: {}",

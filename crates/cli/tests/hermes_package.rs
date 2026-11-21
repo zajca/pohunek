@@ -3370,8 +3370,20 @@ async fn hermes_launches_only_from_the_installed_official_package() {
         ])
         .await;
     assert!(
-        String::from_utf8_lossy(&human.stdout).contains("note: the assistant package"),
+        String::from_utf8_lossy(&human.stderr).contains("note: the assistant package"),
         "{human:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&human.stdout).contains("note:"),
+        "the note stays off stdout: {human:?}"
+    );
+    // A bundle version that is not semantic never counts as older.
+    install_assistant_context_package(&harness, &cwd, "nightly", true).await;
+    let (code, unordered) = assistant().await;
+    assert_eq!(code, 0, "{unordered}");
+    assert!(
+        unordered["ok"].get("knowledge_bundle_note").is_none(),
+        "{unordered}"
     );
     install_assistant_context_package(&harness, &cwd, "0.0.0-test", true).await;
     let (code, current) = assistant().await;

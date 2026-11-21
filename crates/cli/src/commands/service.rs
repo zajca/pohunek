@@ -261,8 +261,8 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             json,
         } => {
             let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
-            let mut report = service::upgrade(from, accept_runtime_loss, budget, repair).await?;
-            report.assistant = Some(assistant_state(&report.to_version, Paths::resolve()).await);
+            let report = service::upgrade(from, accept_runtime_loss, budget, repair).await?;
+            let report = with_assistant(report, Paths::resolve()).await;
             emit(json, &report, render_upgrade)
         }
         Action::RefreshPath {
@@ -301,6 +301,15 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
         }
     }?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `report` with the assistant package state of the upgraded installation.
+pub(crate) async fn with_assistant(
+    mut report: report::UpgradeReport,
+    paths: Result<Paths, CliError>,
+) -> report::UpgradeReport {
+    report.assistant = Some(assistant_state(&report.to_version, paths).await);
+    report
 }
 
 /// The assistant context package as the upgraded daemon lists it, compared
@@ -838,7 +847,7 @@ fn render_plan(text: &mut String, plan: &EnsureReport) {
     append_gaps(text, plan);
 }
 
-fn render_upgrade(report: &report::UpgradeReport) -> String {
+pub(crate) fn render_upgrade(report: &report::UpgradeReport) -> String {
     let mut text = String::new();
     for warning in &report.warnings {
         let _ = writeln!(text, "warning: {warning}");
