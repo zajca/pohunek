@@ -358,13 +358,14 @@ or `/login`, or reads a token file.
 
 **Which account to pick.** Choose the account by whose work the session is, for
 example work repositories on the work seat and private ones on the personal plan.
-Never choose it by remaining quota. Anthropic does not permit
-switching accounts to get around usage limits: the [Usage
-Policy](https://www.anthropic.com/legal/aup) prohibits services that route
-requests through consumer subscriptions or misrepresent the client, and the
+Never choose it by remaining quota. Pohunek reads Anthropic's terms as
+excluding that: the [Usage Policy](https://www.anthropic.com/legal/aup)
+prohibits services that "route requests through consumer subscriptions or
+misrepresent the product or client being used", and the
 [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance)
-says plan limits assume "ordinary, individual usage" and bars intermediating
-Claude.ai credentials. So there is no automatic switch when a limit is
+says plan limits "assume ordinary, individual usage" and that developers may not
+"collect, store, or intermediate Claude.ai credentials". This is guidance built
+on those sentences, not a quotation of a rule against switching. So there is no automatic switch when a limit is
 hit, no round-robin or least-used strategy, and no routing of sessions across
 subscriptions by headroom: none of these is supported. A session that hits a
 limit waits for the reset or stops. A local proxy that swaps the token per
@@ -441,9 +442,8 @@ unset CLAUDE_ACCOUNT
 exec "$agent" "$@"
 ```
 
-Save it as an executable whose name contains `claude` (the worker and its tests
-identify the launch by an executable name containing the provider), never add
-`set -x` or an `echo` of the token, and keep each account's file separate. The
+Save it as an executable. The launch is identified by the program the wrapper
+`exec`s into, so keep the final `exec` and never add `set -x` or an `echo` of the token, and keep each account's file separate. The
 `stat -c` form is GNU; on macOS use `stat -f %Lp`. `pohunek integration status
 --agent claude --profile <profile>` should report the hooks of `~/.claude`,
 because the home is the ambient one.
@@ -458,9 +458,11 @@ federation credentials, then the stored `/login`. Anything above the token wins
 silently, which is why the wrapper unsets the variables of that list it can.
 Pohunek's base environment forwards no `ANTHROPIC_*` or `CLAUDE_*` variable, so
 those can only come from a profile `[env]`, a choice env, the wrapper or Claude's
-own settings. An `apiKeyHelper` or an `env` block naming `ANTHROPIC_*` in
-`~/.claude/settings.json` outranks the token and no environment check sees it:
-the owner checks that file for those names, names only. `/status` in the session
+own settings. An `apiKeyHelper`, or an `env` block in a user or project settings file that
+names `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` or `CLAUDE_CODE_OAUTH_TOKEN`, replaces
+or outranks the wrapper's token and no environment check sees it: the owner
+checks those files for those names, names only. A signed-in Claude apps gateway
+session sits outside this list and outranks it. `/status` in the session
 shows the login method and account in use. A hand-written profile `[env]` is not
 refused for a credential name (only launch-option choices are), so the rule that
 no token or key goes in `[env]` is the owner's, not an enforced one.
