@@ -436,7 +436,11 @@ fi
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
     CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
     CLAUDE_CONFIG_DIR
-IFS= read -r CLAUDE_CODE_OAUTH_TOKEN < "$file" || [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]
+IFS= read -r CLAUDE_CODE_OAUTH_TOKEN < "$file" || true
+if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+    echo "claude-account: $file has no token on its first line" >&2
+    exit 66
+fi
 export CLAUDE_CODE_OAUTH_TOKEN
 unset CLAUDE_ACCOUNT
 exec "$agent" "$@"
