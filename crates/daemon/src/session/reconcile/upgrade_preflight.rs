@@ -1578,7 +1578,9 @@ fn run_probe(
     // budget; a program that does not resolve is refused as resume refuses it.
     let remaining = ledger.remaining();
     if definition.version_probe_parser().is_some() && remaining.is_zero() {
-        if ValidatedLaunchProgram::resolve(program).is_none() {
+        if ValidatedLaunchProgram::resolve(program, crate::agent::process_search_path().as_deref())
+            .is_none()
+        {
             let error = ProtocolError::agent_binary_missing(&reported_program(definition, program));
             return Probe::Refused {
                 code: error.code,
@@ -2185,7 +2187,11 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         }
     };
     let program = binding_program(binding, &definition);
-    let environment = ProbeEnvironment::for_launch(base, profile_env.as_slice());
+    let environment = ProbeEnvironment::for_launch(
+        base,
+        profile_env.as_slice(),
+        crate::agent::process_search_path().as_deref(),
+    );
     match run_probe(&definition, &program, &environment, judging.probes) {
         Probe::Supported => None,
         Probe::Refused { code, detail } => Some((

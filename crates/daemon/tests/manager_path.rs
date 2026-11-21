@@ -3,7 +3,8 @@
 //!
 //! The manager is a fake whose `PATH` the test changes between requests; the
 //! requests go through the daemon's own dispatcher, so the host inventory, the
-//! daemon doctor and the agent launch all read the one search path.
+//! daemon doctor and the agent launch all read the search path of their
+//! registry.
 
 // Rust guideline compliant 2026-11-21
 
@@ -45,6 +46,9 @@ const PROFILE: &str = "fixture";
 
 /// Reuse window of the manager read: zero, so every request reads the manager.
 const NO_REUSE: Duration = Duration::ZERO;
+
+/// Reuse window longer than any scenario: a registry reuses its first read.
+const LONG_REUSE: Duration = Duration::from_secs(3600);
 
 /// Deadline of one manager read; only the manager that never answers reaches it.
 const READ_DEADLINE: Duration = HANG_GUARD;
@@ -154,7 +158,12 @@ enum Launches {
     Really,
 }
 
-async fn state(root: &Path, manager: &FakeManager, launches: Launches) -> DaemonState {
+async fn state(
+    root: &Path,
+    manager: &FakeManager,
+    launches: Launches,
+    max_age: Duration,
+) -> DaemonState {
     let socket = root.join("daemon.sock");
     let environment = SubprocessWorkerEnvironment {
         runtime_home: root.join("worker/runtime"),
@@ -186,7 +195,7 @@ async fn state(root: &Path, manager: &FakeManager, launches: Launches) -> Daemon
         format!("base = \"shell\"\nprogram = \"{AGENT}\"\n"),
     )
     .expect("write the profile");
-    let manager_path = ManagerPath::new(Arc::new(manager.clone()), NO_REUSE, READ_DEADLINE);
+    let manager_path = ManagerPath::new(Arc::new(manager.clone()), max_age, READ_DEADLINE);
     let supervision = match launches {
         Launches::Never => environment
             .supervision(PathBuf::from(WORKER_PLACEHOLDER))
@@ -266,8 +275,7 @@ async fn doctor_status(state: &DaemonState) -> [protocol::DoctorStatus; 2] {
 
 /// A daemon started while the manager `PATH` has no agent directory.
 ///
-/// The search path is process-wide state, so each scenario runs in its own
-/// process.
+/// The scenarios set the process `PATH`, so each runs in its own process.
 struct Started {
     root: tempfile::TempDir,
     process_dir: PathBuf,
@@ -297,7 +305,7 @@ impl Started {
             .remove(ENV_DAEMON_ID)
             .remove(ENV_SESSION_ID);
         let manager = FakeManager::answering(Answer::Path(process_dir.clone().into()));
-        let state = state(root.path(), &manager, launches).await;
+        let state = state(root.path(), &manager, launches, NO_REUSE).await;
         Self {
             root,
             process_dir,
@@ -435,6 +443,50 @@ async fn an_agent_dir_the_manager_path_loses_is_missing_again() {
         .answer(Answer::Path(started.process_dir.clone().into()));
 
     assert_eq!(inspected(&started.state).await, None);
+}
+
+/// Two registries of one process follow their own managers: each resolves
+/// agents on the `PATH` of its manager, whatever the other registry read in
+/// between. The long reuse window makes the second request of a registry reuse
+/// its earlier read, so the answer comes from the registry's own state.
+#[tokio::test]
+async fn two_registries_in_one_process_resolve_on_their_own_manager_path() {
+    if !in_own_process() {
+        return;
+    }
+    let process_dir_root = pohunek_test_support::tempdir().expect("scratch directory");
+    let process_dir = process_dir_root.path().join("process-bin");
+    std::fs::create_dir_all(&process_dir).expect("process directory");
+    std::fs::set_permissions(&process_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-private process directory");
+    let mut process = ProcessEnv::lock();
+    process
+        .set("PATH", &process_dir)
+        .remove(ENV_DAEMON_ID)
+        .remove(ENV_SESSION_ID);
+
+    let mut daemons = Vec::new();
+    for name in ["first", "second"] {
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let manager_dir = root.path().join("manager-bin");
+        install_agent(&manager_dir, &root.path().join("launched.txt"));
+        let manager_path = std::env::join_paths([&manager_dir, &process_dir]).expect("join PATH");
+        let manager = FakeManager::answering(Answer::Path(manager_path));
+        let state = state(root.path(), &manager, Launches::Never, LONG_REUSE).await;
+        daemons.push((name, root, manager_dir, state));
+    }
+
+    for index in [0, 1, 0, 1, 0] {
+        let (name, _root, manager_dir, state) = &daemons[index];
+        let found = inspected(state)
+            .await
+            .unwrap_or_else(|| panic!("the {name} registry finds its agent"));
+        assert_eq!(
+            Path::new(&found),
+            manager_dir.join(AGENT),
+            "the {name} registry resolves on its own manager's PATH"
+        );
+    }
 }
 
 /// R4: a manager that cannot answer, or that has no `PATH`, leaves the `PATH`

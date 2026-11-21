@@ -2128,6 +2128,7 @@ async fn doctor_plugin_index(fixture: &Fixture) -> Vec<protocol::DoctorCheck> {
         &trust,
         &crate::agent::ProfileRegistry::default(),
         pohunek_worker_protocol::BaseEnv::default(),
+        crate::agent::process_search_path(),
         hostcheck::OverlayChecks::NONE,
         false,
         crate::session::RejectedLinesState::Counted {

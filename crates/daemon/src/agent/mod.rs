@@ -92,10 +92,10 @@ pub(crate) struct ValidatedLaunchProgram {
 }
 
 impl ValidatedLaunchProgram {
-    /// Resolve one configured program to its first trusted executable match.
-    pub(crate) fn resolve(program: &str) -> Option<Self> {
-        let path = executable_search_path();
-        Self::resolve_with_path(program, path.as_deref())
+    /// Resolve one configured program on `path` to its first trusted
+    /// executable match.
+    pub(crate) fn resolve(program: &str, path: Option<&OsStr>) -> Option<Self> {
+        Self::resolve_with_path(program, path)
     }
 
     fn resolve_with_path(program: &str, path: Option<&OsStr>) -> Option<Self> {
@@ -149,6 +149,9 @@ pub struct LaunchOpts {
     pub env_extra: LaunchEnv,
     /// Exact provider executable already resolved and validated for this launch.
     pub(crate) validated_program: Option<ValidatedLaunchProgram>,
+    /// The `PATH` a program without a validated executable is resolved on:
+    /// the launching registry's search path.
+    pub(crate) search_path: Option<std::ffi::OsString>,
     /// File the session worker writes before it starts the agent, named by the
     /// runtime's launch input.
     pub worker_file: Option<PathBuf>,
@@ -446,7 +449,7 @@ pub fn build_pty_command(
     opts: &LaunchOpts,
 ) -> Result<LaunchCommand, ProtocolError> {
     let program = opts.validated_program.as_ref().map_or_else(
-        || resolve_binary(program),
+        || resolve_binary(program, opts.search_path.as_deref()),
         |validated| Ok(validated.as_launch_str().to_owned()),
     )?;
     Ok(LaunchCommand {
@@ -503,13 +506,10 @@ fn resolve_program(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
     shell_env::resolve_executable_in_path_value(OsStr::new(program), path).ok()
 }
 
-/// The refusal that kept `program` from resolving on the daemon's `PATH`, when
-/// a candidate exists and failed a trust check; `None` when none is installed.
-pub(crate) fn executable_refusal(program: &str) -> Option<String> {
-    match shell_env::resolve_executable_in_path_value(
-        OsStr::new(program),
-        executable_search_path().as_deref(),
-    ) {
+/// The refusal that kept `program` from resolving on `path`, when a candidate
+/// exists and failed a trust check; `None` when none is installed.
+pub(crate) fn executable_refusal(program: &str, path: Option<&OsStr>) -> Option<String> {
+    match shell_env::resolve_executable_in_path_value(OsStr::new(program), path) {
         Err(error @ shell_env::ExecutableError::Refused { .. }) => Some(error.to_string()),
         Err(shell_env::ExecutableError::NotExecutable(refusal)) if !refusal.is_absent() => {
             Some(format!("found {program} but not trusted: {refusal}"))
@@ -518,18 +518,16 @@ pub(crate) fn executable_refusal(program: &str) -> Option<String> {
     }
 }
 
-/// The `PATH` agent executables are resolved on: the daemon's own, or its
-/// service manager's when the daemon follows it.
-fn executable_search_path() -> Option<std::ffi::OsString> {
-    let path = crate::runtime::manager_path::search_path();
+/// The `PATH` of a process that follows no service manager: its own.
+pub(crate) fn process_search_path() -> Option<std::ffi::OsString> {
+    let path = std::env::var_os("PATH");
     #[cfg(test)]
     let path = crate::test_support::with_thread_launch_path(path);
     path
 }
 
-fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
-    let path = executable_search_path();
-    resolve_program(name, path.as_deref())
+fn resolve_binary(name: &str, path: Option<&OsStr>) -> Result<String, ProtocolError> {
+    resolve_program(name, path)
         .and_then(|resolved| resolved.to_str().map(str::to_owned))
         .ok_or_else(|| missing_binary(name))
 }
@@ -537,10 +535,10 @@ fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
 /// Resolve `name` to the first **executable** match on `PATH`, for capability
 /// probing (`host.inspect`). Uses the same resolver as [`resolve_binary`], so
 /// "available" in a capability snapshot agrees with what the launch path would
-/// accept. Returns the resolved path, or `None` when nothing executable matches.
-pub(crate) fn which_executable(name: &str) -> Option<PathBuf> {
-    let path = executable_search_path();
-    resolve_program(name, path.as_deref())
+/// accept. Returns the resolved path, or `None` when nothing executable matches
+/// on `path`.
+pub(crate) fn which_executable(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    resolve_program(name, path)
 }
 
 /// Resolve a helper program the daemon itself runs (`git`, the hook
@@ -551,7 +549,10 @@ pub(crate) fn which_executable(name: &str) -> Option<PathBuf> {
 /// kernel does no second `PATH` search. A program that is missing or untrusted
 /// yields a message naming it, which callers surface like a failed spawn.
 pub(crate) fn trusted_program(name: &str) -> Result<PathBuf, String> {
-    which_executable(name)
+    let path = crate::runtime::manager_path::helper_search_path();
+    #[cfg(test)]
+    let path = crate::test_support::with_thread_launch_path(path);
+    which_executable(name, path.as_deref())
         .ok_or_else(|| format!("{name} was not found, or is not trusted, on PATH"))
 }
 
@@ -579,10 +580,22 @@ mod tests {
 
     use super::host::launch_command;
     use super::{
-        resolve_binary, resume_pty_command_from_launch, served_native_launch, trusted_program,
-        which_executable, LaunchCommand, LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef,
-        SessionRefKind, ValidatedLaunchProgram,
+        process_search_path, resume_pty_command_from_launch, served_native_launch, trusted_program,
+        LaunchCommand, LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef, SessionRefKind,
+        ValidatedLaunchProgram,
     };
+
+    fn resolve_binary(name: &str) -> Result<String, protocol::ProtocolError> {
+        super::resolve_binary(name, process_search_path().as_deref())
+    }
+
+    fn which_executable(name: &str) -> Option<PathBuf> {
+        super::which_executable(name, process_search_path().as_deref())
+    }
+
+    fn resolve_launch_program(name: &str) -> Option<ValidatedLaunchProgram> {
+        ValidatedLaunchProgram::resolve(name, process_search_path().as_deref())
+    }
 
     fn launch_opts(cwd: impl AsRef<Path>) -> LaunchOpts {
         LaunchOpts {
@@ -591,6 +604,7 @@ mod tests {
             rows: 40,
             env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())].into(),
             validated_program: None,
+            search_path: process_search_path(),
             worker_file: None,
         }
     }
@@ -732,7 +746,7 @@ mod tests {
                 (
                     which_executable("agent"),
                     resolve_binary("agent").expect("launch path resolves"),
-                    ValidatedLaunchProgram::resolve("agent"),
+                    resolve_launch_program("agent"),
                 )
             });
             assert_eq!(resolved.0.as_deref(), Some(usable.as_path()));

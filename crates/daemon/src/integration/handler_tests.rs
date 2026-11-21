@@ -1360,6 +1360,7 @@ fn an_outdated_claude_install_names_the_lost_identity_recovery() {
                 agent: Some(claude.clone()),
                 ..Default::default()
             },
+            crate::agent::process_search_path().as_deref(),
         )
     })
     .expect("doctor");

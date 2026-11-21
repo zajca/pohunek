@@ -143,12 +143,26 @@ pub(crate) fn base_environment<P: AsRef<str>>(
     allowlist: &[P],
     source: &EnvironmentSource,
 ) -> Result<BaseEnv, EnvError> {
+    base_environment_following(allowlist, source, None)
+}
+
+/// [`base_environment`] for a daemon that follows its service manager:
+/// `manager_path`, when set, replaces the `PATH` of a [`EnvironmentSource::Process`].
+///
+/// # Errors
+///
+/// Same as [`base_environment`].
+pub(crate) fn base_environment_following<P: AsRef<str>>(
+    allowlist: &[P],
+    source: &EnvironmentSource,
+    manager_path: Option<OsString>,
+) -> Result<BaseEnv, EnvError> {
     match source {
         // `PATH` is the one variable a daemon that follows its service manager
         // refreshes; the rest is what the process started with.
         EnvironmentSource::Process => {
             let mut variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-            if let Some(path) = super::manager_path::current_manager_path() {
+            if let Some(path) = manager_path {
                 variables.retain(|(name, _)| name != "PATH");
                 variables.push((OsString::from("PATH"), path));
             }

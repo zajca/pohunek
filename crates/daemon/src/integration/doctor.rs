@@ -9,6 +9,7 @@
 //! located by path checks alone, because on macOS the stub at `/usr/bin/python3`
 //! opens an installer dialog when run without the Command Line Tools.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
 
@@ -99,11 +100,11 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 }
 
 impl PythonProbe {
-    /// Builds the probe for this process from its `PATH` entries and, on macOS,
-    /// the stub description.
-    pub(super) fn from_environment() -> Self {
-        let search_dirs = crate::runtime::manager_path::search_path()
-            .map(|path| std::env::split_paths(&path).collect())
+    /// Builds the probe from the entries of `search_path`, the daemon's search
+    /// path, and, on macOS, the stub description.
+    pub(super) fn from_search_path(search_path: Option<&OsStr>) -> Self {
+        let search_dirs = search_path
+            .map(|path| std::env::split_paths(path).collect())
             .unwrap_or_default();
         Self {
             search_dirs,
@@ -604,11 +605,12 @@ fn unsafe_installer_lock(dir: &std::path::Path) -> IntegrationFinding {
 pub fn doctor_in(
     homes: &ConfigHomes,
     params: IntegrationDoctorParams,
+    search_path: Option<&OsStr>,
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
     doctor_in_with(
         homes,
         params,
-        &python_findings(&PythonProbe::from_environment()),
+        &python_findings(&PythonProbe::from_search_path(search_path)),
         &socket_findings_for_process(),
     )
 }
@@ -626,7 +628,11 @@ pub(super) fn doctor_for(
     host: &RuntimeHost,
     params: IntegrationDoctorParams,
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
-    doctor_in(&super::config_homes_for_tests(host), params)
+    doctor_in(
+        &super::config_homes_for_tests(host),
+        params,
+        crate::agent::process_search_path().as_deref(),
+    )
 }
 
 /// [`doctor_for_with`] against the runtimes of the official fixture host.
@@ -693,11 +699,12 @@ pub(super) fn doctor_in_with(
 pub(crate) fn doctor_in_noted(
     homes: &ConfigHomes,
     params: IntegrationDoctorParams,
+    search_path: Option<&OsStr>,
 ) -> Result<Vec<(IntegrationAgentDoctor, Option<&'static str>)>, ProtocolError> {
     diagnose_with_notes(
         homes,
         params,
-        &python_findings(&PythonProbe::from_environment()),
+        &python_findings(&PythonProbe::from_search_path(search_path)),
         &socket_findings_for_process(),
     )
 }

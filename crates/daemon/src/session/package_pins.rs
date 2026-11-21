@@ -122,16 +122,19 @@ impl SessionRegistry {
                 crate::runtime::EnvironmentSource::Process,
             ),
         };
-        let base = crate::runtime::environment::base_environment(&allowlist, &source).map_err(
-            |error| {
-                ProtocolError::new(
-                    protocol::ErrorClass::Runtime,
-                    "worker_initialize_invalid",
-                    error.to_string(),
-                    None,
-                )
-            },
-        )?;
+        let base = crate::runtime::environment::base_environment_following(
+            &allowlist,
+            &source,
+            self.manager_search_path(),
+        )
+        .map_err(|error| {
+            ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                "worker_initialize_invalid",
+                error.to_string(),
+                None,
+            )
+        })?;
         Ok(ConfigHomes::new(self.inner.profiles.clone(), base))
     }
 
