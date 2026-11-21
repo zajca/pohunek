@@ -276,7 +276,8 @@ pub enum AssistantInstallResult {
     /// The owner disabled the selected version or selected none, so the
     /// package stays as set.
     Held,
-    /// The index, the download or the daemon refused; nothing changed.
+    /// The index, the download or the daemon refused; `status` and `version`
+    /// are read after the attempt.
     Failed,
     /// `--no-assistant-package` was given.
     Skipped,

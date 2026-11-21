@@ -3141,11 +3141,12 @@ not apply are `null`. `result` is one of:
   index lists it only once it is admitted), so the old package is kept;
   `command` is `pohunek setup`;
 - `held`: the selected version is disabled, or a version is installed and none
-  is selected, or the listed version is installed and not selected; nothing is
-  asked of the index and `command` names the `plugin enable` or `plugin select`
-  steps;
+  is selected (no index request is made), or the listed version is installed
+  and not selected (found after the index is read); `command` names the
+  `plugin enable` and `plugin select` steps;
 - `failed`: the index or the archive could not be fetched, or the index or the
-  digest was refused (`detail` carries the reason); nothing changed and
+  digest was refused (`detail` carries the reason); the daemon installs nothing
+  it did not verify, `status` and `version` are read after the attempt and
   `command` is `pohunek setup`;
 - `skipped`: `--no-assistant-package` was given; no index request was made.
 
@@ -3154,7 +3155,8 @@ that still serves is replaced, as `pohunek setup` replaces it. No result fails t
 upgrade or rolls the core back, the exit code stays 0, and a failed or rolled-back
 upgrade carries no `assistant` object. A run that is not a forward move to this
 build's version (a rollback with `--from <previous>`, an unchanged version, a
-`--repair`) reports the state only, and a newer selected package keeps serving
+`--repair`) reports the state only (`--no-assistant-package` still reports
+`skipped`), and a newer selected package keeps serving
 after a rollback. A fresh `pohunek service install` does not install the package;
 `pohunek setup` does.
 

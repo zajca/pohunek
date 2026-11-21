@@ -56,10 +56,15 @@ pub(crate) async fn reconcile(
         options,
     )
     .await;
-    let installed = install
-        .as_ref()
-        .is_some_and(|install| install.result == AssistantInstallResult::Installed);
-    let mut state = if installed {
+    // An attempt that failed after the daemon installed the package still
+    // leaves the daemon's state as the report's truth.
+    let attempted = install.as_ref().is_some_and(|install| {
+        matches!(
+            install.result,
+            AssistantInstallResult::Installed | AssistantInstallResult::Failed
+        )
+    });
+    let mut state = if attempted {
         assistant_state(&core, Ok(paths)).await
     } else {
         before
@@ -171,7 +176,7 @@ async fn install(
                 held.package.version
             )),
             Some(format!(
-                "pohunek plugin select {PACKAGE_ID} --digest {digest}"
+                "pohunek plugin enable {PACKAGE_ID} --digest {digest} && pohunek plugin select {PACKAGE_ID} --digest {digest}"
             )),
         );
     }
