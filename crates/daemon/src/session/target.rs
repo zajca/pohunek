@@ -285,11 +285,12 @@ impl SessionRegistry {
             return true;
         };
         let session_id = id.0.clone();
+        let search_path = self.search_path_snapshot();
         match tokio::task::spawn_blocking(move || {
             // Remove-hook warnings on the rollback path are logged (the launch error
             // is what the caller surfaces).
             let mut hook_warnings = Vec::new();
-            let result = manager.compensate_session(&session_id, &mut hook_warnings);
+            let result = manager.compensate_session(&session_id, &search_path, &mut hook_warnings);
             for warning in &hook_warnings {
                 warn!(
                     session_id = %session_id,
@@ -347,6 +348,7 @@ impl SessionRegistry {
         id: &SessionId,
         params: &SessionNewParams,
         fallback_cwd: PathBuf,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<TargetResolution, ProtocolError> {
         // `base_branch` only branches a worktree; it is meaningless in-place.
         if params.base_branch.is_some() && params.branch.is_none() {
@@ -372,7 +374,7 @@ impl SessionRegistry {
         };
 
         // Phase 1: resolve the project (by reference, else by detecting a path).
-        let (project, detected) = self.resolve_project(params).await?;
+        let (project, detected) = self.resolve_project(params, search_path).await?;
 
         // Phase 2: isolation (Decision 3).
         let Some(branch) = params.branch.clone() else {
@@ -391,8 +393,9 @@ impl SessionRegistry {
             let by_reference = params.project.is_some() || params.repo.is_some();
             let reference_outside_repository = match launch_dir.clone() {
                 Some(dir) if by_reference && project.is_some() => {
+                    let search_path = search_path.clone();
                     tokio::task::spawn_blocking(move || {
-                        crate::project::detect::confirmed_outside_repository(&dir)
+                        crate::project::detect::confirmed_outside_repository(&dir, &search_path)
                     })
                     .await
                     .unwrap_or(false)
@@ -423,20 +426,23 @@ impl SessionRegistry {
             .clone()
             .or_else(|| project.as_ref().and_then(|r| r.default_base_branch.clone()));
         let bound = self
-            .bind_worktree(WorktreeRequest {
-                session_id: id.0.clone(),
-                repo,
-                branch,
-                base_branch,
-                project_id: project_id.clone(),
-                agent: params.agent.clone(),
-                branch_source: params
-                    .branch_source
-                    .unwrap_or(protocol::BranchSource::Local),
-                on_diverged: params.on_diverged,
-                fetch_ref: params.fetch_ref.clone(),
-                skip_repo_hooks: params.skip_repo_hooks,
-            })
+            .bind_worktree(
+                search_path,
+                WorktreeRequest {
+                    session_id: id.0.clone(),
+                    repo,
+                    branch,
+                    base_branch,
+                    project_id: project_id.clone(),
+                    agent: params.agent.clone(),
+                    branch_source: params
+                        .branch_source
+                        .unwrap_or(protocol::BranchSource::Local),
+                    on_diverged: params.on_diverged,
+                    fetch_ref: params.fetch_ref.clone(),
+                    skip_repo_hooks: params.skip_repo_hooks,
+                },
+            )
             .await?;
         Ok(TargetResolution {
             launch_cwd: bound.path.clone(),
@@ -511,6 +517,7 @@ impl SessionRegistry {
     async fn resolve_project(
         &self,
         params: &SessionNewParams,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<(Option<ProjectRecord>, Option<DetectedProject>), ProtocolError> {
         let Some(projects) = self.inner.projects.clone() else {
             // No project subsystem (store unconfigured, e.g. some unit tests): a
@@ -527,6 +534,7 @@ impl SessionRegistry {
         let reference = params.project.clone();
         let repo = params.repo.clone();
         let cwd = params.cwd.clone();
+        let search_path = search_path.clone();
         tokio::task::spawn_blocking(move || -> Result<_, ProtocolError> {
             // 1. Reference resolves against the store; a session start bumps recency.
             if let Some(reference) = reference {
@@ -537,8 +545,8 @@ impl SessionRegistry {
             // 2. Explicit --repo: must be a git work tree, else error — never
             // silently launch somewhere else (no-silent-defaults).
             if let Some(repo) = repo {
-                let detected =
-                    detect_at(&repo)?.ok_or_else(|| crate::project::not_a_git_repo(&repo))?;
+                let detected = detect_at(&repo, &search_path)?
+                    .ok_or_else(|| crate::project::not_a_git_repo(&repo))?;
                 let record = projects.register(&detected, false)?;
                 return Ok((Some(record), Some(detected)));
             }
@@ -546,7 +554,7 @@ impl SessionRegistry {
             let Some(cwd) = cwd else {
                 return Ok((None, None));
             };
-            let Some(detected) = detect_at(&cwd)? else {
+            let Some(detected) = detect_at(&cwd, &search_path)? else {
                 return Ok((None, None));
             };
             let record = projects.register(&detected, false)?;
@@ -562,6 +570,7 @@ impl SessionRegistry {
     /// thread. Errors when worktree binding is not configured.
     async fn bind_worktree(
         &self,
+        search_path: &crate::runtime::SearchPath,
         request: WorktreeRequest,
     ) -> Result<crate::worktree::WorktreeBound, ProtocolError> {
         let Some(manager) = self.inner.worktree.clone() else {
@@ -573,9 +582,10 @@ impl SessionRegistry {
         // The manager writes the registry's store itself, so the write gate is
         // taken here and the write is tracked like the registry's own.
         self.store_for_write()?;
+        let search_path = search_path.clone();
         self.inner
             .background
-            .spawn_blocking("bind_target", move || manager.bind(&request))
+            .spawn_blocking("bind_target", move || manager.bind(&request, &search_path))
             .await
             .map_err(|_join_error| {
                 runtime_error("worktree_bind_failed", "worktree bind task panicked")

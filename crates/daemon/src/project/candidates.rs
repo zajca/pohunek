@@ -115,6 +115,8 @@ pub(crate) struct Inputs {
     pub(crate) history: Option<(HistoryScan, PathBuf)>,
     /// The git common dirs of the registered projects.
     pub(crate) registered: HashSet<PathBuf>,
+    /// The search path snapshot `git` is resolved on.
+    pub(crate) search_path: crate::runtime::SearchPath,
 }
 
 /// Where an observation came from.
@@ -188,7 +190,8 @@ pub(crate) fn resolve(
             dropped = dropped.saturating_add(1);
             continue;
         }
-        let Some((project, canonical_cwd)) = resolve_cwd(&cwd, &temp_roots) else {
+        let Some((project, canonical_cwd)) = resolve_cwd(&cwd, &temp_roots, &inputs.search_path)
+        else {
             dropped = dropped.saturating_add(1);
             continue;
         };
@@ -308,12 +311,16 @@ fn finish(
 /// The repository of `cwd` with the canonical form of `cwd`, or `None` when it
 /// is not listable: the directory is gone, lies in a temporary directory, or is
 /// not in a git repository.
-fn resolve_cwd(cwd: &Path, temp_roots: &[PathBuf]) -> Option<(DetectedProject, PathBuf)> {
+fn resolve_cwd(
+    cwd: &Path,
+    temp_roots: &[PathBuf],
+    search_path: &crate::runtime::SearchPath,
+) -> Option<(DetectedProject, PathBuf)> {
     let canonical = std::fs::canonicalize(cwd).ok()?;
     if !canonical.is_dir() || in_any(&canonical, temp_roots) {
         return None;
     }
-    let project = detect::detect(&canonical).ok().flatten()?;
+    let project = detect::detect(&canonical, search_path).ok().flatten()?;
     (!in_any(&project.repo_root, temp_roots)).then_some((project, canonical))
 }
 

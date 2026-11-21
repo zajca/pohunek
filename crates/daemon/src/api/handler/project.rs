@@ -144,6 +144,7 @@ pub(super) async fn handle_project_candidates(request: &Request, state: &DaemonS
         Vec::new()
     };
     let config = sessions.candidate_config().clone();
+    let search_path = sessions.search_path_snapshot();
     run_project_blocking(request, move || {
         let started = std::time::Instant::now();
         let deadline = candidates::deadline_from(started, &config);
@@ -175,6 +176,7 @@ pub(super) async fn handle_project_candidates(request: &Request, state: &DaemonS
                 owned,
                 history,
                 registered,
+                search_path,
             },
             &config,
             deadline,
@@ -203,7 +205,11 @@ pub(super) async fn handle_project_add(request: &Request, sessions: &SessionRegi
         );
     };
     let (name, base_branch) = (params.name, params.base_branch);
-    run_project_blocking(request, move || pm.add(&path, name, base_branch)).await
+    let search_path = sessions.search_path_snapshot();
+    run_project_blocking(request, move || {
+        pm.add(&path, name, base_branch, &search_path)
+    })
+    .await
 }
 
 /// `project.show`: a project plus its live worktrees, enriched with which ones
@@ -220,7 +226,8 @@ pub(super) async fn handle_project_show(request: &Request, sessions: &SessionReg
     // Snapshot live sessions so `show` can mark which worktrees currently host one.
     let live = live_sessions(sessions.list().await);
     let reference = params.reference;
-    run_project_blocking(request, move || pm.show(&reference, &live)).await
+    let search_path = sessions.search_path_snapshot();
+    run_project_blocking(request, move || pm.show(&reference, &live, &search_path)).await
 }
 
 /// `project.prompt`: resolve one prompt by name to its template content,

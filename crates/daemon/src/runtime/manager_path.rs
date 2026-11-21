@@ -5,10 +5,14 @@
 //! the `PATH` it was started with, so agents the login environment provides
 //! (version-manager shims) stay invisible until the daemon restarts. A daemon
 //! whose job takes the manager `PATH` therefore reads the manager again at the
-//! boundary where its registry resolves or launches an agent, and the registry
-//! hands that one value to every reader of the operation, so a probe and a
-//! launch agree on what runs. The state belongs to the [`ManagerPath`] of a
-//! registry; two registries never share it.
+//! boundary where its registry resolves or launches an agent. The operation
+//! takes one [`SearchPath`] snapshot from that read and moves it to every
+//! resolver, `git` spawn and hook it reaches, so a probe, a worktree bind and a
+//! launch agree on what runs even while another operation refreshes. Work that
+//! starts no agent (diff, retention, removal, session-stop hooks, cwd tracking)
+//! takes the registry's last read without reading the manager again. The state
+//! belongs to the [`ManagerPath`] of a registry; no process-wide copy exists, so
+//! two registries never share it.
 //!
 //! Only `PATH` is refreshed. Other allowlisted variables, such as a store
 //! location, stay as the process got them. A manager that cannot answer leaves
@@ -25,30 +29,6 @@ use std::time::{Duration, Instant};
 
 use pohunek_platform::supervisor::UnitEnvironment;
 use tracing::{debug, warn};
-
-/// The manager `PATH` of the registry that refreshed last, for the helper
-/// resolvers (`git`, hook interpreters) that no registry reaches.
-///
-/// Process-wide until those resolvers take their search path from the registry
-/// (#2494); every other reader uses [`ManagerPath::search_path`] of its own
-/// registry.
-static HELPER_CURRENT: RwLock<Option<OsString>> = RwLock::new(None);
-
-/// The `PATH` the helper resolvers search: the manager's when a
-/// [`ManagerPath::refresh`] has read one, else the process's.
-#[must_use]
-pub(crate) fn helper_search_path() -> Option<OsString> {
-    let current = HELPER_CURRENT
-        .read()
-        .unwrap_or_else(PoisonError::into_inner);
-    current.clone().or_else(|| std::env::var_os("PATH"))
-}
-
-fn store_helper(path: Option<OsString>) {
-    *HELPER_CURRENT
-        .write()
-        .unwrap_or_else(PoisonError::into_inner) = path;
-}
 
 /// The executable search path of one operation, taken once from its registry
 /// and moved to every resolver, `git` spawn and hook the operation reaches.
@@ -75,6 +55,13 @@ impl SearchPath {
             resolved: resolved.map(Arc::from),
             manager: manager.map(Arc::from),
         }
+    }
+
+    /// The process `PATH`, for fixtures that never follow a service manager.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn process() -> Self {
+        Self::new(crate::agent::process_search_path(), None)
     }
 
     /// The `PATH` executables resolve on.
@@ -228,7 +215,6 @@ impl ManagerPath {
     }
 
     fn store(&self, path: Option<OsString>) {
-        store_helper(path.clone());
         *self
             .inner
             .current

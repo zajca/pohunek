@@ -164,6 +164,17 @@ async fn state(
     launches: Launches,
     max_age: Duration,
 ) -> DaemonState {
+    state_configured(root, manager, launches, max_age, |_config| {}).await
+}
+
+/// [`state`] with `configure` applied to the registry configuration last.
+async fn state_configured(
+    root: &Path,
+    manager: &FakeManager,
+    launches: Launches,
+    max_age: Duration,
+    configure: impl FnOnce(&mut SessionRegistryConfig),
+) -> DaemonState {
     let socket = root.join("daemon.sock");
     let environment = SubprocessWorkerEnvironment {
         runtime_home: root.join("worker/runtime"),
@@ -207,7 +218,7 @@ async fn state(
             supervision
         }
     };
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents),
         host_state_dir: Some(root.join("host-state")),
         socket_path: Some(socket),
@@ -216,6 +227,7 @@ async fn state(
         supervision: Some(supervision.with_manager_path(manager_path)),
         ..support::hermetic_registry_config()
     };
+    configure(&mut config);
     let registry =
         SessionRegistry::new_production(config, Arc::new(SubprocessWorkerLauncher::new()))
             .expect("the production registry opens");
@@ -562,6 +574,153 @@ async fn two_registries_judge_git_on_their_own_manager_path() {
     }
 }
 
+/// The first directory of the process `PATH` that holds `program`.
+fn directory_of(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("the test runs with a PATH"))
+        .find(|directory| directory.join(program).is_file())
+        .unwrap_or_else(|| panic!("{program} is on the process PATH"))
+}
+
+/// A repository with one commit on `main`, made before the scenario replaces
+/// the process `PATH`.
+fn repository() -> pohunek_test_support::env::TestEnv {
+    let env = pohunek_test_support::env::TestEnv::new().expect("repository environment");
+    let git = |args: &[&str]| {
+        let output = env
+            .git_command()
+            .args(args)
+            .output()
+            .expect("run git in the repository environment");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(env.cwd().join("README.md"), "init\n").expect("write README");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    env
+}
+
+/// C2: the `post-create` hook of a worktree session runs with the `PATH` of the
+/// registry that created it, whatever another registry of the process read
+/// since. Both managers carry the `git` and `sh` the create needs and differ in
+/// one more directory, so a hook that took the other registry's value records a
+/// different `PATH`.
+#[tokio::test]
+async fn a_worktree_hook_runs_on_its_own_registrys_manager_path() {
+    if !in_own_process() {
+        return;
+    }
+    let repo = repository();
+    let tools = [directory_of("git"), directory_of("sh")];
+    let scratch = pohunek_test_support::tempdir().expect("scratch directory");
+    let process_dir = scratch.path().join("process-bin");
+    std::fs::create_dir_all(&process_dir).expect("process directory");
+    std::fs::set_permissions(&process_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-private process directory");
+    let mut process = ProcessEnv::lock();
+    process
+        .set("PATH", &process_dir)
+        .remove(ENV_DAEMON_ID)
+        .remove(ENV_SESSION_ID);
+
+    let mut daemons = Vec::new();
+    for name in ["first", "second"] {
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let manager_dir = root.path().join("manager-bin");
+        install_agent(&manager_dir, &root.path().join("launched.txt"));
+        let manager_path = std::env::join_paths(
+            std::iter::once(manager_dir.clone())
+                .chain(tools.iter().cloned())
+                .chain([process_dir.clone()]),
+        )
+        .expect("join PATH");
+        let manager = FakeManager::answering(Answer::Path(manager_path.clone()));
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(config_dir.join("hooks")).expect("host hook directory");
+        let recorded = root.path().join("hook-path.txt");
+        let hook = config_dir.join("hooks/post-create");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$PATH\" > '{}'\n",
+                recorded.display()
+            ),
+        )
+        .expect("write the hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("make the hook executable");
+        let worktrees = root.path().join("worktrees");
+        let store = root.path().join("metadata.jsonl");
+        let state = state_configured(
+            root.path(),
+            &manager,
+            Launches::Really,
+            LONG_REUSE,
+            |config| {
+                config.config_dir = Some(config_dir);
+                config.worktree_root = Some(worktrees);
+                config.store_path = Some(store);
+            },
+        )
+        .await;
+        daemons.push((name, manager_path, recorded, root, state));
+    }
+
+    // Each registry reads its manager once; the second read is the one the
+    // first registry's create must not see.
+    for (_name, _path, _recorded, _root, state) in &daemons {
+        git_available(state).await;
+    }
+    let (name, manager_path, recorded, _root, state) = &daemons[0];
+    let params = SessionNewParams {
+        client_request_id: None,
+        name: None,
+        agent: PROFILE.to_owned(),
+        cwd: None,
+        cols: 80,
+        rows: 24,
+        project: None,
+        repo: Some(repo.cwd().to_path_buf()),
+        branch: Some("c2".to_owned()),
+        base_branch: None,
+        input: None,
+        extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
+        input_ack_timeout_ms: None,
+        metadata: std::collections::BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
+        fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
+    };
+    let request = Request::new(
+        "manager-path",
+        method::SESSION_NEW,
+        serde_json::to_value(params).expect("session.new params"),
+    )
+    .expect("valid request");
+    handle_request(&request, state)
+        .await
+        .into_result()
+        .unwrap_or_else(|error| panic!("session.new on the {name} registry failed: {error}"));
+
+    let hook_path = std::fs::read_to_string(recorded).expect("the hook ran and recorded its PATH");
+    assert_eq!(
+        OsString::from(hook_path),
+        *manager_path,
+        "the {name} registry's hook runs on its own manager's PATH"
+    );
+}
+
 /// R4: a manager that cannot answer, or that has no `PATH`, leaves the `PATH`
 /// the daemon process started with; the process environment itself is never
 /// changed.
@@ -571,13 +730,16 @@ async fn a_manager_that_does_not_answer_leaves_the_process_path() {
         return;
     }
     let started = Started::new().await;
+    install_git(&started.manager_dir);
     for silent in [Answer::Unreachable, Answer::NoPath] {
         started.manager.answer(Answer::Path(started.with_agent()));
         started.found().await;
+        assert!(git_available(&started.state).await);
 
         started.manager.answer(silent);
 
         assert_eq!(inspected(&started.state).await, None);
+        assert!(!git_available(&started.state).await);
     }
     assert_eq!(
         std::env::var_os("PATH").as_deref(),

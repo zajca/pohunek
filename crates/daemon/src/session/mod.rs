@@ -2650,12 +2650,13 @@ impl SessionRegistry {
             return Ok((Vec::new(), WorktreeCleanup::default()));
         };
         let session_id = id.0.clone();
+        let search_path = self.search_path_snapshot();
         self.store_for_write()?;
         self.inner
             .background
             .spawn_blocking("cleanup_session_worktrees", move || {
                 let mut warnings = Vec::new();
-                let cleanup = worktree.cleanup_session(&session_id, &mut warnings)?;
+                let cleanup = worktree.cleanup_session(&session_id, &search_path, &mut warnings)?;
                 Ok((warnings, cleanup))
             })
             .await
@@ -3620,6 +3621,7 @@ impl SessionRegistry {
             Vec::new()
         };
         let reference = reference.to_owned();
+        let search_path = self.search_path_snapshot();
         self.store_for_write()?;
         self.inner
             .background
@@ -3640,6 +3642,7 @@ impl SessionRegistry {
                                 let prune = manager.cleanup_project(
                                     &record.id(),
                                     &skip,
+                                    &search_path,
                                     &mut hook_warnings,
                                 )?;
                                 for warning in &hook_warnings {
@@ -3728,6 +3731,7 @@ impl SessionRegistry {
             return Err(ProtocolError::worktree_in_use());
         }
         let path = path.to_owned();
+        let search_path = self.search_path_snapshot();
         self.store_for_write()?;
         self.inner
             .background
@@ -3735,7 +3739,7 @@ impl SessionRegistry {
                 "remove_worktree",
                 move || -> Result<WorktreeRemoveResult, ProtocolError> {
                     let mut warnings = Vec::new();
-                    let removed = manager.remove_one(&path, &mut warnings)?;
+                    let removed = manager.remove_one(&path, &search_path, &mut warnings)?;
                     if !removed {
                         return Err(runtime_error(
                             "worktree_not_owned",
@@ -3891,6 +3895,10 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// As [`Self::create`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered create: validate, claim, resolve, probe, then the detached transaction on one search path snapshot"
+    )]
     pub async fn create_outcome_spawned_by(
         &self,
         mut params: SessionNewParams,
@@ -4004,6 +4012,7 @@ impl SessionRegistry {
                     pending_initial_input,
                     extended_input_ready_wait,
                     input_ack_timeout,
+                    search_path,
                 )
                 .await
                 .map_err(|err| note_kept_backup(err, branch.as_deref(), source.as_ref()))?;
@@ -4051,12 +4060,15 @@ impl SessionRegistry {
         pending_initial_input: Option<String>,
         extended_input_ready_wait: bool,
         input_ack_timeout_ms: Option<u32>,
+        search_path: crate::runtime::SearchPath,
     ) -> Result<(SessionInfo, Option<bool>), ProtocolError> {
         // A reference assigned at launch makes the session resumable at once.
         if info.native_session_id.is_some() {
             self.persist_resume_binding(&info.id).await;
         }
-        self.spawn_session_hook(SessionHookRequest::of(HookEvent::SessionStart, &info));
+        self.spawn_session_hook(
+            SessionHookRequest::of(HookEvent::SessionStart, &info).on(search_path),
+        );
         // An empty initial prompt is a no-op (like no prompt): there is
         // nothing to defer, so a blocked dialog rolls back instead of being
         // kept with an empty deferred prompt.
@@ -4879,7 +4891,10 @@ impl SessionRegistry {
         let mut hook_stderr_tails = Vec::new();
         let mut worktree_source = None;
         let mut fetched_ref = None;
-        let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
+        let prepared = match self
+            .resolve_target(&id, &params, fallback_cwd, search_path)
+            .await
+        {
             Ok(mut target) => {
                 hook_stderr_tails = std::mem::take(&mut target.hook_stderr_tails);
                 worktree_source = target.worktree_source.take();
@@ -4906,6 +4921,7 @@ impl SessionRegistry {
                             &resolved.definition,
                             &target.launch_cwd,
                             target.project_id.as_deref(),
+                            search_path,
                         )
                         .await;
                     self.create_spec(
@@ -5479,7 +5495,8 @@ impl SessionRegistry {
         env_extra.append(secret_env);
         if params.skip_repo_hooks {
             let base = self.launch_base_environment(search_path)?;
-            launch_input::pin_git_hooks_off(&base, &mut env_extra, &launch_cwd).await?;
+            launch_input::pin_git_hooks_off(&base, &mut env_extra, &launch_cwd, search_path)
+                .await?;
         }
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),
@@ -7001,11 +7018,12 @@ impl SessionRegistry {
             .await
             .get(id)
             .is_some_and(|entry| entry.reference_launch.is_some());
+        let search_path = self.search_path_snapshot();
         match tokio::task::spawn_blocking(move || {
-            let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref())?;
+            let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref(), &search_path)?;
             let outside = marked
                 && resolved == CwdAssociation::default()
-                && crate::project::detect::confirmed_outside_repository(&cwd);
+                && crate::project::detect::confirmed_outside_repository(&cwd, &search_path);
             Ok::<_, ProtocolError>((resolved, outside))
         })
         .await
@@ -9138,8 +9156,9 @@ impl SessionRegistry {
             }
         }
         let store = self.inner.store.clone();
+        let search_path = self.search_path_snapshot();
         match tokio::task::spawn_blocking(move || {
-            resolve_cwd_association(cwd.as_path(), store.as_deref())
+            resolve_cwd_association(cwd.as_path(), store.as_deref(), &search_path)
         })
         .await
         {
@@ -9559,13 +9578,14 @@ fn external_session_info(
 fn resolve_cwd_association(
     cwd: &Path,
     store: Option<&Store>,
+    search_path: &crate::runtime::SearchPath,
 ) -> Result<CwdAssociation, ProtocolError> {
     let canonical_cwd = canonical_or_original(cwd);
     let worktree = match store {
         Some(store) => active_worktree_for_cwd(store, &canonical_cwd)?,
         None => None,
     };
-    let detected = detect_at(cwd)?;
+    let detected = detect_at(cwd, search_path)?;
     let mut association = match detected {
         Some(detected) => association_from_detected_project(&detected),
         None => CwdAssociation::default(),

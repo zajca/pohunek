@@ -1135,7 +1135,7 @@ impl SessionRegistry {
             ..
         } = relaunch;
         let trusted_args = self
-            .trusted_relaunch_args(&relaunch.definition, &binding)
+            .trusted_relaunch_args(&relaunch.definition, &binding, &search_path)
             .await;
         let inputs = self.launch_inputs(
             &relaunch.definition,
@@ -1152,7 +1152,13 @@ impl SessionRegistry {
         )?;
         let mut env_extra = inputs.env;
         if binding.skip_repo_hooks {
-            pin_git_hooks_off(&relaunch.base_environment, &mut env_extra, &binding.cwd).await?;
+            pin_git_hooks_off(
+                &relaunch.base_environment,
+                &mut env_extra,
+                &binding.cwd,
+                &search_path,
+            )
+            .await?;
         }
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
