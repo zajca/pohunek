@@ -60,6 +60,16 @@ const FOLLOWING: FollowGate = FollowGate {
     search_path_recorded: false,
 };
 
+/// The status of the doctor's `bin:` check once the manager `PATH` holds the
+/// agent. The Linux doctor probes the daemon's search path; the macOS doctor
+/// probes the process environment, because a macOS daemon never follows a
+/// manager.
+const DOCTOR_BIN_FOLLOWS_MANAGER: protocol::DoctorStatus = if cfg!(target_os = "linux") {
+    protocol::DoctorStatus::Ok
+} else {
+    protocol::DoctorStatus::Warn
+};
+
 /// What the fake manager answers next.
 #[derive(Debug, Clone)]
 enum Answer {
@@ -379,7 +389,7 @@ async fn a_daemon_started_before_the_manager_path_gains_an_agent_dir_finds_it() 
     started.found().await;
     assert_eq!(
         doctor_status(&started.state).await,
-        [protocol::DoctorStatus::Ok, protocol::DoctorStatus::Ok]
+        [DOCTOR_BIN_FOLLOWS_MANAGER, protocol::DoctorStatus::Ok]
     );
 }
 
