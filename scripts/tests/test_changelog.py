@@ -212,6 +212,54 @@ class ReleaseRules(ChangelogScenarios):
         self.assertEqual(run(root, "fold", "0.37.0", "--date", "2026-10-24T00:00").returncode, 1)
 
 
+class IssueLink(ChangelogScenarios):
+    """A folded entry carries its issue link once, whether or not the fragment ends with it."""
+
+    LINK = "([#7](https://github.com/example/app/issues/7))"
+
+    def folded_section(self, *fragments: tuple[str, str]) -> str:
+        root = self.copy_input("single")
+        for name in self.fragments(root):
+            (root / "changelog.d" / name).unlink()
+        for name, text in fragments:
+            (root / "changelog.d" / name).write_text(f"---\nkind: added\n---\n{text}\n")
+        fold = run(root, "fold", "0.37.0", "--date", "2026-10-24")
+        self.assertEqual(fold.returncode, 0, fold.stderr)
+        return (root / "CHANGELOG.md").read_text()
+
+    def test_a_fragment_with_and_without_its_own_link_ends_with_it_once(self):
+        section = self.folded_section(
+            ("7-bare.md", "Bare entry."),
+            ("7-linked.md", f"Linked entry. {self.LINK}"),
+            ("7-wrapped.md", f"Wrapped entry.\n{self.LINK}"),
+        )
+        self.assertIn(f"- Bare entry. {self.LINK}\n", section)
+        self.assertIn(f"- Linked entry. {self.LINK}\n", section)
+        self.assertIn(f"- Wrapped entry. {self.LINK}\n", section)
+        self.assertEqual(section.count(self.LINK), 3)
+
+    def test_a_fragment_citing_several_issues_ends_with_its_own_link_once(self):
+        other = "[#8](https://github.com/example/app/issues/8)"
+        own = self.LINK[1:-1]
+        section = self.folded_section(("7-both.md", f"Entry. ({other}, {own})"))
+        self.assertIn(f"- Entry. ({other}, {own})\n", section)
+
+    def test_a_link_to_another_issue_does_not_replace_the_entry_link(self):
+        other = "([#8](https://github.com/example/app/issues/8))"
+        section = self.folded_section(("7-other.md", f"Entry. {other}"))
+        self.assertIn(f"- Entry. {other} {self.LINK}\n", section)
+
+    def test_notes_post_of_a_linked_fragment_has_no_doubled_link(self):
+        root = self.copy_input("single")
+        for name in self.fragments(root):
+            (root / "changelog.d" / name).unlink()
+        (root / "changelog.d" / "7-linked.md").write_text(f"---\nkind: added\n---\nLinked entry. {self.LINK}\n")
+        self.assertEqual(run(root, "fold", "0.37.0", "--date", "2026-10-24").returncode, 0)
+        post = run(root, "notes", "0.37.0", "--post")
+        self.assertEqual(post.returncode, 0, post.stderr)
+        self.assertEqual(post.stdout.decode().count(self.LINK), 1)
+
+
 class ReleasePost(ChangelogScenarios):
     """`notes --post`: the skeleton a person turns into the release post.
 

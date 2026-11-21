@@ -276,6 +276,16 @@ def selected(fragments: list[Fragment], surface: str | None) -> list[Fragment]:
     return [f for f in fragments if surface is None or surface in (f.surfaces or ())]
 
 
+def issue_link_suffix(fragment: Fragment, repository: str) -> str:
+    """The issue link an entry ends with; empty when the fragment text already ends with it.
+
+    A fragment that cites several issues, `([#1](...), [#2](...))`, counts as linked when
+    the last citation is its own issue.
+    """
+    link = f"[#{fragment.number}](https://github.com/{repository}/issues/{fragment.number})"
+    return "" if fragment.text.endswith(f"{link})") else f" ({link})"
+
+
 def render_section(fragments: list[Fragment], repository: str) -> str:
     if not fragments:
         return NO_CHANGES
@@ -288,8 +298,7 @@ def render_section(fragments: list[Fragment], repository: str) -> str:
         if not items:
             continue
         entries = [
-            f"- {'**Breaking:** ' if f.breaking else ''}{f.text}"
-            f" ([#{f.number}](https://github.com/{repository}/issues/{f.number}))"
+            f"- {'**Breaking:** ' if f.breaking else ''}{f.text}{issue_link_suffix(f, repository)}"
             for f in items
         ]
         blocks.append(f"### {kind.capitalize()}\n\n" + "\n".join(entries))
