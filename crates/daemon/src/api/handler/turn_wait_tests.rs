@@ -104,6 +104,7 @@ const SETTLE_YIELDS: usize = 64;
 pub(super) struct Fixture {
     state: DaemonState,
     pub(super) sessions: SessionRegistry,
+    notifications: NotificationService,
     pub(super) root: Arc<tempfile::TempDir>,
     _projector: crate::shutdown::DriverHandle,
     _coordinator: crate::shutdown::DriverHandle,
@@ -190,15 +191,22 @@ impl Fixture {
             crate::test_support::overlay_registry(),
             crate::api::OverlaySource::Default,
         )
-        .with_notifications(notifications)
+        .with_notifications(notifications.clone())
         .with_attention_coordinator(attention);
         Self {
             state,
             sessions,
+            notifications,
             root,
             _projector: projector,
             _coordinator: coordinator,
         }
+    }
+
+    /// Runs the startup pass that acknowledges stale attention records on
+    /// this daemon, whose sessions are all live.
+    pub(super) async fn resolve_stale_attention(&self) -> usize {
+        crate::notifications::resolve_stale_attention(&self.sessions, &self.notifications).await
     }
 
     /// Creates a live session through `session.new` and returns its id.
