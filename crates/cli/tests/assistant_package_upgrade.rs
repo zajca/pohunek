@@ -156,7 +156,10 @@ async fn the_upgrade_reports_an_older_assistant_package_with_the_update_command(
     let finished = upgrade_assistant::attach(upgrade_report(VERSION), &paths).await;
     let document = serde_json::to_value(&finished).expect("the upgrade report serializes");
     assert_eq!(document["assistant"]["status"], "outdated", "{document}");
-    assert_eq!(document["assistant"]["version"], OLDER_VERSION, "{document}");
+    assert_eq!(
+        document["assistant"]["version"], OLDER_VERSION,
+        "{document}"
+    );
     assert_eq!(document["assistant"]["core_version"], VERSION, "{document}");
     let upgrade_text = upgrade_assistant::render_report(&finished);
     assert!(
