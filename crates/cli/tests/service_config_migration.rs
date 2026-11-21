@@ -685,6 +685,58 @@ fn check_refuses_a_schema_seven_config_when_the_cache_directory_cannot_hold_the_
     assert_config_refusal_naming(success, &envelope, "namespace.session_tmp_root");
 }
 
+/// An interrupted `refresh-path` of a schema-7 installation is judged by the
+/// adoption gate with the recorded search path the rollback restores, which
+/// renders the migrated file: the gate derives the session temporary root for
+/// it instead of failing on an unrecorded one.
+#[test]
+fn check_judges_a_pending_refresh_over_a_schema_seven_config_without_a_root_error() {
+    let host = Host::schema_seven_with_waits(120_000, 2_700_000);
+    let (_success, envelope) = check_with_setup(&host, |config, state, source| {
+        let digest = format!("{:x}", sha2::Sha256::digest(source));
+        let record = Record {
+            schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
+            operation: Operation::RefreshPath,
+            version: "0.36.0".to_owned(),
+            prefix: config
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .expect("fixture root")
+                .join("prefix"),
+            previous_version: Some("0.36.0".to_owned()),
+            version_dir_preexisted: true,
+            config_backup: None,
+            step: Step::Started,
+            rolling_back: false,
+            runtime_stop: false,
+            runtime_backup: None,
+            launchd_default_path: None,
+            launchd_boot_identity: None,
+            accepted_risks: None,
+            refresh: Some(pohunek_cli::service::record::RefreshJournal {
+                previous: vec!["/usr/bin".into()],
+                target: vec!["/usr/bin".into(), "/bin".into()],
+                digest_before: digest.clone(),
+                digest_after: digest,
+                daemon_before: None,
+            }),
+        };
+        Store::new(state.to_path_buf())
+            .save(&record)
+            .expect("journal the interrupted refresh");
+    });
+    let message = envelope
+        .get("err")
+        .and_then(|refusal| refusal.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !message.contains("session_tmp_root"),
+        "{envelope}: the gate does not fail on an unrecorded root"
+    );
+}
+
 /// A command that never writes the file reads a schema-7 file whatever the
 /// cache directory is: the cache directory only matters to the migration.
 #[test]
