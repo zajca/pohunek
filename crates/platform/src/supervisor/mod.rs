@@ -116,7 +116,10 @@ impl UnitEnvironment {
             || self.environment.iter().any(names_search_path)
             || !self.exec_search_path.is_empty()
             || !self.environment_files.is_empty()
-            || self.pass_environment.iter().any(|name| name == SEARCH_PATH_VARIABLE)
+            || self
+                .pass_environment
+                .iter()
+                .any(|name| name == SEARCH_PATH_VARIABLE)
             || self.unset_environment.iter().any(names_search_path)
     }
 }

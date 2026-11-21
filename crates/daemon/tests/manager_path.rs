@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use protocol::{DaemonDoctorResult, HostCapabilities, Request, method};
+use protocol::{method, DaemonDoctorResult, HostCapabilities, Request};
 use serde_json::Value;
 
 use pohunek_daemon::api::{handle_request, DaemonState, HealthInfo, OverlaySource};
@@ -59,7 +59,11 @@ impl FakeManager {
 
 impl ManagerEnvironment for FakeManager {
     fn search_path(&self) -> ManagerFuture<'_, Option<OsString>> {
-        let answer = self.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let answer = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         Box::pin(async move {
             match answer {
                 Answer::Path(path) => Ok(Some(path)),
@@ -114,8 +118,9 @@ async fn state(root: &Path, manager: &FakeManager) -> DaemonState {
         ),
         ..support::hermetic_registry_config()
     };
-    let registry = SessionRegistry::new_production(config, Arc::new(SubprocessWorkerLauncher::new()))
-        .expect("the production registry opens");
+    let registry =
+        SessionRegistry::new_production(config, Arc::new(SubprocessWorkerLauncher::new()))
+            .expect("the production registry opens");
     let governance = Arc::new(
         HostGovernanceService::open(root.join("state"))
             .await
