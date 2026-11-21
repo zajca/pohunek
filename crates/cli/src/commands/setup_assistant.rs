@@ -111,17 +111,13 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
             // it is the assistant the owner runs now. This rule is read before
             // the listed digest, so a digest the owner does not run never
             // replaces a selection that serves.
-            let selected = listed
-                .packages
-                .iter()
-                .find(|info| info.package.id == resolved.id && info.selected);
-            if let Some(selected) = selected {
-                let current = selected.package.version.to_string();
-                if serves(selected) && !is_older(&current, &version) {
+            let selected = selected_package(&listed.packages, &package_id, &version);
+            if let Some(selected) = &selected {
+                if serves(selected.info) && !selected.older {
                     return AssistantStep::Present {
                         package_id,
-                        version: current,
-                        digest: selected.digest.as_str().to_owned(),
+                        version: selected.info.package.version.to_string(),
+                        digest: selected.info.digest.as_str().to_owned(),
                     };
                 }
             }
@@ -166,7 +162,7 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
             // The listed digest is not installed, so installing it replaces a
             // selection that does not serve or is older than the listing.
             if let Some(selected) = selected {
-                replaces = Some(selected.package.version.to_string());
+                replaces = Some(selected.info.package.version.to_string());
             }
         }
     }
@@ -176,6 +172,29 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
         digest,
         replaces,
     }
+}
+
+/// The selected package of one id, compared with the version the index lists.
+pub(crate) struct SelectedPackage<'a> {
+    /// The daemon's entry for the selected package.
+    pub(crate) info: &'a protocol::PackageInfo,
+    /// Whether its version is older than the listed one.
+    pub(crate) older: bool,
+}
+
+/// The selected entry of `package_id` among `packages`, with whether it is
+/// older than `listed`. This is the one place that decides whether the
+/// installed assistant package is current.
+pub(crate) fn selected_package<'a>(
+    packages: &'a [protocol::PackageInfo],
+    package_id: &str,
+    listed: &str,
+) -> Option<SelectedPackage<'a>> {
+    let info = packages
+        .iter()
+        .find(|info| info.selected && info.package.id.to_string() == package_id)?;
+    let older = is_older(info.package.version.as_ref(), listed);
+    Some(SelectedPackage { info, older })
 }
 
 /// Whether `info` is a package that serves fresh launches and bare requests.

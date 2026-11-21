@@ -33,6 +33,11 @@ pub mod service;
 pub mod upgrade_assistant {
     //! The assistant package state `pohunek service upgrade` reports, asked of
     //! the daemon that serves the installation `base` describes.
+    //!
+    //! Test seam: the report is produced after the upgrade swapped the daemon
+    //! through a service manager, which no harness runs, so the scenario in
+    //! `tests/assistant_package_upgrade.rs` drives the same functions the
+    //! upgrade calls against a real `pohunekd` instead.
     use crate::paths::Paths;
     use crate::service::report::AssistantPackageReport;
 
