@@ -375,7 +375,7 @@ makes limit switching one setting away.
 **The credential.** `claude setup-token` runs the browser authorization of
 `/login`, prints a one-year OAuth token for a Pro, Max, Ultra, Team or Enterprise
 plan and saves it nowhere; the owner stores it in a mode 0600 file, one per
-account, in a directory outside `~/.claude`, and never pastes it into a chat, a
+account, in a mode 0700 directory outside `~/.claude`, and never pastes it into a chat, a
 session, a profile or an issue. Claude reads it from `CLAUDE_CODE_OAUTH_TOKEN`
 (see [authentication](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token)).
 The profile selects the file through a non-secret selector, here
@@ -394,7 +394,7 @@ choices.personal = { label = "Personal", env = { CLAUDE_ACCOUNT = "personal" } }
 ```
 
 The wrapper keeps the token out of the daemon entirely. It answers the
-version-only probe without a token, refuses an unsafe account or file, clears the
+version-only probe without a token, refuses an unsafe account, directory or file, clears the
 variables that would outrank the token, and ends in `exec` so the launched
 process is Claude itself:
 
@@ -426,6 +426,12 @@ case "${CLAUDE_ACCOUNT:-}" in
         ;;
 esac
 
+if [ ! -d "$accounts" ] || [ -L "$accounts" ] || [ ! -O "$accounts" ] \
+    || [ "$(stat -c %a "$accounts")" != 700 ]; then
+    echo "claude-account: $accounts must be a directory owned by you with mode 0700" >&2
+    exit 66
+fi
+
 file="$accounts/$CLAUDE_ACCOUNT.token"
 if [ ! -f "$file" ] || [ -L "$file" ] || [ ! -O "$file" ] || [ ! -s "$file" ] \
     || [ "$(stat -c %a "$file")" != 600 ]; then
@@ -435,7 +441,8 @@ fi
 
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
     CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
-    CLAUDE_CONFIG_DIR
+    CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
+    CLAUDE_CODE_USE_MANTLE CLAUDE_CONFIG_DIR
 IFS= read -r CLAUDE_CODE_OAUTH_TOKEN < "$file" || true
 if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
     echo "claude-account: $file has no token on its first line" >&2
@@ -460,9 +467,10 @@ cloud provider variables (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
 `apiKeyHelper` script, `CLAUDE_CODE_OAUTH_TOKEN`, Anthropic profile and
 federation credentials, then the stored `/login`. Anything above the token wins
 silently, which is why the wrapper unsets the variables of that list it can.
-Pohunek's base environment forwards no `ANTHROPIC_*` or `CLAUDE_*` variable, so
-those can only come from a profile `[env]`, a choice env, the wrapper or Claude's
-own settings. An `apiKeyHelper`, or an `env` block in a user or project settings file that
+The default allowlist of Pohunek's base environment forwards no `ANTHROPIC_*` or
+`CLAUDE_*` variable, so with it those can only come from a profile `[env]`, a
+choice env, the wrapper or Claude's own settings; an owner-set
+`environment_allowlist` in the service config can forward more. An `apiKeyHelper`, or an `env` block in a user or project settings file that
 names `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` or `CLAUDE_CODE_OAUTH_TOKEN`, replaces
 or outranks the wrapper's token and no environment check sees it: the owner
 checks those files for those names, names only. A signed-in Claude apps gateway
@@ -474,7 +482,7 @@ no token or key goes in `[env]` is the owner's, not an enforced one.
 **What a setup-token session lacks.**
 
 - `--bare` and `CLAUDE_CODE_SIMPLE=1` do not read `CLAUDE_CODE_OAUTH_TOKEN`
-  ([bare mode](https://code.claude.com/docs/en/headless.md#start-faster-with-bare-mode)),
+  ([bare mode](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)),
   so a session started that way is not on the chosen account. Pohunek never
   passes `--bare`; the wrapper refuses both.
 - The token can only make model requests: no Remote Control session and no

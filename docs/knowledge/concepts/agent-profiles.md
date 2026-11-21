@@ -255,6 +255,9 @@ expanded). The pieces fit together like this:
   exist yet is skipped until it does. An external session is still matched by
   agent base and not attributed to a profile.
 
+Resume freezing of the profile follows in a later change of the same work; this
+page grows with it.
+
 ### Choosing a credential with a launch option
 
 Accounts that must share one config home (one memory, settings, skills, plugins
@@ -301,9 +304,6 @@ session](../guides/claude-package.md#one-claude-subscription-per-session). A
 generic launch-time credential reference in the core is tracked in
 [#2504](https://github.com/zajca/pohunek/issues/2504); until it exists the
 wrapper is the supported way.
-
-Resume freezing of the profile follows in a later change of the same work; this
-page grows with it.
 
 ## Launch sources
 
