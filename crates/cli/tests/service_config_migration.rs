@@ -341,14 +341,15 @@ fn check(host: &Host) -> (bool, Value) {
 
 /// Runs the real check after a fixture has set up an interrupted transaction.
 fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bool, Value) {
-    check_in(host, None, setup)
+    check_in(host, None, "check", setup)
 }
 
 /// [`check_with_setup`] with the cache directory the child resolves
-/// (`XDG_CACHE_HOME`) replaced by `cache_home`.
+/// (`XDG_CACHE_HOME`) replaced by `cache_home`, running `service <command>`.
 fn check_in(
     host: &Host,
     cache_home: Option<&Path>,
+    command: &str,
     setup: impl FnOnce(&Path, &Path, &[u8]),
 ) -> (bool, Value) {
     let root = host.temporary.path();
@@ -413,7 +414,7 @@ fn check_in(
     let output = output
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .args(["service", "check", "--json"])
+        .args(["service", command, "--json"])
         .env("XDG_RUNTIME_DIR", env_of(&run))
         .env("XDG_STATE_HOME", env_of(&state))
         .env("XDG_DATA_HOME", env_of(&root.join("data")))
@@ -680,8 +681,30 @@ fn check_refuses_a_schema_seven_config_when_the_cache_directory_cannot_hold_the_
     for _ in 0..24 {
         cache_home.push("c".repeat(200));
     }
-    let (success, envelope) = check_in(&host, Some(&cache_home), |_, _, _| {});
+    let (success, envelope) = check_in(&host, Some(&cache_home), "check", |_, _, _| {});
     assert_config_refusal_naming(success, &envelope, "namespace.session_tmp_root");
+}
+
+/// A command that never writes the file reads a schema-7 file whatever the
+/// cache directory is: the cache directory only matters to the migration.
+#[test]
+fn status_reads_a_schema_seven_config_whatever_the_cache_directory() {
+    let host = Host::schema_seven_with_waits(120_000, 2_700_000);
+    let mut cache_home = host.temporary.path().join("cache");
+    // More than the 4096 bytes a recorded path may have.
+    for _ in 0..24 {
+        cache_home.push("c".repeat(200));
+    }
+    let (_success, envelope) = check_in(&host, Some(&cache_home), "status", |_, _, _| {});
+    let code = envelope
+        .get("err")
+        .and_then(|refusal| refusal.get("code"))
+        .and_then(Value::as_str);
+    assert_ne!(
+        code,
+        Some("service_config_invalid"),
+        "{envelope}: the file is read without the cache directory"
+    );
 }
 
 #[test]

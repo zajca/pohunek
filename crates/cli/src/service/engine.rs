@@ -3749,8 +3749,12 @@ pub(crate) async fn adoption_job_path(
     let Some(record) = pending else {
         return installed_job_path(context).await;
     };
+    // A refresh rollback rewrites the file with the recorded search path, which
+    // renders the migrated root, so only that judgement derives it.
+    let cache_dir =
+        (record.operation == Operation::RefreshPath).then(|| context.paths().cache_dir.as_path());
     let source =
-        load_config_for_upgrade(&context.config_path(), None)?.ok_or(Error::NotInstalled {
+        load_config_for_upgrade(&context.config_path(), cache_dir)?.ok_or(Error::NotInstalled {
             path: context.config_path(),
         })?;
     let config = if record.operation == Operation::RefreshPath {

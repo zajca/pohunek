@@ -191,11 +191,11 @@
 //! A schema-7 file does not record the cache directory, so the caller passes it
 //! and the upgrade assigns `namespace.session_tmp_root` explicitly as
 //! [`default_session_tmp_root`] of it, the location a daemon without the key
-//! uses. A reader that never writes the file passes no cache directory and gets
-//! the previous schema's values with no root ([`ServiceConfig::session_tmp_root`]
-//! is `None`), so it does not depend on the cache directory. The upgrade
-//! therefore moves nothing until the operator edits the key.
-//! Editing it moves only new session directories: the directories of sessions
+//! uses. The upgrade therefore moves nothing until the operator edits the key.
+//! A reader that never writes the file passes no cache directory and gets the
+//! previous schema's values with no root ([`ServiceConfig::session_tmp_root`]
+//! is `None`), so it does not depend on the cache directory.
+//! Editing the key moves only new session directories: the directories of sessions
 //! created under the old root stay there and are neither moved nor cleaned up.
 //!
 //! `environment.search_path` is the executable search path the installer
