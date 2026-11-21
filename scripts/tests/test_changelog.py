@@ -264,6 +264,11 @@ class IssueLink(ChangelogScenarios):
         section = self.folded_section(("7-other.md", f"Entry. {other}"))
         self.assertIn(f"- Entry. {other} {self.LINK}\n", section)
 
+    def test_a_link_to_an_issue_sharing_the_number_prefix_does_not_replace_the_entry_link(self):
+        other = "([#70](https://github.com/example/app/issues/70))"
+        section = self.folded_section(("7-prefix.md", f"Entry. {other}"))
+        self.assertIn(f"- Entry. {other} {self.LINK}\n", section)
+
     def test_notes_post_of_a_linked_fragment_has_no_doubled_link(self):
         root = self.copy_input("single")
         for name in self.fragments(root):
