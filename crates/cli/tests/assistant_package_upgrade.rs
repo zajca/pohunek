@@ -509,12 +509,56 @@ async fn a_store_that_cannot_be_written_leaves_the_selection_unchanged() {
     assert_eq!(leftovers.len(), before.len(), "{leftovers:?}");
 }
 
-/// The rollback flow: the listed version is installed and enabled, the owner
-/// selected an older one, and a later upgrade selects the listed version again
-/// without downloading it and reports the version it replaced. A listed
-/// version the owner disabled stays as set.
+/// An index the release does not endorse that names an installed version
+/// changes no selection and reports no `installed`: the owner's older choice
+/// stays.
 #[tokio::test]
-async fn an_installed_listed_version_is_selected_again_after_a_rollback() {
+async fn an_unendorsed_index_naming_an_installed_version_changes_no_selection() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    let old_digest = rig.install_by_digest(OLDER_VERSION).await;
+    let archive = rig.publish(VERSION);
+    let first = document_of_upgrade(&rig).await;
+    assert_eq!(install_of(&first)["result"], "installed", "{first}");
+    let (code, selected) = rig
+        .install
+        .json(&[
+            "plugin",
+            "select",
+            ASSISTANT_PACKAGE,
+            "--digest",
+            &old_digest,
+        ])
+        .await;
+    assert_eq!(code, 0, "{selected}");
+
+    let archive_path = assistant_index::archive_path(VERSION);
+    let entry = assistant_index::assistant_entry(&archive, VERSION, rig.server.url(&archive_path));
+    let stranger = test_key();
+    rig.server.set(
+        INDEX_PATH,
+        rig.keys.document(&stranger, now() + 1000, vec![entry]),
+    );
+    let before = rig.listed().await;
+    let document = document_of_upgrade(&rig).await;
+    assert_ne!(install_of(&document)["result"], "installed", "{document}");
+    assert_eq!(rig.listed().await, before);
+    assert_eq!(
+        rig.selected().await.expect("selected").digest,
+        old_digest,
+        "the selection did not change"
+    );
+}
+
+/// The rollback flow: the listed version is installed and enabled, the owner
+/// selected an older one, and a later upgrade holds: it changes no selection
+/// and names `plugin select` (a daemon install of an installed digest keeps the
+/// recorded state, as after `pohunek setup`). A disabled listed version is held
+/// the same way.
+#[tokio::test]
+async fn an_installed_listed_version_is_held_after_a_rollback() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -539,43 +583,39 @@ async fn an_installed_listed_version_is_selected_again_after_a_rollback() {
         rig.selected().await.expect("selected").version,
         OLDER_VERSION
     );
-    let archive_path = assistant_index::archive_path(VERSION);
-    let downloads = |rig: &Rig| {
-        rig.server
-            .requests()
-            .iter()
-            .filter(|path| **path == archive_path)
-            .count()
-    };
-    let before = downloads(&rig);
+    let before = rig.listed().await;
 
-    let document = document_of_upgrade(&rig).await;
+    let report = rig.upgrade().await;
+    let document = as_json(&report);
     let install = install_of(&document);
-    assert_eq!(install["result"], "installed", "{document}");
-    assert_eq!(install["digest"], archive.digest.as_str(), "{document}");
-    assert_eq!(install["replaced_version"], OLDER_VERSION, "{document}");
-    assert_eq!(install["replaced_digest"], old_digest, "{document}");
-    assert_eq!(document["assistant"]["status"], "current", "{document}");
-    let selected = rig.selected().await.expect("a version is selected");
-    assert_eq!(selected.digest, archive.digest.as_str());
-    assert!(selected.enabled);
-    assert_eq!(
-        downloads(&rig),
-        before,
-        "an installed version is selected, not downloaded again"
+    assert_eq!(install["result"], "held", "{document}");
+    assert!(install["digest"].is_null(), "{document}");
+    assert!(
+        install["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("installed but not selected"),
+        "{document}"
     );
+    let command = install["command"].as_str().expect("command");
+    assert_eq!(
+        command,
+        format!(
+            "pohunek plugin select {ASSISTANT_PACKAGE} --digest {}",
+            archive.digest.as_str()
+        ),
+        "{document}"
+    );
+    assert_eq!(document["assistant"]["status"], "outdated", "{document}");
+    assert_eq!(rig.listed().await, before, "no selection changed");
+    assert_eq!(
+        rig.selected().await.expect("selected").digest,
+        old_digest,
+        "the owner's selection stays"
+    );
+    let text = upgrade_assistant::render_report(&report);
+    assert!(text.contains("plugin select"), "{text}");
 
-    let (code, back) = rig
-        .install
-        .json(&[
-            "plugin",
-            "select",
-            ASSISTANT_PACKAGE,
-            "--digest",
-            &old_digest,
-        ])
-        .await;
-    assert_eq!(code, 0, "{back}");
     let (code, disabled) = rig
         .install
         .json(&[
@@ -589,6 +629,13 @@ async fn an_installed_listed_version_is_selected_again_after_a_rollback() {
     assert_eq!(code, 0, "{disabled}");
     let held = document_of_upgrade(&rig).await;
     assert_eq!(install_of(&held)["result"], "held", "{held}");
+    assert!(
+        install_of(&held)["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("installed but disabled"),
+        "{held}"
+    );
     assert_eq!(
         rig.selected().await.expect("selected").version,
         OLDER_VERSION,

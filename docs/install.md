@@ -477,10 +477,13 @@ made before that reports `not_published` and keeps the old package; run
 `pohunek setup` later to install it. The step never fails the upgrade: an
 unreachable index or a refused document is reported as `failed` and the old
 package stays. A package you disabled, or an installed one with no selected version, stays
-as set (`held`, with the `plugin enable` and `plugin select` steps), and an
-older version you selected on purpose is replaced like `setup` replaces it (a
-listed version that is already installed and enabled is selected again without a
-download); the report names the
+as set (`held`, with the `plugin enable` and `plugin select` steps), and so
+does a case where the version the index lists is already installed but not
+selected, for example after you rolled back with `plugin select` (`held`, naming
+`pohunek plugin select pohunek.context.assistant --digest <digest>`): the
+upgrade changes no selection that way, as `setup` does not. An older version you
+selected on purpose is otherwise replaced like `setup` replaces it, when the
+listed version is not installed yet; the report names the
 replaced digest, so `pohunek plugin select pohunek.context.assistant --digest
 <replaced_digest>` selects it again. A rollback with `pohunek service upgrade
 --from <previous>` keeps the newer package selected and serving; select the older

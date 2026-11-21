@@ -3135,16 +3135,17 @@ selected one, so `pohunek plugin select pohunek.context.assistant --digest
 not apply are `null`. `result` is one of:
 
 - `installed`: a newer version is installed and selected in one registry commit;
-  the old version stays installed. A listed version that is already installed and
-  enabled while an older one is selected (after a rollback with `plugin select`)
-  is selected without a download and reported the same way;
+  the old version stays installed. The daemon verifies the signed index and the
+  archive digest for it, as for `pohunek setup`;
 - `not_published`: the index lists no version newer than the selected one for the
   new core (the package is published after the core release, and the official
   index lists it only once it is admitted), so the old package is kept;
   `command` is `pohunek setup`;
 - `held`: the selected version is disabled, or a version is installed and none
   is selected (no index request is made), or the listed version is installed
-  and disabled (found after the index is read); `command` names the
+  and not selected or disabled (found after the index is read; a daemon
+  install of an installed digest keeps its recorded state, so only
+  `plugin select` changes the selection, and the step changes none); `command` names the
   `plugin enable` and `plugin select` steps;
 - `failed`: the index or the archive could not be fetched, or the index or the
   digest was refused (`detail` carries the reason); the daemon installs nothing
@@ -3153,7 +3154,8 @@ not apply are `null`. `result` is one of:
 - `skipped`: `--no-assistant-package` was given; no index request was made.
 
 An absent package is installed; an explicit `plugin select` of an older version
-that still serves is replaced, as `pohunek setup` replaces it. No result fails the
+that still serves is replaced, as `pohunek setup` replaces it, unless the listed
+version is already installed (`held`, above). No result fails the
 upgrade or rolls the core back, the exit code stays 0, and a failed or rolled-back
 upgrade carries no `assistant` object. A run that is not a forward move to this
 build's version (a rollback with `--from <previous>`, an unchanged version, a

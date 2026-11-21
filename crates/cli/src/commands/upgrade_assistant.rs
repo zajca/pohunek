@@ -9,8 +9,6 @@
 
 // Rust guideline compliant 2026-11-21
 
-use protocol::{method, PackageSelectParams};
-
 use crate::client::Client;
 use crate::commands::plugin::{self, Error};
 use crate::commands::plugin_index;
@@ -169,30 +167,30 @@ async fn install(
             && !info.revoked
     });
     if let Some(held) = installed {
-        if !held.enabled {
-            // The owner disabled the listed digest: it stays as set.
-            return outcome(
-                AssistantInstallResult::Held,
-                Some(format!(
-                    "version {} is installed but disabled, which the upgrade leaves as it is",
-                    held.package.version
-                )),
-                Some(format!(
+        // The listed digest is already installed: a daemon install of it keeps
+        // the recorded state, so only the owner's `plugin select` changes the
+        // selection, as after `pohunek setup`.
+        let (state, command) = if held.enabled {
+            (
+                "not selected",
+                format!("pohunek plugin select {PACKAGE_ID} --digest {digest}"),
+            )
+        } else {
+            (
+                "disabled",
+                format!(
                     "pohunek plugin enable {PACKAGE_ID} --digest {digest} && pohunek plugin select {PACKAGE_ID} --digest {digest}"
-                )),
-            );
-        }
-        // The listed digest is installed and enabled while an older version
-        // serves: selecting it is the upgrade, and nothing is downloaded.
-        return match client
-            .call::<method::PackageSelect>(PackageSelectParams {
-                digest: resolved.digest.clone(),
-            })
-            .await
-        {
-            Ok(_) => installed_outcome(version, digest, selected),
-            Err(error) => failed(error.to_string()),
+                ),
+            )
         };
+        return outcome(
+            AssistantInstallResult::Held,
+            Some(format!(
+                "version {} is installed but {state}, which the upgrade leaves as it is",
+                held.package.version
+            )),
+            Some(command),
+        );
     }
     match setup_assistant::install(&mut client, &version, &digest, options.index_url).await {
         Ok(()) => installed_outcome(version, digest, selected),
