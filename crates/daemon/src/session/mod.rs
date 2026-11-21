@@ -3874,7 +3874,8 @@ impl SessionRegistry {
         // without a probed release: a runtime that reports no version cannot
         // meet any `min_runtime`.
         let base = self.launch_base_environment()?;
-        let environment = host::ProbeEnvironment::for_launch(&base, profile_env);
+        let environment =
+            host::ProbeEnvironment::for_launch(&base, profile_env, self.search_path().as_deref());
         let program =
             host::validate_launch_runtime(&resolved.definition, resolved.spawn(), &environment)?;
         resolved.check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
@@ -3892,6 +3893,8 @@ impl SessionRegistry {
         mut params: SessionNewParams,
         spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<CreateOutcome, ProtocolError> {
+        // The create resolves and launches on the `PATH` the manager holds now.
+        self.refreshed_search_path().await;
         // Taken before the secret values are removed, so the fingerprint covers
         // the slot names and never a value.
         let fingerprint = create_request::request_fingerprint(&params)?;
@@ -5469,6 +5472,7 @@ impl SessionRegistry {
             rows: params.rows,
             env_extra,
             validated_program,
+            search_path: self.search_path(),
             worker_file: inputs.worker_file,
         };
         let plan = build_launch_command(

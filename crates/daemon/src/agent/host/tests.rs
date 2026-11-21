@@ -1134,7 +1134,11 @@ mod launch_validation {
             &crate::runtime::environment::EnvironmentSource::Process,
         )
         .expect("the default allowlist builds");
-        let environment = ProbeEnvironment::for_launch(&base, &[]);
+        let environment = ProbeEnvironment::for_launch(
+            &base,
+            &[],
+            crate::agent::process_search_path().as_deref(),
+        );
         let error = validate_launch_runtime(&unknown, Spawn::Program(&acme), &environment)
             .expect_err("unknown parser");
         assert_eq!(error.code, "agent_runtime_unsupported");

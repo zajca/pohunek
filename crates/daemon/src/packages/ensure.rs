@@ -1398,7 +1398,9 @@ fn report_requested_off_path(report: &mut Report, entry: &Planned) {
         return;
     }
     let program = entry.definition.program().as_str();
-    if ValidatedLaunchProgram::resolve(program).is_none() {
+    if ValidatedLaunchProgram::resolve(program, crate::agent::process_search_path().as_deref())
+        .is_none()
+    {
         report.gap(
             entry.runtime.as_str(),
             CODE_GAP_AGENT_NOT_ON_PATH,
@@ -1783,7 +1785,9 @@ fn detect_on_search_path(
     program: &str,
     reasons: &mut Vec<UseReason>,
 ) -> bool {
-    if ValidatedLaunchProgram::resolve(program).is_some() {
+    if ValidatedLaunchProgram::resolve(program, crate::agent::process_search_path().as_deref())
+        .is_some()
+    {
         reasons.push(UseReason::Detected);
         return true;
     }

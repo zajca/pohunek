@@ -857,19 +857,43 @@ pub(super) struct RetryState {
 }
 
 impl SessionRegistry {
-    /// Re-reads the service manager's `PATH` when the daemon follows it, so
-    /// the request about to run resolves and launches agents on the `PATH` the
-    /// manager holds now.
-    pub(crate) async fn refresh_manager_path(&self) {
-        if let Some(manager_path) = self
-            .inner
+    fn manager_path(&self) -> Option<&crate::runtime::ManagerPath> {
+        self.inner
             .config
             .supervision
             .as_ref()
             .and_then(|supervision| supervision.manager_path.as_ref())
-        {
+    }
+
+    /// The `PATH` this registry resolves executables on and gives its agents:
+    /// the service manager's last read when the daemon follows it, else the
+    /// process's.
+    pub(crate) fn search_path(&self) -> Option<std::ffi::OsString> {
+        let path = self.manager_path().map_or_else(
+            || std::env::var_os("PATH"),
+            crate::runtime::ManagerPath::search_path,
+        );
+        #[cfg(test)]
+        let path = crate::test_support::with_thread_launch_path(path);
+        path
+    }
+
+    /// The manager `PATH` of the last read, when the daemon follows it; the
+    /// base environment of a launch swaps it in for the process's.
+    pub(crate) fn manager_search_path(&self) -> Option<std::ffi::OsString> {
+        self.manager_path()
+            .and_then(crate::runtime::ManagerPath::manager_path)
+    }
+
+    /// [`Self::search_path`] after re-reading the service manager's `PATH`
+    /// when the daemon follows it. Every operation that resolves or launches
+    /// an agent starts from this, so it runs on the `PATH` the manager holds
+    /// now.
+    pub(crate) async fn refreshed_search_path(&self) -> Option<std::ffi::OsString> {
+        if let Some(manager_path) = self.manager_path() {
             manager_path.refresh().await;
         }
+        self.search_path()
     }
 
     /// Reaps the processes an ended generation's runtime left behind.

@@ -25,7 +25,7 @@ use crate::agent::{
 };
 use crate::detect::Manifest;
 use crate::integration::launch_input::LaunchKind;
-use crate::runtime::environment::{base_environment, effective_variable};
+use crate::runtime::environment::effective_variable;
 use crate::store::LaunchCheckout;
 use package::PackageDigest;
 use pohunek_worker_protocol::BaseEnv;
@@ -536,6 +536,8 @@ impl SessionRegistry {
         change: ProfileChange,
     ) -> Result<SessionInfo, ProtocolError> {
         self.ensure_not_external(id).await?;
+        // The resume resolves and launches on the `PATH` the manager holds now.
+        self.refreshed_search_path().await;
         // Held from resolving the pin until the detached registration has
         // persisted the resumed record, so an adopting package cannot be
         // uninstalled in between: the built-in pin does not count as a
@@ -854,9 +856,10 @@ impl SessionRegistry {
     /// The base environment a launch of this registry hands to the agent.
     pub(super) fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
         let lifecycle = self.lifecycle()?;
-        base_environment(
+        crate::runtime::environment::base_environment_following(
             &lifecycle.config.environment_allowlist,
             &lifecycle.config.environment_source,
+            self.manager_search_path(),
         )
         .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))
     }
@@ -956,8 +959,11 @@ impl SessionRegistry {
         // A runtime without a version probe validates the frozen program's
         // resolution the same way; its environment only matters when a
         // probe runs.
-        let environment =
-            host::ProbeEnvironment::for_launch(&base_environment, profile.env.as_slice());
+        let environment = host::ProbeEnvironment::for_launch(
+            &base_environment,
+            profile.env.as_slice(),
+            self.search_path().as_deref(),
+        );
         let validated_program = host::validate_launch_runtime(
             &definition,
             host::Spawn::Program(&program),
@@ -1067,6 +1073,10 @@ impl SessionRegistry {
     }
 
     /// Relaunch one session under the supplied durable lifecycle operation.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the resume launch is one ordered sequence of recovery steps"
+    )]
     async fn resume_binding_with_registration(
         &self,
         binding: ResumeBinding,
@@ -1126,6 +1136,7 @@ impl SessionRegistry {
             rows: binding.rows,
             env_extra,
             validated_program,
+            search_path: self.search_path(),
             worker_file: inputs.worker_file,
         };
         let command = resume_pty_command_from_launch(

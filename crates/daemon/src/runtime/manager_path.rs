@@ -4,9 +4,11 @@
 //! A user unit started before the desktop session imports its environment keeps
 //! the `PATH` it was started with, so agents the login environment provides
 //! (version-manager shims) stay invisible until the daemon restarts. A daemon
-//! whose job takes the manager `PATH` therefore reads the manager again when it
-//! handles a request, and every `PATH` read of the daemon goes through
-//! [`search_path`], so a probe and a launch agree on what runs.
+//! whose job takes the manager `PATH` therefore reads the manager again at the
+//! boundary where its registry resolves or launches an agent, and the registry
+//! hands that one value to every reader of the operation, so a probe and a
+//! launch agree on what runs. The state belongs to the [`ManagerPath`] of a
+//! registry; two registries never share it.
 //!
 //! Only `PATH` is refreshed. Other allowlisted variables, such as a store
 //! location, stay as the process got them. A manager that cannot answer leaves
@@ -24,29 +26,28 @@ use std::time::{Duration, Instant};
 use pohunek_platform::supervisor::UnitEnvironment;
 use tracing::{debug, warn};
 
-/// The manager `PATH` the last read returned; `None` when the daemon uses its
-/// process environment.
-static CURRENT: RwLock<Option<OsString>> = RwLock::new(None);
+/// The manager `PATH` of the registry that refreshed last, for the helper
+/// resolvers (`git`, hook interpreters) that no registry reaches.
+///
+/// Process-wide until those resolvers take their search path from the registry
+/// (#2494); every other reader uses [`ManagerPath::search_path`] of its own
+/// registry.
+static HELPER_CURRENT: RwLock<Option<OsString>> = RwLock::new(None);
 
-/// The `PATH` the daemon resolves executables on and gives its agents: the
-/// manager's when [`ManagerPath::refresh`] has read one, else the process's.
+/// The `PATH` the helper resolvers search: the manager's when a
+/// [`ManagerPath::refresh`] has read one, else the process's.
 #[must_use]
-pub(crate) fn search_path() -> Option<OsString> {
-    let current = CURRENT.read().unwrap_or_else(PoisonError::into_inner);
+pub(crate) fn helper_search_path() -> Option<OsString> {
+    let current = HELPER_CURRENT
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
     current.clone().or_else(|| std::env::var_os("PATH"))
 }
 
-/// The manager `PATH` the last refresh read, when one is in use.
-#[must_use]
-pub(crate) fn current_manager_path() -> Option<OsString> {
-    CURRENT
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-}
-
-fn store(path: Option<OsString>) {
-    *CURRENT.write().unwrap_or_else(PoisonError::into_inner) = path;
+fn store_helper(path: Option<OsString>) {
+    *HELPER_CURRENT
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = path;
 }
 
 /// Why the manager's `PATH` could not be read.
@@ -110,6 +111,10 @@ struct Inner {
     max_age: Duration,
     deadline: Duration,
     last_read: tokio::sync::Mutex<Option<Instant>>,
+    /// The manager `PATH` the last read returned; `None` when the daemon uses
+    /// its process environment. A std lock because sync readers run on
+    /// blocking threads.
+    current: RwLock<Option<OsString>>,
 }
 
 impl ManagerPath {
@@ -123,6 +128,7 @@ impl ManagerPath {
                 max_age,
                 deadline,
                 last_read: tokio::sync::Mutex::new(None),
+                current: RwLock::new(None),
             }),
         }
     }
@@ -158,6 +164,32 @@ impl ManagerPath {
             .then(|| Self::new(source, max_age, deadline))
     }
 
+    /// The manager `PATH` the last refresh read, when one is in use.
+    #[must_use]
+    pub fn manager_path(&self) -> Option<OsString> {
+        self.inner
+            .current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The `PATH` this daemon resolves executables on and gives its agents:
+    /// the manager's when a refresh has read one, else the process's.
+    #[must_use]
+    pub fn search_path(&self) -> Option<OsString> {
+        self.manager_path().or_else(|| std::env::var_os("PATH"))
+    }
+
+    fn store(&self, path: Option<OsString>) {
+        store_helper(path.clone());
+        *self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = path;
+    }
+
     /// Reads the manager `PATH` unless a recent read is still fresh, and makes
     /// it the daemon's search path; a manager that cannot answer, or that has
     /// no `PATH`, returns the daemon to its process `PATH`.
@@ -173,17 +205,17 @@ impl ManagerPath {
             .unwrap_or_else(|_elapsed| Err(ManagerReadError::new("the read timed out")));
         match read {
             Ok(path) => {
-                let changed = current_manager_path() != path;
-                store(path);
+                let changed = self.manager_path() != path;
+                self.store(path);
                 if changed {
                     debug!("the daemon search path follows the service manager");
                 }
             }
             Err(error) => {
-                if current_manager_path().is_some() {
+                if self.manager_path().is_some() {
                     warn!(%error, "the service manager's PATH is unreadable; using the process PATH");
                 }
-                store(None);
+                self.store(None);
             }
         }
         *last_read = Some(Instant::now());

@@ -477,8 +477,11 @@ Daemon, sessions, integrations, and project state:
   login-shell discovery, path validation, and executable resolution (see
   `docs/knowledge/guides/environment-resolution.md`).
 - `crates/daemon/src/runtime/manager_path.rs` — the systemd user manager's
-  `PATH` a daemon follows on each request, and the one search path every daemon
-  `PATH` read uses (see `docs/knowledge/guides/environment-resolution.md`).
+  `PATH` a daemon follows. Each `ManagerPath`, owned by one session registry,
+  holds its own search path and the registry refreshes it where it resolves or
+  launches an agent. Only the `git` and hook-interpreter resolvers still read a
+  process-wide mirror (#2494) (see
+  `docs/knowledge/guides/environment-resolution.md`).
 - `docs/knowledge/guides/environment-resolution.md` — how the daemon and
   agents resolve `PATH` and executables.
 - `crates/platform/src/process/sweep.rs` — ownership-marker sweep of a lost

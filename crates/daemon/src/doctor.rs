@@ -64,6 +64,7 @@ pub(crate) async fn report(
     catalog_trust: &CatalogTrust,
     profiles: &crate::agent::ProfileRegistry,
     base_env: pohunek_worker_protocol::BaseEnv,
+    search_path: Option<std::ffi::OsString>,
     overlays: OverlayChecks<'_>,
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
@@ -84,6 +85,7 @@ pub(crate) async fn report(
         path: active.worker_executable,
         source: WorkerSource::Supervision,
     });
+    let standard_search_path = search_path.clone();
     let mut checks = tokio::task::spawn_blocking(move || {
         let mut checks = standard_checks(
             &paths,
@@ -93,6 +95,7 @@ pub(crate) async fn report(
                 diagnostics: &overlay_diagnostics,
                 from_file: overlays_from_file,
             },
+            standard_search_path.as_deref(),
         );
         let readiness = worker_readiness_check(worker.as_ref());
         if let Some(existing) = checks
@@ -112,7 +115,14 @@ pub(crate) async fn report(
     let probe_clock = probe_clock.clone();
     checks.extend(
         tokio::task::spawn_blocking(move || {
-            profile_checks(&profiles, &base_env, include_profile_homes, &probe_clock, probe_budget)
+            profile_checks(
+                &profiles,
+                &base_env,
+                include_profile_homes,
+                &probe_clock,
+                probe_budget,
+                search_path.as_deref(),
+            )
         })
             .await
             .unwrap_or_else(|_| vec![check("agent_profiles", DoctorStatus::Fail, "Configured agent profiles could not be inspected; check daemon logs and profile ownership.")]),
@@ -183,6 +193,8 @@ struct DoctorProbes<'a> {
     started: Instant,
     budget: Duration,
     clock: &'a ProbeClock,
+    /// Where the daemon resolves agent executables.
+    search_path: Option<&'a std::ffi::OsStr>,
 }
 
 /// Check configured profile resolution and the readiness of optional providers.
@@ -192,6 +204,7 @@ fn profile_checks(
     include_profile_homes: bool,
     clock: &ProbeClock,
     budget: Duration,
+    search_path: Option<&std::ffi::OsStr>,
 ) -> Vec<DoctorCheck> {
     let mut checks = embedded_manifest_checks();
     checks.extend(manifest_override_checks(profiles));
@@ -199,12 +212,19 @@ fn profile_checks(
         started: Instant::now(),
         budget,
         clock,
+        search_path,
     };
     let configured = match profiles.doctor_profiles() {
         Ok(configured) => configured,
         Err(detail) => {
             checks.push(check("agent_profiles", DoctorStatus::Fail, detail));
-            checks.extend(integration_checks(profiles, base_env, false, &[]));
+            checks.extend(integration_checks(
+                profiles,
+                base_env,
+                false,
+                &[],
+                probes.search_path,
+            ));
             return checks;
         }
     };
@@ -252,6 +272,7 @@ fn configured_checks(
         base_env,
         include_profile_homes,
         &hermes_profiles,
+        probes.search_path,
     ));
     checks
 }
@@ -465,6 +486,7 @@ fn integration_checks(
     base_env: &pohunek_worker_protocol::BaseEnv,
     include_profile_homes: bool,
     hermes_profiles: &[String],
+    search_path: Option<&std::ffi::OsStr>,
 ) -> Vec<DoctorCheck> {
     let params = IntegrationDoctorParams {
         agent: None,
@@ -472,7 +494,7 @@ fn integration_checks(
         all_profiles: include_profile_homes,
     };
     let homes = crate::integration::ConfigHomes::new(profiles.clone(), base_env.clone());
-    let mut checks = match crate::integration::doctor_in_noted(&homes, params) {
+    let mut checks = match crate::integration::doctor_in_noted(&homes, params, search_path) {
         Ok(report) => report
             .iter()
             .map(|(diagnosis, note)| integration_agent_check(diagnosis, *note))
@@ -678,11 +700,13 @@ fn profile_runtime_check(
         .profile
         .as_ref()
         .map_or(&[][..], |profile| profile.env.as_slice());
-    if crate::agent::which_executable(agent.program()).is_none() {
-        return Err(crate::agent::executable_refusal(agent.program()).map_or(
-            RuntimeFailure::Executable,
-            RuntimeFailure::ExecutableRefused,
-        ));
+    if crate::agent::which_executable(agent.program(), probes.search_path).is_none() {
+        return Err(
+            crate::agent::executable_refusal(agent.program(), probes.search_path).map_or(
+                RuntimeFailure::Executable,
+                RuntimeFailure::ExecutableRefused,
+            ),
+        );
     }
     let probe_timeout = if agent.definition.version_probe_parser().is_some() {
         probes.budget.saturating_sub(probes.started.elapsed())
@@ -692,7 +716,8 @@ fn profile_runtime_check(
     if agent.definition.version_probe_parser().is_some() && probe_timeout.is_zero() {
         return Err(RuntimeFailure::ProbeBudget);
     }
-    let environment = crate::agent::host::ProbeEnvironment::for_launch(base_env, profile_env);
+    let environment =
+        crate::agent::host::ProbeEnvironment::for_launch(base_env, profile_env, probes.search_path);
     crate::agent::host::validate_launch_runtime_with_timeout_detailed(
         &agent.definition,
         agent.spawn(),
@@ -702,7 +727,7 @@ fn profile_runtime_check(
     )
     .map_err(|error| match error {
         crate::capabilities::LaunchValidationFailure::Missing => {
-            crate::agent::executable_refusal(agent.program()).map_or(
+            crate::agent::executable_refusal(agent.program(), probes.search_path).map_or(
                 RuntimeFailure::Executable,
                 RuntimeFailure::ExecutableRefused,
             )
@@ -736,9 +761,9 @@ fn standard_checks(
     worker: Option<&WorkerCandidate>,
     supervision: Supervision,
     overlays: OverlayChecks<'_>,
+    search_path: Option<&std::ffi::OsStr>,
 ) -> Vec<DoctorCheck> {
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
-    let search_path = crate::runtime::manager_path::search_path();
     hostcheck::standard_checks_on(
         StandardCheckInputs {
             socket_dir: &paths.runtime_dir,
@@ -752,7 +777,7 @@ fn standard_checks(
             supervision,
             overlays,
         },
-        search_path.as_deref(),
+        search_path,
     )
 }
 
@@ -1483,6 +1508,7 @@ mod tests {
             &CatalogTrust::Absent,
             &crate::agent::ProfileRegistry::default(),
             pohunek_worker_protocol::BaseEnv::default(),
+            crate::agent::process_search_path(),
             OverlayChecks::NONE,
             false,
             RejectedLinesState::Counted {
@@ -1569,6 +1595,7 @@ mod tests {
             &CatalogTrust::Invalid(AnchorFault::TooLarge),
             &crate::agent::ProfileRegistry::default(),
             pohunek_worker_protocol::BaseEnv::default(),
+            crate::agent::process_search_path(),
             OverlayChecks::NONE,
             false,
             RejectedLinesState::Counted {

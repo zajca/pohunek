@@ -152,6 +152,7 @@ pub(crate) fn host_capabilities(
     daemon_version: &str,
     profiles: &ProfileRegistry,
     base_env: &BaseEnv,
+    search_path: Option<&OsStr>,
     cache: &ProbeCache,
 ) -> HostCapabilities {
     host_capabilities_for(
@@ -159,6 +160,7 @@ pub(crate) fn host_capabilities(
         profiles,
         &profiles.runtimes().registry(),
         base_env,
+        search_path,
         cache,
     )
 }
@@ -185,6 +187,7 @@ pub(crate) fn host_capabilities_uncached(
         daemon_version,
         profiles,
         base_env,
+        crate::agent::process_search_path().as_deref(),
         &ProbeCache::new(pohunek_service_config::DEFAULT_INVENTORY_PROBE),
     )
 }
@@ -202,6 +205,7 @@ fn host_capabilities_for_uncached(
         profiles,
         registry,
         base_env,
+        crate::agent::process_search_path().as_deref(),
         &ProbeCache::new(pohunek_service_config::DEFAULT_INVENTORY_PROBE),
     )
 }
@@ -224,6 +228,7 @@ fn host_capabilities_for(
     profiles: &ProfileRegistry,
     registry: &RuntimeRegistry,
     base_env: &BaseEnv,
+    search_path: Option<&OsStr>,
     cache: &ProbeCache,
 ) -> HostCapabilities {
     let mut definitions: Vec<&Arc<RuntimeDefinition>> = registry.definitions().collect();
@@ -259,8 +264,7 @@ fn host_capabilities_for(
                 agent_base,
                 definition,
                 program,
-                base_env,
-                &[],
+                &ProbeEnvironment::for_launch(base_env, &[], search_path),
                 &mut memo,
             ),
         };
@@ -283,8 +287,7 @@ fn host_capabilities_for(
                 agent_base,
                 &agent.definition,
                 &profile.program,
-                base_env,
-                &profile.env,
+                &ProbeEnvironment::for_launch(base_env, &profile.env, search_path),
                 &mut memo,
             ),
             (Ok(()), None) => probe_definition(
@@ -292,8 +295,7 @@ fn host_capabilities_for(
                 agent_base,
                 &agent.definition,
                 agent.definition.program().as_str(),
-                base_env,
-                &[],
+                &ProbeEnvironment::for_launch(base_env, &[], search_path),
                 &mut memo,
             ),
         };
@@ -502,16 +504,22 @@ fn probe_definition(
     agent_base: RuntimeRef,
     definition: &RuntimeDefinition,
     program: &str,
-    base_env: &BaseEnv,
-    profile_env: &[(String, String)],
+    environment: &ProbeEnvironment,
     memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
     match definition.version_probe_parser() {
         Some(_) => {
-            let environment = ProbeEnvironment::for_launch(base_env, profile_env);
-            plan_versioned_runtime(agent, agent_base, program, definition, &environment, memo)
+            plan_versioned_runtime(agent, agent_base, program, definition, environment, memo)
         }
-        None => (probe_runtime(agent, agent_base, program), None),
+        None => (
+            probe_runtime(
+                agent,
+                agent_base,
+                program,
+                environment.search_path.as_deref(),
+            ),
+            None,
+        ),
     }
 }
 
@@ -520,8 +528,13 @@ fn probe_definition(
 /// `available` is true exactly when the program resolves to an **executable** on
 /// `PATH` (the launch-path check, [`which_executable`]); the resolved path is
 /// reported when found.
-fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRuntime {
-    match which_executable(binary) {
+fn probe_runtime(
+    agent: &str,
+    agent_base: RuntimeRef,
+    binary: &str,
+    search_path: Option<&OsStr>,
+) -> AgentRuntime {
+    match which_executable(binary, search_path) {
         Some(path) => AgentRuntime {
             agent: agent.to_owned(),
             agent_base: Some(agent_base),
@@ -564,7 +577,8 @@ fn plan_versioned_runtime(
     environment: &ProbeEnvironment,
     memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
-    let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
+    let Some(program) = ValidatedLaunchProgram::resolve(binary, environment.search_path.as_deref())
+    else {
         return (
             AgentRuntime {
                 agent: agent.to_owned(),
@@ -697,15 +711,24 @@ pub(crate) struct ProbeEnvironment {
     /// against, selected from the base environment and profile pairs the
     /// launched agent will see.
     pub(crate) owner_locations: dispatch::OwnerLocations,
+    /// The `PATH` the daemon resolves the agent executable on: its registry's
+    /// search path.
+    pub(crate) search_path: Option<OsString>,
 }
 
 impl ProbeEnvironment {
     /// Builds the probe environment of one launch: the `PATH` the launched
     /// agent will see, read from the daemon's base environment overridden by
     /// the profile pairs, and the owner location variables selected from
-    /// those same two sources.
-    pub(crate) fn for_launch(base: &BaseEnv, profile_env: &[(String, String)]) -> Self {
+    /// those same two sources. `search_path` is where the daemon resolves the
+    /// executable.
+    pub(crate) fn for_launch(
+        base: &BaseEnv,
+        profile_env: &[(String, String)],
+        search_path: Option<&OsStr>,
+    ) -> Self {
         Self {
+            search_path: search_path.map(OsStr::to_os_string),
             launch_path: effective_variable(base, profile_env, SEARCH_PATH_VAR),
             owner_locations: dispatch::OwnerLocations::from_launch(base, profile_env),
         }
@@ -873,7 +896,9 @@ fn validate_definition_launch_detailed_with_clock(
     if !probed {
         // The same resolution the launch applies to a program it spawns by
         // name: an executable on the daemon's `PATH` with a UTF-8 path.
-        return if which_executable(binary).is_some_and(|path| path.to_str().is_some()) {
+        return if which_executable(binary, environment.search_path.as_deref())
+            .is_some_and(|path| path.to_str().is_some())
+        {
             Ok(None)
         } else {
             Err(LaunchValidationFailure::Missing)
@@ -882,8 +907,8 @@ fn validate_definition_launch_detailed_with_clock(
     let shortened_budget = timeout < VERSION_PROBE_TIMEOUT;
     let mut timeout = timeout.min(VERSION_PROBE_TIMEOUT);
 
-    let program =
-        ValidatedLaunchProgram::resolve(binary).ok_or(LaunchValidationFailure::Missing)?;
+    let program = ValidatedLaunchProgram::resolve(binary, environment.search_path.as_deref())
+        .ok_or(LaunchValidationFailure::Missing)?;
     let Some(probe) = VersionProbe::for_definition(definition) else {
         return Err(LaunchValidationFailure::Unsupported);
     };
@@ -1039,7 +1064,7 @@ fn collect_probe(
 /// the first executable file. Mirrors the agent launch-path probe rather than
 /// reporting a non-executable placeholder as available.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = crate::runtime::manager_path::search_path()?;
+    let path_var = crate::runtime::manager_path::helper_search_path()?;
     which_on_path_value(name, &path_var)
 }
 
@@ -1083,6 +1108,7 @@ mod tests {
     /// environment plus that path, without a profile override.
     fn probe_env(base: &BaseEnv, path: Option<&OsStr>) -> ProbeEnvironment {
         ProbeEnvironment {
+            search_path: path.map(OsStr::to_os_string),
             launch_path: path.map(OsStr::to_os_string),
             owner_locations: dispatch::OwnerLocations::from_launch(base, &[]),
         }
@@ -2041,8 +2067,11 @@ strategy = "none"
                 RuntimeRef::from_wire("tool"),
                 &definition,
                 &binary,
-                base,
-                profile_env,
+                &ProbeEnvironment::for_launch(
+                    base,
+                    profile_env,
+                    crate::agent::process_search_path().as_deref(),
+                ),
                 &mut dispatch::LookupMemo::default(),
             ))
             .supported

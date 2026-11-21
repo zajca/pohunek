@@ -2060,7 +2060,7 @@ pub(crate) struct HookContext {
 fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
     let mut env = Vec::new();
     // Pass through PATH/HOME so a hook can find `git`/`npm`/etc. and resolve `~`.
-    if let Some(path) = crate::runtime::manager_path::search_path() {
+    if let Some(path) = crate::runtime::manager_path::helper_search_path() {
         env.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
     }
     if let Some(home) = std::env::var_os("HOME") {

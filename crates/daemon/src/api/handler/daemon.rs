@@ -59,6 +59,7 @@ pub(super) async fn handle_daemon_doctor(
             None
         }
     };
+    let search_path = sessions.refreshed_search_path().await;
     match crate::doctor::report(
         &paths,
         governance,
@@ -66,6 +67,7 @@ pub(super) async fn handle_daemon_doctor(
         sessions.package_authority().catalog_trust(),
         sessions.profiles(),
         sessions.inspect_base_environment(),
+        search_path,
         hostcheck::OverlayChecks {
             diagnostics: &overlay_diagnostics,
             from_file: overlays_from_file,

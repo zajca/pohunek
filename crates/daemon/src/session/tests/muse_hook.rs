@@ -1128,6 +1128,7 @@ async fn status_and_doctor_report_a_misshapen_hooks_file_that_a_launch_would_ref
             profile: None,
             all_profiles: false,
         },
+        crate::agent::process_search_path().as_deref(),
     )
     .expect("doctor");
     assert!(

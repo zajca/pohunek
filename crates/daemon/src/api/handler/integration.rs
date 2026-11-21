@@ -173,8 +173,9 @@ pub(super) async fn handle_integration_doctor(request: &Request, state: &DaemonS
         Ok(homes) => homes,
         Err(response) => return response,
     };
+    let search_path = state.sessions.refreshed_search_path().await;
     run_integration_doctor_blocking(request, move || {
-        crate::integration::doctor_in(&homes, params)
+        crate::integration::doctor_in(&homes, params, search_path.as_deref())
     })
     .await
 }

@@ -113,6 +113,7 @@ mod tests {
             rows: 24,
             env_extra: secret_env(),
             validated_program: None,
+            search_path: None,
             worker_file: None,
         };
         assert_redacted(&format!("{opts:?}"));
