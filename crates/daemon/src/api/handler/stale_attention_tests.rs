@@ -8,11 +8,12 @@
 
 // Rust guideline compliant 2026-11-21
 
+use pohunek_test_support::wait::guard;
 use protocol::method;
 use serde_json::{json, Value};
 
 use super::turn_wait_tests::{
-    debounce, ok, pause_clock, settle, surfaced_inbox, Fixture, FLUSH_SLACK,
+    debounce, ok, pause_clock, settle, surfaced_inbox, Fixture, CLOCK_STEP, FLUSH_SLACK,
 };
 use crate::session::SessionRegistryConfig;
 
@@ -105,6 +106,42 @@ async fn the_startup_pass_keeps_the_record_of_a_live_session() {
 
     let inbox = fixture.inbox().await;
     assert_eq!(open_records(&inbox), before, "{inbox:?}");
+}
+
+#[tokio::test]
+async fn a_blocked_session_adopted_by_a_restarted_daemon_resolves_on_its_first_working_observation()
+{
+    let fixture = Fixture::new(SessionRegistryConfig::default());
+    let session = fixture.session("stale-adopted").await;
+    fixture.activity(&session, "working").await;
+    let _inhibitor = pause_clock().await;
+    needs_you(&fixture, &session).await;
+    let surfaced = Box::pin(surfaced_inbox(&fixture)).await;
+    assert_eq!(open_records(&surfaced), 1, "{surfaced:?}");
+    fixture.activity(&session, "blocked").await;
+    tokio::time::advance(debounce() + FLUSH_SLACK).await;
+    settle().await;
+
+    // The new daemon adopts the session, which still waits: the startup pass
+    // keeps its record.
+    let restarted = fixture.restarted_over_live_sessions().await;
+    let kept = restarted.inbox().await;
+    assert_eq!(open_records(&kept), 1, "{kept:?}");
+
+    // The first working observation after the restart ends the wait.
+    restarted.activity(&session, "working").await;
+    let inbox = Box::pin(guard("the record to be acknowledged", async {
+        loop {
+            tokio::time::advance(CLOCK_STEP).await;
+            settle().await;
+            let inbox = restarted.inbox().await;
+            if open_records(&inbox) == 0 {
+                return inbox;
+            }
+        }
+    }))
+    .await;
+    assert_eq!(inbox.len(), 1, "the record is acknowledged, not lost");
 }
 
 #[tokio::test]

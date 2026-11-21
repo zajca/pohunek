@@ -405,7 +405,9 @@ because no terminal is left to answer them, and so does removing the session.
 Once after startup reconciliation the daemon acknowledges every open attention
 record whose session is absent, stopped, done, failed or on a lost runtime
 (a record the previous daemon left open across an upgrade or a host restart); a
-live session keeps its record at startup, whatever its stored activity. The projector derives no record for
+live session keeps its record at startup, whatever its stored activity; the
+first `working` observation the new projector makes of it acknowledges the record,
+because the projector holds no earlier activity for the session. The projector derives no record for
 the loss or for any other state of the session (`session list` shows a failed,
 done or lost session). Resolved records are removed after `record_ttl_secs`
 (14 days by default).

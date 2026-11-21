@@ -106,8 +106,8 @@ pub(super) struct Fixture {
     pub(super) sessions: SessionRegistry,
     notifications: NotificationService,
     pub(super) root: Arc<tempfile::TempDir>,
-    _projector: crate::shutdown::DriverHandle,
-    _coordinator: crate::shutdown::DriverHandle,
+    projector_driver: crate::shutdown::DriverHandle,
+    coordinator_driver: crate::shutdown::DriverHandle,
 }
 
 impl Fixture {
@@ -172,6 +172,28 @@ impl Fixture {
         Self::assemble(root, sessions)
     }
 
+    /// Replaces the notification side of the daemon (store handle, projector,
+    /// debounce coordinator) while the sessions stay live, as a daemon upgrade
+    /// that adopts running workers does: the projector starts without any
+    /// memory of what the sessions did, and the startup pass runs first.
+    pub(super) async fn restarted_over_live_sessions(self) -> Self {
+        let root = Arc::clone(&self.root);
+        let sessions = self.sessions.clone();
+        // Dropping a handle leaves its task running, so the old drivers stop
+        // explicitly: only the new ones may see the observations that follow.
+        self.projector_driver.stop().await;
+        self.coordinator_driver.stop().await;
+        drop(self);
+        let notifications = NotificationService::open(&root.path().join("data"))
+            .expect("notification service opens");
+        crate::notifications::resolve_stale_attention(&sessions, &notifications).await;
+        let restarted = Self::assemble(root, sessions);
+        // The projector subscribes to session events from its own task; an
+        // observation reported before that would never reach it.
+        settle().await;
+        restarted
+    }
+
     fn assemble(root: Arc<tempfile::TempDir>, sessions: SessionRegistry) -> Self {
         let notifications = NotificationService::open(&root.path().join("data"))
             .expect("notification service opens");
@@ -198,8 +220,8 @@ impl Fixture {
             sessions,
             notifications,
             root,
-            _projector: projector,
-            _coordinator: coordinator,
+            projector_driver: projector,
+            coordinator_driver: coordinator,
         }
     }
 
