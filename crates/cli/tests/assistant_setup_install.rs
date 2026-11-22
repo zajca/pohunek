@@ -408,6 +408,14 @@ fn serve_remote_connection(
     }
 }
 
+/// A remote `assistant_package_missing` error keeps its code and names the
+/// runnable command for that host: nothing is installed remotely, because
+/// `package install` is local-only.
+///
+/// Linux-only: the fixture reaches the fake remote daemon through the
+/// `connect_redirect` interposer, which relies on `LD_PRELOAD`. macOS has no
+/// `LD_PRELOAD`, so the dial would time out with `host_unreachable` there.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn s4_remote_host_installs_nothing_against_the_index() {
     use std::os::unix::fs::PermissionsExt as _;
