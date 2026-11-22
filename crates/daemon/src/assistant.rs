@@ -5,7 +5,6 @@ use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 
-use crate::DAEMON_VERSION;
 use knowledge::{
     assistant_keyed_launch_id, assistant_launch_id, bundle_index, read_prompt_contract,
     POHUNEK_VERSION,
@@ -57,7 +56,7 @@ pub async fn materialize_assistant(
             ProtocolError::assistant_package_missing(
                 ASSISTANT_CONTEXT_PACKAGE_ID,
                 &format!("its prompt contract is unusable: {err}"),
-                "install a package version whose assistant/system.md has the required Safety and Navigation sections",
+                "run `pohunek assistant setup` (or `pohunek setup`) on that host to install the version the signed index lists, whose assistant/system.md has the required Safety and Navigation sections",
             )
         })?;
         let launch_id = match params.request_id.as_deref() {
@@ -115,15 +114,12 @@ pub(crate) fn context_error(error: &ContextError) -> ProtocolError {
     let (detail, remedy) = match error {
         ContextError::NotInstalled => (
             "it is not installed".to_owned(),
-            format!(
-                "install it with `pohunek assistant setup` (or `pohunek setup`) on that host, which installs the version the signed plugin index lists through daemon verification; {}",
-                ProtocolError::assistant_missing_hint(DAEMON_VERSION)
-            ),
+            "install it with `pohunek assistant setup` (or `pohunek setup`) on that host, which installs the version the signed plugin index lists through daemon verification".to_owned(),
         ),
         ContextError::NotSelected => (
             "it is installed but not selected".to_owned(),
             format!(
-                "select it with `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID} --digest <digest>` (`pohunek plugin list` shows the digests), then retry"
+                "run `pohunek assistant setup` on that host to select the version the signed index lists, or pick one with `pohunek plugin list` and `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID} --digest`, then retry"
             ),
         ),
         ContextError::Disabled => (
@@ -138,13 +134,11 @@ pub(crate) fn context_error(error: &ContextError) -> ProtocolError {
         ),
         ContextError::Rejected(PackageRejection::Revoked) => (
             PackageRejection::Revoked.to_string(),
-            format!(
-                "the publisher revoked this version; run `pohunek setup` (or `pohunek plugin install {ASSISTANT_CONTEXT_PACKAGE_ID}`) to install the version the signed index lists now, and do not reinstall the revoked archive"
-            ),
+            "the publisher revoked this version; run `pohunek assistant setup` (or `pohunek setup`) on that host to install the version the signed index lists now, and do not reinstall the revoked archive".to_owned(),
         ),
         ContextError::Rejected(rejection) => (
             rejection.to_string(),
-            "run `pohunek plugin doctor` for the package, then reinstall it (`plugin uninstall --remove-modified`, then `plugin install ... --sha256 <digest>`)".to_owned(),
+            "run `pohunek plugin doctor` for the package, then reinstall it with `pohunek assistant setup` (or `pohunek setup`) on that host, which installs the version the signed index lists through daemon verification".to_owned(),
         ),
     };
     ProtocolError::assistant_package_missing(ASSISTANT_CONTEXT_PACKAGE_ID, &detail, &remedy)

@@ -148,7 +148,7 @@ async fn install(
         Ok(wanted) => wanted,
         Err(error) => return failed(error.to_string()),
     };
-    let resolved = match plugin_index::resolve(&wanted, options.index_url).await {
+    let resolved = match plugin_index::resolve(&wanted, options.index_url, None).await {
         Ok(resolved) => resolved,
         Err(Error::IndexPackageNotFound { .. } | Error::IndexVersionNotFound { .. }) => {
             return not_published(core, selected_version);
@@ -192,7 +192,7 @@ async fn install(
             Some(command),
         );
     }
-    match setup_assistant::install(&mut client, &version, &digest, options.index_url).await {
+    match setup_assistant::install(&mut client, &version, &digest, options.index_url, None).await {
         Ok(()) => installed_outcome(version, digest, selected),
         Err(detail) => failed(detail),
     }

@@ -203,6 +203,44 @@ async fn s3_index_without_the_package_names_the_daemon_version() {
         "the message names the runnable command: {combined}"
     );
     assert!(
+        document["err"]["recover"]
+            .as_str()
+            .is_some_and(|recover| recover.contains("pohunek assistant setup")),
+        "the JSON error carries the runnable remedy, not the stale daemon one: {combined}"
+    );
+    assert!(
+        !document["err"]["recover"]
+            .as_str()
+            .is_some_and(|recover| recover.contains('<')),
+        "no placeholder remains in the JSON recover: {combined}"
+    );
+    assert!(
+        !combined.contains('<'),
+        "no placeholder remains: {combined}"
+    );
+    assert!(rig.listed().await.is_empty(), "nothing installed");
+}
+
+#[tokio::test]
+async fn s6_index_for_another_core_names_the_daemon_version() {
+    let rig = Rig::start().await;
+    // The index lists the package, but no entry supports this daemon's core:
+    // the core text is checked, not assumed.
+    rig.publish("9.9.9");
+    let archive = assistant_index::assistant_archive("9.9.9", "9.9.9");
+    let mut entry =
+        assistant_index::assistant_entry(&archive, "9.9.9", rig.server.url("/9.9.9.tar.zst"));
+    entry.core = "^9.0.0".to_owned();
+    rig.server.set(INDEX_PATH, rig.keys.signed(vec![entry]));
+    let version = daemon_version(&rig);
+    let (code, document, stderr) = rig.assistant(&["--yes", "help me"]);
+    assert_ne!(code, 0, "{document} / {stderr}");
+    let combined = format!("{document}{stderr}");
+    assert!(
+        combined.contains(&format!("not available for core v{version}")),
+        "the core gap names the daemon version: {combined}"
+    );
+    assert!(
         !combined.contains('<'),
         "no placeholder remains: {combined}"
     );

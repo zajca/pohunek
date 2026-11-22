@@ -548,6 +548,25 @@ pub(crate) enum Error {
         name: String,
     },
 
+    /// No entry of the index supports this core version for the id: entries
+    /// name it, but none of their core ranges matches. The stored core
+    /// version is kept so a caller that knows the daemon version can name it.
+    #[error("the plugin index has no {package} for core version {core}")]
+    IndexCoreUnsupported {
+        /// The requested package id.
+        package: String,
+        /// The core version no entry supports.
+        core: String,
+    },
+
+    /// Entries of the index support the core version for the id, but none
+    /// supports this platform.
+    #[error("the plugin index has no {package} for this platform")]
+    IndexPlatformUnsupported {
+        /// The requested package id.
+        package: String,
+    },
+
     /// No entry of the index fits the id on this host and core version.
     #[error("the plugin index has no {package} for this platform and core version")]
     IndexPackageNotFound {
@@ -778,6 +797,8 @@ impl Error {
             Self::ProfileNotFound { .. } => "plugin_profile_not_found",
             Self::IndexPackageNotFound { .. } => "plugin_index_package_not_found",
             Self::IndexVersionNotFound { .. } => "plugin_index_version_not_found",
+            Self::IndexCoreUnsupported { .. } => "plugin_index_core_unsupported",
+            Self::IndexPlatformUnsupported { .. } => "plugin_index_platform_unsupported",
             Self::ArchiveDigestMismatch { .. } => "plugin_archive_digest_mismatch",
             Self::PlatformUnsupported => "plugin_platform_unsupported",
             Self::StagingFailed { .. } => "plugin_staging_failed",
@@ -813,6 +834,10 @@ impl Error {
     }
 
     /// Recovery hint that does not depend on the error's fields.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one hint per error variant keeps the recovery text beside the code"
+    )]
     fn fixed_hint(&self) -> &'static str {
         match self {
             Self::LocalOnly { .. } => {
@@ -856,6 +881,12 @@ impl Error {
             }
             Self::IndexVersionNotFound { .. } => {
                 "omit the version to take the newest one the index lists for this host"
+            }
+            Self::IndexCoreUnsupported { .. } => {
+                "the index lists the package, but no entry supports this core version; upgrade the core or wait for a release the index lists"
+            }
+            Self::IndexPlatformUnsupported { .. } => {
+                "the index lists the package, but no entry supports this platform"
             }
             Self::ArchiveDigestMismatch { .. } => {
                 "the download does not match the index; nothing was installed, retry later"
@@ -1160,14 +1191,14 @@ async fn stage_after_refresh(
     request: &PackageRef,
 ) -> Result<plugin_index::Staged, CliError> {
     match refresh_stored(client, None, false).await {
-        Ok(_) => Ok(plugin_index::stage_from_stored(request).await?),
-        Err(refresh_error) => match plugin_index::stage_from_stored(request).await {
+        Ok(_) => Ok(plugin_index::stage_from_stored(request, None).await?),
+        Err(refresh_error) => match plugin_index::stage_from_stored(request, None).await {
             Ok(staged) => {
                 eprintln!("warning: could not refresh the stored plugin index: {refresh_error}");
                 Ok(staged)
             }
             Err(error) if plugin_index::is_not_listed(&error) => {
-                Ok(plugin_index::stage(request, None).await?)
+                Ok(plugin_index::stage(request, None, None).await?)
             }
             Err(_) => Err(refresh_error),
         },
@@ -1206,11 +1237,11 @@ async fn run_install_by_id(
     // first.
     let kind = plugin_index::wanted_kind(&request);
     let staged = if args.index_url.is_some() {
-        plugin_index::stage(&request, args.index_url.as_deref()).await?
+        plugin_index::stage(&request, args.index_url.as_deref(), None).await?
     } else if !apply_supported(&mut client).await? {
-        plugin_index::stage(&request, None).await?
+        plugin_index::stage(&request, None, None).await?
     } else if plugin_index::stored_is_fresh(kind) {
-        match plugin_index::stage_from_stored(&request).await {
+        match plugin_index::stage_from_stored(&request, None).await {
             Ok(staged) => staged,
             Err(error) if plugin_index::is_not_listed(&error) => {
                 stage_after_refresh(&mut client, &request).await?

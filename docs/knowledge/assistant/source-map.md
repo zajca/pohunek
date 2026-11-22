@@ -50,9 +50,11 @@ Current CLI and command surface:
   `pohunek service upgrade`: gate, owner hold, install through the index path of
   `setup_assistant.rs`, and the `assistant.install` outcome.
 - `crates/cli/src/commands/assistant/mod.rs` — the `assistant_package_missing`
-  recovery: a local launch plans through `setup_assistant.rs`, installs through
-  the daemon's signed plugin index verification and retries once; a remote
-  launch names `pohunek assistant setup` for that host and installs nothing.
+  recovery: a local launch plans through `setup_assistant.rs` against the
+  daemon's core version, installs through the daemon's signed plugin index
+  verification and retries once; the returned error carries the plan's
+  runnable remedy as its recovery hint. A remote launch names
+  `pohunek assistant setup` for that host and installs nothing.
 - `crates/cli/src/commands/setup_hooks.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`

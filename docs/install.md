@@ -449,7 +449,10 @@ a host set up with 0.42.0 or later has it (`pohunek setup --dry-run --json`
 shows the package and its digest in `assistant`). A `pohunek assistant` launch
 whose daemon reports the package missing installs it itself through the same
 index path (preview, one confirmation unless `--yes`, then a single retried
-launch); a remote launch names `pohunek assistant setup` for that host and
+launch): the index resolution matches the daemon's core version, and when the
+official index lists no package that core can use the launch stops with a
+message naming that core version and `pohunek assistant setup` to rerun after
+admission. A remote launch names `pohunek assistant setup` for that host and
 installs nothing remotely. When the package is a gap in a
 setup run (the index is unreachable or does not list it yet, or the daemon
 refuses it), install it by hand once per host that runs assistant sessions (a

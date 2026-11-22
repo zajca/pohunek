@@ -212,11 +212,12 @@ async fn recover_missing_package(
     workdir: Option<std::path::PathBuf>,
 ) -> Result<(), CliError> {
     if opts.is_remote() {
-        eprintln!(
-            "pohunek: assistant package missing on host '{}': run `pohunek assistant setup` on that host, then retry",
+        let recover = format!(
+            "assistant package missing on host '{}': run `pohunek assistant setup` on that host, then retry",
             opts.host
         );
-        return Err(error);
+        eprintln!("pohunek: {recover}");
+        return Err(with_recover(error, Some(recover)));
     }
     let Ok(mut client) = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await
     else {
@@ -229,8 +230,15 @@ async fn recover_missing_package(
         .await
         .map(|capabilities| capabilities.daemon_version)
         .ok();
-    let (step, cause) =
-        crate::commands::setup_assistant::plan_with_cause(None, Some(&mut client)).await;
+    let daemon_core = daemon_version
+        .as_deref()
+        .and_then(|version| semver::Version::parse(version).ok());
+    let (step, cause) = crate::commands::setup_assistant::plan_with_cause(
+        None,
+        Some(&mut client),
+        daemon_core.as_ref(),
+    )
+    .await;
     match step {
         crate::commands::setup_assistant::AssistantStep::Install { .. } => {
             install_and_retry(
@@ -246,42 +254,66 @@ async fn recover_missing_package(
         }
         crate::commands::setup_assistant::AssistantStep::Present { .. }
         | crate::commands::setup_assistant::AssistantStep::Gap { .. } => {
-            print_plan_outcome(&step, cause, daemon_version.as_deref());
-            Err(error)
+            let recover = outcome_recover(&step, cause, daemon_version.as_deref());
+            if let Some(text) = &recover {
+                eprintln!("pohunek: {text}");
+            }
+            Err(with_recover(error, recover))
         }
     }
 }
 
-/// Prints the plan's outcome for a `Gap` or `Present` step, with the error.
-///
-/// A gap caused by a missing index listing names the concrete QA-a text
-/// with the daemon version instead of the plan's generic detail.
-fn print_plan_outcome(
+/// The recovery hint of a plan outcome: the runnable remedy the returned
+/// error carries, so both the human line and the `--json` document name a
+/// concrete command and never a `<placeholder>`.
+fn outcome_recover(
     step: &crate::commands::setup_assistant::AssistantStep,
     cause: Option<crate::commands::setup_assistant::GapCause>,
     daemon_version: Option<&str>,
-) {
+) -> Option<String> {
     use crate::commands::setup_assistant::{AssistantStep, GapCause};
     match step {
-        AssistantStep::Gap { detail, command } => {
-            let text = match (cause, daemon_version) {
-                (Some(GapCause::NotListed), Some(version)) => {
-                    crate::commands::setup_assistant::not_listed_text(version)
-                }
-                _ => format!("{detail}; install it by hand with `{command}`"),
-            };
-            eprintln!("pohunek: {text}");
-        }
+        AssistantStep::Gap { detail, command } => Some(match (cause, daemon_version) {
+            (Some(GapCause::NotListed), Some(version)) => {
+                crate::commands::setup_assistant::not_listed_text(version)
+            }
+            _ => format!("{detail}; install it by hand with `{command}`"),
+        }),
         AssistantStep::Present {
             package_id,
             version,
             ..
-        } => {
-            eprintln!(
-                "pohunek: assistant package {package_id}@{version} is installed; the daemon still refuses it"
-            );
+        } => Some(format!(
+            "assistant package {package_id}@{version} is installed; the daemon still refuses it; \
+             run `pohunek assistant setup` to repair the selection, or `pohunek plugin list` to inspect it"
+        )),
+        AssistantStep::Install { .. } => None,
+    }
+}
+
+/// The error `error` with its recovery hint replaced by `recover`: the human
+/// line and the `--json` document then name the same runnable remedy.
+fn with_recover(error: CliError, recover: Option<String>) -> CliError {
+    let Some(recover) = recover else {
+        return error;
+    };
+    match error {
+        CliError::Protocol(mut error) => {
+            error.recover = Some(recover);
+            CliError::Protocol(error)
         }
-        AssistantStep::Install { .. } => {}
+        CliError::Client(error) => match error {
+            pohunek_client::ClientError::Protocol(mut source) => {
+                source.recover = Some(recover);
+                CliError::Client(pohunek_client::ClientError::Protocol(source))
+            }
+            pohunek_client::ClientError::RemoteProtocol { host, mut source } => {
+                source.recover = Some(recover);
+                CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source })
+            }
+            error => CliError::Client(error),
+        },
+        error => error,
     }
 }
 
@@ -304,27 +336,41 @@ async fn install_and_retry(
         ..
     } = step
     else {
-        print_plan_outcome(step, cause, daemon_version);
-        return Err(CliError::Protocol(protocol::ProtocolError::new(
-            protocol::ErrorClass::Runtime,
-            "assistant_package_missing",
-            "the assistant context package cannot be used",
-            None,
-        )));
+        let recover = outcome_recover(step, cause, daemon_version);
+        if let Some(text) = &recover {
+            eprintln!("pohunek: {text}");
+        }
+        return Err(with_recover(
+            CliError::Protocol(protocol::ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                "assistant_package_missing",
+                "the assistant context package cannot be used",
+                None,
+            )),
+            recover,
+        ));
     };
     let (package_id, version, digest) = (package_id.clone(), version.clone(), digest.clone());
     eprintln!("pohunek: assistant package missing: installing {package_id}@{version} ({digest})");
     if !opts.yes && (opts.json || !std::io::IsTerminal::is_terminal(&std::io::stdin())) {
-        eprintln!(
-            "pohunek: preview only (no TTY and no --yes): rerun with --yes to install, or run `pohunek assistant setup`"
-        );
-        return Err(CliError::SetupConsentRequired);
+        let recover = "preview only (no TTY or `--json`, unless `--yes`): rerun `pohunek assistant --yes` to install, or run `pohunek assistant setup`".to_owned();
+        eprintln!("pohunek: {recover}");
+        return Err(with_recover(CliError::SetupConsentRequired, Some(recover)));
     }
     if !opts.yes && !crate::commands::setup_host::confirm()? {
         return Err(CliError::SetupDeclined);
     }
     let mut client = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await?;
-    match crate::commands::setup_assistant::apply(&mut client, step, None).await {
+    let daemon_core = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await
+        .ok()
+        .and_then(|capabilities| semver::Version::parse(&capabilities.daemon_version).ok());
+    match crate::commands::setup_assistant::apply(&mut client, step, None, daemon_core.as_ref())
+        .await
+    {
         AssistantOutcome::Installed(line) => {
             eprintln!("pohunek: {line}");
         }

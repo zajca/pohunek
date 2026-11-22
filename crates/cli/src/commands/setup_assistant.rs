@@ -101,16 +101,18 @@ pub(crate) enum GapCause {
 
 /// A plan never fails: whatever stops the resolution is a gap.
 pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -> AssistantStep {
-    plan_with_cause(index_url, client).await.0
+    plan_with_cause(index_url, client, None).await.0
 }
 
 /// Plans the step and reports why a gap is a gap, so a caller that knows the
-/// daemon version can print the concrete QA-a text for a missing listing.
+/// daemon version can print the concrete QA-a text for a missing listing,
+/// matched against that daemon's core version rather than this build's.
 ///
 /// A plan never fails: whatever stops the resolution is a gap.
 pub(crate) async fn plan_with_cause(
     index_url: Option<&str>,
     client: Option<&mut Client>,
+    daemon_core: Option<&semver::Version>,
 ) -> (AssistantStep, Option<GapCause>) {
     let Ok(wanted) = request(None) else {
         return (
@@ -118,10 +120,10 @@ pub(crate) async fn plan_with_cause(
             Some(GapCause::Other),
         );
     };
-    let resolved = match plugin_index::resolve(&wanted, index_url).await {
+    let resolved = match plugin_index::resolve(&wanted, index_url, daemon_core).await {
         Ok(resolved) => resolved,
         Err(error) => {
-            let cause = if plugin_index::is_not_listed(&error) {
+            let cause = if plugin_index::is_unlisted_for_core(&error) {
                 GapCause::NotListed
             } else {
                 GapCause::Other
@@ -351,7 +353,8 @@ pub(crate) enum AssistantOutcome {
     Gap(String),
 }
 
-/// Applies `step` through the daemon on `client`.
+/// Applies `step` through the daemon on `client`, matching entries against
+/// `daemon_core` (this build's core version when `None`).
 ///
 /// The archive is resolved again at the previewed version. A digest that
 /// differs from the previewed one is refused before anything is sent to the
@@ -360,6 +363,7 @@ pub(crate) async fn apply(
     client: &mut Client,
     step: &AssistantStep,
     index_url: Option<&str>,
+    daemon_core: Option<&semver::Version>,
 ) -> AssistantOutcome {
     match step {
         AssistantStep::Present { .. } => AssistantOutcome::Present,
@@ -369,7 +373,7 @@ pub(crate) async fn apply(
             version,
             digest,
             ..
-        } => match install(client, version, digest, index_url).await {
+        } => match install(client, version, digest, index_url, daemon_core).await {
             Ok(()) => AssistantOutcome::Installed(format!("package {package_id}@{version}")),
             Err(detail) => AssistantOutcome::Gap(describe(&detail, MANUAL_COMMAND)),
         },
@@ -419,11 +423,14 @@ pub(crate) fn is_older(current: &str, listed: &str) -> bool {
 }
 
 /// Installs the previewed package; the error is the detail of the gap.
+/// Entries match against `daemon_core` (this build's core version when
+/// `None`) so the install stages what the daemon's core can use.
 pub(crate) async fn install(
     client: &mut Client,
     version: &str,
     digest: &str,
     index_url: Option<&str>,
+    daemon_core: Option<&semver::Version>,
 ) -> Result<(), String> {
     require_context_install(client)
         .await
@@ -431,7 +438,7 @@ pub(crate) async fn install(
     let pinned = protocol::PackageVersion::parse(version)
         .map_err(|error| format!("the previewed version is invalid: {error}"))?;
     let wanted = request(Some(&pinned)).map_err(|error| error.to_string())?;
-    let staged = plugin_index::stage(&wanted, index_url)
+    let staged = plugin_index::stage(&wanted, index_url, daemon_core)
         .await
         .map_err(|error| error.to_string())?;
     if staged.resolved.digest.as_str() != digest {
