@@ -22,8 +22,14 @@ use super::plugin_catalog_install::{Anchor, Channel, Install};
 )]
 #[path = "support/assistant_index.rs"]
 mod assistant_index;
+// Linux-only: the fake remote daemon in S4 reaches `127.0.0.1` through
+// the `connect_redirect` interposer, which relies on `LD_PRELOAD`.
+// Without the gate the darwin target would keep the modules' helpers
+// alive with no caller and fail `dead_code` under `-D warnings`.
+#[cfg(target_os = "linux")]
 #[path = "support/connect_redirect.rs"]
 mod connect_redirect;
+#[cfg(target_os = "linux")]
 #[path = "support/pin_overlay.rs"]
 mod pin_overlay;
 
@@ -292,6 +298,10 @@ async fn s3b_installed_but_disabled_package_installs_nothing() {
 /// answers a minimal capability document and `assistant.materialize`
 /// refuses with the historical N-1 placeholder remedy, so the remote
 /// recovery branch is reached through a real connection.
+///
+/// Linux-only with its only caller S4: the darwin target must not keep
+/// a helper no test there can reach.
+#[cfg(target_os = "linux")]
 fn serve_remote_missing_package(
     listener: std::net::TcpListener,
     served: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -305,6 +315,8 @@ fn serve_remote_missing_package(
     });
 }
 
+/// Linux-only with `serve_remote_missing_package`, its only caller.
+#[cfg(target_os = "linux")]
 fn serve_remote_connection(
     stream: std::net::TcpStream,
     served: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
