@@ -922,7 +922,11 @@ repeating the command; the CLI never retries an install on its own.
   index and revocation marks before the install, looks the archive digest up
   before decompressing, and refuses the runtime ids `shell`, `codex`, `claude`,
   `hermes` and `pi` (`package_runtime_not_claimable`) and any package that
-  declares commands (`package_untrusted`). A host without the channel file
+  declares commands (`package_untrusted`). The signed entry carries only the
+  package id, kind, `runtime_id`, version, digest, URL, platforms and core
+  range; the source repository, `repo_id`, tag, commit, `built_with`,
+  `runtime_api` and required features are admission-only (`IndexEntry`,
+  `crates/package/src/plugin_index.rs:150`). A host without the channel file
   refuses it (`official_trust_unavailable`) and `pohunek doctor` reports the
   `plugin_index_channel` check as `warn`; catalog installs are unaffected.
 - `pohunek plugin install --index <file>` sends a local signed index to the
@@ -948,7 +952,13 @@ repeating the command; the CLI never retries an install on its own.
   The by-id install reads the daemon's stored copy when it is younger than 24h,
   refreshes once when it is older, and with `--index-url` always fetches from that
   URL and ignores the stored copy; `--index-url` with a different URL is a
-  transport replacement, not a trust root — the daemon still verifies it.
+  transport replacement, not a trust root — the daemon still verifies it. A
+  mirror is available only through `--index-url`; there is no configured
+  mirror. The official URLs the CLI fetches by default are compiled in
+  (`OFFICIAL_INDEX_URL`, `OFFICIAL_INDEX_URL_V2`,
+  `crates/cli/src/commands/plugin_index.rs:32`, `:52`), and `--index-url`
+  only swaps that fetch address. Both are the accepted design (see the
+  [accepted index design](plugin-repositories.md#accepted-index-design)).
   `pohunek plugin update <package> <archive> --index <file>` applies the same
   checks and refuses an index older than the stored one
   (`package_index_rollback`), an index that omits the archive's digest
