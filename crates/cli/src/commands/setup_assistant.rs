@@ -24,7 +24,7 @@ const ASSISTANT_PACKAGE: &str = "pohunek.context.assistant";
 
 /// The command that installs the package by hand, with the section of
 /// `docs/install.md` that explains it.
-const MANUAL_COMMAND: &str = "pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes (docs/install.md, \"Install the assistant package\")";
+const MANUAL_COMMAND: &str = "pohunek assistant setup (or `pohunek setup`; docs/install.md, \"Install the assistant package\")";
 
 /// What a setup run does about the assistant package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -89,14 +89,45 @@ pub(crate) fn request(version: Option<&protocol::PackageVersion>) -> Result<Pack
 /// Plans the step: resolves the package through the index and, when a daemon
 /// answers on `client`, compares it with what is installed.
 ///
+/// Why a plan is a gap: either the index does not list the package for this
+/// core release, or something else stopped the resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapCause {
+    /// The official index does not list the package for this core release.
+    NotListed,
+    /// Something else stopped the resolution.
+    Other,
+}
+
 /// A plan never fails: whatever stops the resolution is a gap.
 pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -> AssistantStep {
+    plan_with_cause(index_url, client).await.0
+}
+
+/// Plans the step and reports why a gap is a gap, so a caller that knows the
+/// daemon version can print the concrete QA-a text for a missing listing.
+///
+/// A plan never fails: whatever stops the resolution is a gap.
+pub(crate) async fn plan_with_cause(
+    index_url: Option<&str>,
+    client: Option<&mut Client>,
+) -> (AssistantStep, Option<GapCause>) {
     let Ok(wanted) = request(None) else {
-        return AssistantStep::gap("the package reference is invalid");
+        return (
+            AssistantStep::gap("the package reference is invalid"),
+            Some(GapCause::Other),
+        );
     };
     let resolved = match plugin_index::resolve(&wanted, index_url).await {
         Ok(resolved) => resolved,
-        Err(error) => return AssistantStep::gap(error.to_string()),
+        Err(error) => {
+            let cause = if plugin_index::is_not_listed(&error) {
+                GapCause::NotListed
+            } else {
+                GapCause::Other
+            };
+            return (AssistantStep::gap(error.to_string()), Some(cause));
+        }
     };
     let package_id = resolved.id.to_string();
     let version = resolved.version.to_string();
@@ -104,7 +135,7 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
     let mut replaces = None;
     if let Some(client) = client {
         if let Err(error) = require_context_install(client).await {
-            return AssistantStep::gap(error.to_string());
+            return (AssistantStep::gap(error.to_string()), Some(GapCause::Other));
         }
         if let Ok(listed) = plugin::list(client).await {
             // A selection that serves and is not older than the listing stays:
@@ -114,50 +145,24 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
             let selected = selected_package(&listed.packages, &package_id, &version);
             if let Some(selected) = &selected {
                 if serves(selected.info) && !selected.older {
-                    return AssistantStep::Present {
-                        package_id,
-                        version: selected.info.package.version.to_string(),
-                        digest: selected.info.digest.as_str().to_owned(),
-                    };
+                    return (
+                        AssistantStep::Present {
+                            package_id,
+                            version: selected.info.package.version.to_string(),
+                            digest: selected.info.digest.as_str().to_owned(),
+                        },
+                        None,
+                    );
                 }
             }
-            if let Some(info) = listed
-                .packages
-                .iter()
-                .find(|info| info.package.id == resolved.id && info.digest == resolved.digest)
-            {
-                if serves(info) {
-                    return AssistantStep::Present {
-                        package_id,
-                        version,
-                        digest,
-                    };
-                }
-                if info.revoked {
-                    return AssistantStep::gap(format!(
-                        "version {version} is revoked; wait for a release whose index lists a newer version"
-                    ));
-                }
-                // A package with a fault (a missing root, say) is installed
-                // again: the daemon restores the root of the same digest.
-                if info.fault.is_some() {
-                    return AssistantStep::Install {
-                        package_id,
-                        version,
-                        digest,
-                        replaces: None,
-                    };
-                }
-                // An owner's disable or version choice is not overridden by
-                // a reinstall of the same digest, which the daemon keeps as it is.
-                return AssistantStep::Gap {
-                    detail: format!(
-                        "version {version} is installed but not enabled and selected, which setup leaves as it is"
-                    ),
-                    command: format!(
-                        "pohunek plugin enable {package_id} --digest {digest} && pohunek plugin select {package_id} --digest {digest}"
-                    ),
-                };
+            if let Some(outcome) = installed_digest_outcome(
+                &listed.packages,
+                &resolved,
+                &package_id,
+                &version,
+                &digest,
+            ) {
+                return outcome;
             }
             // The listed digest is not installed, so installing it replaces a
             // selection that does not serve or is older than the listing.
@@ -166,12 +171,15 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
             }
         }
     }
-    AssistantStep::Install {
-        package_id,
-        version,
-        digest,
-        replaces,
-    }
+    (
+        AssistantStep::Install {
+            package_id,
+            version,
+            digest,
+            replaces,
+        },
+        None,
+    )
 }
 
 /// The selected package of one id, compared with the version the index lists.
@@ -248,6 +256,65 @@ pub(crate) fn owner_hold(
     }
 }
 
+/// The plan outcome for a listed digest that is already installed.
+///
+/// `None` when the digest is not installed; the caller then installs it.
+fn installed_digest_outcome(
+    packages: &[protocol::PackageInfo],
+    resolved: &plugin_index::Resolved,
+    package_id: &str,
+    version: &str,
+    digest: &str,
+) -> Option<(AssistantStep, Option<GapCause>)> {
+    let info = packages
+        .iter()
+        .find(|info| info.package.id == resolved.id && info.digest == resolved.digest)?;
+    if serves(info) {
+        return Some((
+            AssistantStep::Present {
+                package_id: package_id.to_owned(),
+                version: version.to_owned(),
+                digest: digest.to_owned(),
+            },
+            None,
+        ));
+    }
+    if info.revoked {
+        return Some((
+            AssistantStep::gap(format!(
+                "version {version} is revoked; wait for a release whose index lists a newer version"
+            )),
+            Some(GapCause::Other),
+        ));
+    }
+    // A package with a fault (a missing root, say) is installed again: the
+    // daemon restores the root of the same digest.
+    if info.fault.is_some() {
+        return Some((
+            AssistantStep::Install {
+                package_id: package_id.to_owned(),
+                version: version.to_owned(),
+                digest: digest.to_owned(),
+                replaces: None,
+            },
+            None,
+        ));
+    }
+    // An owner's disable or version choice is not overridden by a reinstall
+    // of the same digest, which the daemon keeps as it is.
+    Some((
+        AssistantStep::Gap {
+            detail: format!(
+                "version {version} is installed but not enabled and selected, which setup leaves as it is"
+            ),
+            command: format!(
+                "pohunek plugin enable {package_id} --digest {digest} && pohunek plugin select {package_id} --digest {digest}"
+            ),
+        },
+        Some(GapCause::Other),
+    ))
+}
+
 /// Whether `info` is a package that serves fresh launches and bare requests.
 pub(crate) fn serves(info: &protocol::PackageInfo) -> bool {
     info.enabled && info.selected && info.fault.is_none() && !info.revoked
@@ -315,6 +382,15 @@ pub(crate) const UPDATE_COMMAND: &str = "pohunek setup";
 
 /// The package id of the assistant context package.
 pub(crate) const PACKAGE_ID: &str = ASSISTANT_PACKAGE;
+
+/// The QA-a text for a gap whose cause is [`GapCause::NotListed`]: the index
+/// does not list the assistant package for the daemon's core version.
+///
+/// The daemon version is rendered in; the text holds no placeholder.
+#[must_use]
+pub(crate) fn not_listed_text(daemon_version: &str) -> String {
+    protocol::ProtocolError::assistant_missing_hint(daemon_version)
+}
 
 /// The note for an assistant bundle `bundle` that is older than the core
 /// `core`, with the command that updates it; `None` when it is not older or

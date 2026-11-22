@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::Path;
 
+use crate::DAEMON_VERSION;
 use knowledge::{
     assistant_keyed_launch_id, assistant_launch_id, bundle_index, read_prompt_contract,
     POHUNEK_VERSION,
@@ -115,7 +116,8 @@ pub(crate) fn context_error(error: &ContextError) -> ProtocolError {
         ContextError::NotInstalled => (
             "it is not installed".to_owned(),
             format!(
-                "install the assistant package on that host with `pohunek plugin install <archive> --sha256 <digest>` (id `{ASSISTANT_CONTEXT_PACKAGE_ID}`; see the plugin-assistant release), then retry"
+                "install it with `pohunek assistant setup` (or `pohunek setup`) on that host, which installs the version the signed plugin index lists through daemon verification; {}",
+                ProtocolError::assistant_missing_hint(DAEMON_VERSION)
             ),
         ),
         ContextError::NotSelected => (

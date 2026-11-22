@@ -153,7 +153,7 @@ static peers. Errors and output keep the name you typed.
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
-| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with the knowledge bundle of the assistant context package (`pohunek.context.assistant`, installed by digest; `assistant_package_missing` names the install command) + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. A local launch without `--project` or `--repo` starts its session with `cwd` `<data-dir>/assistant`, which the launcher creates at mode 0700 when missing (an existing path that is not a user-owned directory, or is group- or world-writable, is refused with `assistant_workdir_unusable` before any daemon is started or dialed; the launcher never chmods or replaces it). |
+| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with the knowledge bundle of the assistant context package (`pohunek.context.assistant`, installed by digest; when the daemon reports it missing the CLI installs the version the signed plugin index lists through daemon verification and retries once, or names `pohunek assistant setup` when it cannot) + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. A local launch without `--project` or `--repo` starts its session with `cwd` `<data-dir>/assistant`, which the launcher creates at mode 0700 when missing (an existing path that is not a user-owned directory, or is group- or world-writable, is refused with `assistant_workdir_unusable` before any daemon is started or dialed; the launcher never chmods or replaces it). |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
@@ -641,6 +641,18 @@ automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 selected host. Codex, Claude Code and Hermes are served only by their official
 packages: on a host with none of them (and no capable host profile) the
 assistant answers `no_capable_agent`, whose hint names the package install.
+
+When the daemon reports the assistant context package missing
+(`assistant_package_missing`), the launch does not stop with an install
+placeholder: a local launch runs the same plan as `pohunek setup`. An install
+step previews the version and digest, asks once (`--yes` applies without
+asking; without a TTY and without `--yes` it prints the preview and stops
+with `setup_consent_required`), installs through the daemon's signed plugin
+index verification, and retries the launch once. A gap or an already-present
+package prints the plan's outcome with the error. A remote launch installs
+nothing remotely and names `pohunek assistant setup` for that host. When the
+official index lists no package for the daemon's core, the message names the
+core version and says to rerun `pohunek assistant setup` after admission.
 
 When the knowledge bundle of the launch is older than the daemon that serves it (the
 package versions track the core releases and are compared by semantic version

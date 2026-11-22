@@ -446,7 +446,11 @@ hermes`. The new version is selected and the old one stays installed for
 `pohunek.context.assistant`; the daemon binaries carry no copy. `pohunek setup`
 installs the package that matches the release from the signed plugin index, so
 a host set up with 0.42.0 or later has it (`pohunek setup --dry-run --json`
-shows the package and its digest in `assistant`). When the package is a gap in a
+shows the package and its digest in `assistant`). A `pohunek assistant` launch
+whose daemon reports the package missing installs it itself through the same
+index path (preview, one confirmation unless `--yes`, then a single retried
+launch); a remote launch names `pohunek assistant setup` for that host and
+installs nothing remotely. When the package is a gap in a
 setup run (the index is unreachable or does not list it yet, or the daemon
 refuses it), install it by hand once per host that runs assistant sessions (a
 remote assistant reads the package installed on that remote host). The package is published as a release

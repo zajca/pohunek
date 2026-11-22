@@ -162,6 +162,181 @@ pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), Cli
     // any daemon is started or dialed.
     let workdir = assistant_workdir(&opts, paths)?;
     let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
+    match run_prepared(&opts, paths, auto_started, workdir.clone()).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_missing_package(&error) => {
+            recover_missing_package(error, &opts, paths, auto_started, workdir).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `error` is the daemon's `assistant_package_missing` refusal.
+///
+/// The match keys on the stable error code alone, never on the message or
+/// the remedy text, so an older daemon's placeholder hint cannot leak
+/// through: the recovery prints the plan's outcome instead. The launch path
+/// surfaces the daemon refusal wrapped in the SDK client error, so both the
+/// bare protocol error and the client wrapper match.
+fn is_missing_package(error: &CliError) -> bool {
+    match error {
+        CliError::Protocol(error) => error.code == "assistant_package_missing",
+        CliError::Client(error) => matches!(
+            error,
+            pohunek_client::ClientError::Protocol(error)
+            | pohunek_client::ClientError::RemoteProtocol { source: error, .. }
+            if error.code == "assistant_package_missing"
+        ),
+        _ => false,
+    }
+}
+
+/// Recovers a launch the daemon refused with `assistant_package_missing`.
+///
+/// A remote host prints the command to run on that host; nothing is
+/// installed remotely because `plugin install` is local-only. A local host
+/// runs the shared `setup_assistant` plan: an `Install` step previews, asks
+/// (unless `--yes`) and installs through the daemon's index verification,
+/// then the launch is retried once. A `Gap` or `Present` step prints the
+/// plan's outcome with the error. Without a TTY and without `--yes` nothing
+/// is installed and the preview is printed.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the recovery branches install, gap and remote cases in one place"
+)]
+async fn recover_missing_package(
+    error: CliError,
+    opts: &AssistantOptions,
+    paths: &Paths,
+    auto_started: bool,
+    workdir: Option<std::path::PathBuf>,
+) -> Result<(), CliError> {
+    if opts.is_remote() {
+        eprintln!(
+            "pohunek: assistant package missing on host '{}': run `pohunek assistant setup` on that host, then retry",
+            opts.host
+        );
+        return Err(error);
+    }
+    let Ok(mut client) = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await
+    else {
+        return Err(error);
+    };
+    let daemon_version = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await
+        .map(|capabilities| capabilities.daemon_version)
+        .ok();
+    let (step, cause) =
+        crate::commands::setup_assistant::plan_with_cause(None, Some(&mut client)).await;
+    match step {
+        crate::commands::setup_assistant::AssistantStep::Install { .. } => {
+            install_and_retry(
+                &step,
+                cause,
+                opts,
+                paths,
+                auto_started,
+                workdir,
+                daemon_version.as_deref(),
+            )
+            .await
+        }
+        crate::commands::setup_assistant::AssistantStep::Present { .. }
+        | crate::commands::setup_assistant::AssistantStep::Gap { .. } => {
+            print_plan_outcome(&step, cause, daemon_version.as_deref());
+            Err(error)
+        }
+    }
+}
+
+/// Prints the plan's outcome for a `Gap` or `Present` step, with the error.
+///
+/// A gap caused by a missing index listing names the concrete QA-a text
+/// with the daemon version instead of the plan's generic detail.
+fn print_plan_outcome(
+    step: &crate::commands::setup_assistant::AssistantStep,
+    cause: Option<crate::commands::setup_assistant::GapCause>,
+    daemon_version: Option<&str>,
+) {
+    use crate::commands::setup_assistant::{AssistantStep, GapCause};
+    match step {
+        AssistantStep::Gap { detail, command } => {
+            let text = match (cause, daemon_version) {
+                (Some(GapCause::NotListed), Some(version)) => {
+                    crate::commands::setup_assistant::not_listed_text(version)
+                }
+                _ => format!("{detail}; install it by hand with `{command}`"),
+            };
+            eprintln!("pohunek: {text}");
+        }
+        AssistantStep::Present {
+            package_id,
+            version,
+            ..
+        } => {
+            eprintln!(
+                "pohunek: assistant package {package_id}@{version} is installed; the daemon still refuses it"
+            );
+        }
+        AssistantStep::Install { .. } => {}
+    }
+}
+
+/// Previews an `Install` step, installs through the daemon's index
+/// verification, and retries the launch once.
+async fn install_and_retry(
+    step: &crate::commands::setup_assistant::AssistantStep,
+    cause: Option<crate::commands::setup_assistant::GapCause>,
+    opts: &AssistantOptions,
+    paths: &Paths,
+    auto_started: bool,
+    workdir: Option<std::path::PathBuf>,
+    daemon_version: Option<&str>,
+) -> Result<(), CliError> {
+    use crate::commands::setup_assistant::{AssistantOutcome, AssistantStep};
+    let AssistantStep::Install {
+        package_id,
+        version,
+        digest,
+        ..
+    } = step
+    else {
+        print_plan_outcome(step, cause, daemon_version);
+        return Err(CliError::Protocol(protocol::ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "assistant_package_missing",
+            "the assistant context package cannot be used",
+            None,
+        )));
+    };
+    let (package_id, version, digest) = (package_id.clone(), version.clone(), digest.clone());
+    eprintln!("pohunek: assistant package missing: installing {package_id}@{version} ({digest})");
+    if !opts.yes && (opts.json || !std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+        eprintln!(
+            "pohunek: preview only (no TTY and no --yes): rerun with --yes to install, or run `pohunek assistant setup`"
+        );
+        return Err(CliError::SetupConsentRequired);
+    }
+    if !opts.yes && !crate::commands::setup_host::confirm()? {
+        return Err(CliError::SetupDeclined);
+    }
+    let mut client = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await?;
+    match crate::commands::setup_assistant::apply(&mut client, step, None).await {
+        AssistantOutcome::Installed(line) => {
+            eprintln!("pohunek: {line}");
+        }
+        AssistantOutcome::Present => {}
+        AssistantOutcome::Gap(text) => {
+            eprintln!("pohunek: {text}");
+            return Err(CliError::SetupIncomplete {
+                detail: text,
+                applied: Vec::new(),
+            });
+        }
+    }
     run_prepared(opts, paths, auto_started, workdir).await
 }
 
@@ -187,24 +362,24 @@ fn validate_target(opts: &AssistantOptions) -> Result<(), CliError> {
 }
 
 async fn run_prepared(
-    opts: AssistantOptions,
+    opts: &AssistantOptions,
     paths: &Paths,
     auto_started: bool,
     workdir: Option<std::path::PathBuf>,
 ) -> Result<(), CliError> {
-    let host = assistant_host_config(&opts, paths).await?;
-    let params = assistant_params(&opts, auto_started, workdir);
+    let host = assistant_host_config(opts, paths).await?;
+    let params = assistant_params(opts, auto_started, workdir);
     let mut prepared =
         core_assistant::prepare_with_options(&host, params, ConnectionOptions::default())
             .await
             .map_err(core_error)?;
 
     if opts.print_prompt {
-        print_prompt(&opts, &prepared)?;
+        print_prompt(opts, &prepared)?;
         return Ok(());
     }
 
-    confirm_remote_launch(&opts)?;
+    confirm_remote_launch(opts)?;
     prepared.session_params.metadata = opts.metadata.clone();
     let options = ConnectionOptions {
         request_timeout: opts
@@ -222,7 +397,7 @@ async fn run_prepared(
             opts.host
         );
     }
-    emit_launch_output(&opts, &launched)
+    emit_launch_output(opts, &launched)
 }
 
 fn print_prompt(
