@@ -455,23 +455,14 @@ message naming that core version and `pohunek assistant setup` to rerun after
 admission. A remote launch names `pohunek assistant setup` for that host and
 installs nothing remotely. When the package is a gap in a
 setup run (the index is unreachable or does not list it yet, or the daemon
-refuses it), install it by hand once per host that runs assistant sessions (a
-remote assistant reads the package installed on that remote host). The package is published as a release
-asset of [`pohunekd/plugin-assistant`](https://github.com/pohunekd/plugin-assistant)
-and the pohunek release notes carry its SHA-256 digest; a context package
-installs by digest, never through the catalog. Each pohunek release publishes
-the matching package right after the core release, so the package is available
-from the first pohunek release that contains the context package kind (0.41.0):
-
-```bash
-pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
-```
-
-The first install selects the package. A build from `main` before that release
-has no published archive, and `pohunek assistant` answers `assistant_package_missing`
-with the step to take; build the archive from a checkout of
-[`plugin-assistant`](https://github.com/pohunekd/plugin-assistant) (its README)
-instead.
+refuses it), run `pohunek assistant setup` (or `pohunek setup`) once per host
+that runs assistant sessions (a remote assistant reads the package installed
+on that remote host) after the official index admits the package for that
+core release. Until the index lists it, the launch stops with a message
+naming the daemon's core version and the same command to rerun. No archive
+download, attestation check, or digest-pinned hand install is part of this
+path: the signed plugin index is the only source, and the daemon verifies
+the signature, revocations, freshness and digest at install.
 
 `pohunek service upgrade` (and `packaging/install-daemon.sh`, which runs it)
 installs the matching package itself, because the release archive does not carry

@@ -657,7 +657,10 @@ never a `<placeholder>`. A remote launch installs nothing remotely and names
 package the daemon's core can use (the id is absent or no entry supports that
 core), the message names the core version and says to rerun
 `pohunek assistant setup` after admission; the entries the index resolution
-matches against are those of the daemon's core version, not the CLI's.
+matches against are those of the daemon's core version, not the CLI's. A
+daemon version that is not a semantic version stops the recovery with
+`host_cap_probe_failed` before anything installs, since the index entries
+cannot be matched against it.
 
 When the knowledge bundle of the launch is older than the daemon that serves it (the
 package versions track the core releases and are compared by semantic version

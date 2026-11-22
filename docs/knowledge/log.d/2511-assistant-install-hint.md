@@ -20,4 +20,9 @@
   no `<placeholder>`, as do the not-selected, disabled and rejected arms. The
   match keys on the stable error code alone, never on the message or remedy,
   so an older daemon's placeholder hint cannot leak through. Covered by
-  `crates/cli/tests/assistant_setup_install.rs` (S1-S6).
+  `crates/cli/tests/assistant_setup_install.rs` (S1-S4, S6 end to end; S5 by
+  unit tests of the stable-code match and remedy replacement plus an
+  integration run over the no-package plan). A daemon version that cannot be
+  parsed as semantic stops the recovery before anything installs:
+  `host_cap_probe_failed` (configuration class), since the index entries
+  cannot be matched against it.

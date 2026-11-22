@@ -202,7 +202,7 @@ fn is_missing_package(error: &CliError) -> bool {
 /// is installed and the preview is printed.
 #[allow(
     clippy::too_many_lines,
-    reason = "the recovery branches install, gap and remote cases in one place"
+    reason = "the recovery keeps install, gap and remote arms in one place"
 )]
 async fn recover_missing_package(
     error: CliError,
@@ -223,20 +223,29 @@ async fn recover_missing_package(
     else {
         return Err(error);
     };
-    let daemon_version = client
+    // One inspection serves the plan and the apply: the daemon version must
+    // not be sampled twice behind one recovery.
+    let daemon_version = match client
         .host_inspect_with(protocol::HostInspectParams {
             skip_runtime_probes: Some(true),
         })
         .await
-        .map(|capabilities| capabilities.daemon_version)
-        .ok();
-    let daemon_core = daemon_version
-        .as_deref()
-        .and_then(|version| semver::Version::parse(version).ok());
+    {
+        Ok(capabilities) => capabilities.daemon_version,
+        Err(error) => return Err(error),
+    };
+    let daemon_core = match semver::Version::parse(&daemon_version) {
+        Ok(core) => core,
+        Err(_error) => {
+            return Err(CliError::HostCapProbe {
+                version: daemon_version.clone(),
+            });
+        }
+    };
     let (step, cause) = crate::commands::setup_assistant::plan_with_cause(
         None,
         Some(&mut client),
-        daemon_core.as_ref(),
+        Some(&daemon_core),
     )
     .await;
     match step {
@@ -248,13 +257,13 @@ async fn recover_missing_package(
                 paths,
                 auto_started,
                 workdir,
-                daemon_version.as_deref(),
+                Some(daemon_version.as_str()),
             )
             .await
         }
         crate::commands::setup_assistant::AssistantStep::Present { .. }
         | crate::commands::setup_assistant::AssistantStep::Gap { .. } => {
-            let recover = outcome_recover(&step, cause, daemon_version.as_deref());
+            let recover = outcome_recover(&step, cause, Some(daemon_version.as_str()));
             if let Some(text) = &recover {
                 eprintln!("pohunek: {text}");
             }
@@ -329,6 +338,19 @@ async fn install_and_retry(
     daemon_version: Option<&str>,
 ) -> Result<(), CliError> {
     use crate::commands::setup_assistant::{AssistantOutcome, AssistantStep};
+    // One inspection feeds the plan above; the apply reuses that version so
+    // a transient probe failure cannot stage the wrong core.
+    let daemon_core = match daemon_version {
+        Some(version) => match semver::Version::parse(version) {
+            Ok(core) => Some(core),
+            Err(_error) => {
+                return Err(CliError::HostCapProbe {
+                    version: version.to_owned(),
+                });
+            }
+        },
+        None => None,
+    };
     let AssistantStep::Install {
         package_id,
         version,
@@ -352,7 +374,13 @@ async fn install_and_retry(
     };
     let (package_id, version, digest) = (package_id.clone(), version.clone(), digest.clone());
     eprintln!("pohunek: assistant package missing: installing {package_id}@{version} ({digest})");
-    if !opts.yes && (opts.json || !std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+    // A request read from stdin leaves nothing for the prompt: stdin as the
+    // request source takes the non-interactive rule like `--json` does.
+    if !opts.yes
+        && (opts.json
+            || opts.request_from_stdin
+            || !std::io::IsTerminal::is_terminal(&std::io::stdin()))
+    {
         let recover = "preview only (no TTY or `--json`, unless `--yes`): rerun `pohunek assistant --yes` to install, or run `pohunek assistant setup`".to_owned();
         eprintln!("pohunek: {recover}");
         return Err(with_recover(CliError::SetupConsentRequired, Some(recover)));
@@ -361,13 +389,6 @@ async fn install_and_retry(
         return Err(CliError::SetupDeclined);
     }
     let mut client = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await?;
-    let daemon_core = client
-        .host_inspect_with(protocol::HostInspectParams {
-            skip_runtime_probes: Some(true),
-        })
-        .await
-        .ok()
-        .and_then(|capabilities| semver::Version::parse(&capabilities.daemon_version).ok());
     match crate::commands::setup_assistant::apply(&mut client, step, None, daemon_core.as_ref())
         .await
     {
@@ -863,5 +884,71 @@ mod tests {
             matches!(err, CliError::RemoteTargetRequired),
             "expected RemoteTargetRequired, got {err:?}"
         );
+    }
+
+    /// A synthetic N-1 daemon error carrying the historical placeholder
+    /// remedy: the match keys on the stable code, so both the bare and the
+    /// wrapped form recover.
+    fn old_hint_error() -> CliError {
+        CliError::Protocol(protocol::ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "assistant_package_missing",
+            "the assistant context package `pohunek.context.assistant` cannot be used: it is not installed",
+            Some(
+                "install it with `pohunek plugin install <archive> --sha256 <digest>`"
+                    .to_owned(),
+            ),
+        ))
+    }
+
+    #[test]
+    fn missing_package_matches_the_stable_code_only() {
+        assert!(is_missing_package(&old_hint_error()));
+        let wrapped = CliError::Client(pohunek_client::ClientError::Protocol(
+            protocol::ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                "assistant_package_missing",
+                "the assistant context package cannot be used",
+                None,
+            ),
+        ));
+        assert!(is_missing_package(&wrapped));
+        let other = CliError::Protocol(protocol::ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "materialization_failed",
+            "the bundle failed",
+            Some("install it with `pohunek plugin install <archive> --sha256 <digest>`".to_owned()),
+        ));
+        assert!(!is_missing_package(&other));
+    }
+
+    #[test]
+    fn with_recover_replaces_the_stale_placeholder_remedy() {
+        let error = old_hint_error();
+        let message = "run `pohunek assistant setup` again later".to_owned();
+        let recovered = with_recover(error, Some(message.clone()));
+        let CliError::Protocol(error) = recovered else {
+            panic!("the error stays a protocol error");
+        };
+        assert_eq!(error.code, "assistant_package_missing");
+        let recover = error.recover.expect("the recover is replaced");
+        assert_eq!(recover, message);
+        assert!(!recover.contains('<'), "no placeholder remains: {recover}");
+    }
+
+    #[test]
+    fn outcome_recover_names_the_daemon_version_without_placeholders() {
+        use crate::commands::setup_assistant::{AssistantStep, GapCause};
+        let step = AssistantStep::Gap {
+            detail: "the index lists nothing".to_owned(),
+            command: "pohunek assistant setup (or `pohunek setup`)".to_owned(),
+        };
+        let recover = outcome_recover(&step, Some(GapCause::NotListed), Some("0.42.0"))
+            .expect("a not-listed gap has a recover");
+        assert!(
+            recover.contains("not available for core v0.42.0"),
+            "the recover names the daemon version: {recover}"
+        );
+        assert!(!recover.contains('<'), "no placeholder remains: {recover}");
     }
 }

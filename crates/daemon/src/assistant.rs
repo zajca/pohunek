@@ -118,9 +118,7 @@ pub(crate) fn context_error(error: &ContextError) -> ProtocolError {
         ),
         ContextError::NotSelected => (
             "it is installed but not selected".to_owned(),
-            format!(
-                "run `pohunek assistant setup` on that host to select the version the signed index lists, or pick one with `pohunek plugin list` and `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID} --digest`, then retry"
-            ),
+            "run `pohunek assistant setup` on that host to select the version the signed index lists (see `pohunek plugin list`), then retry".to_owned(),
         ),
         ContextError::Disabled => (
             "it is disabled".to_owned(),

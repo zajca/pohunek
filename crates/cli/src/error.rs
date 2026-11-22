@@ -94,6 +94,14 @@ pub(crate) enum CliError {
         option: String,
     },
 
+    /// The daemon's reported version is not a semantic version, so the CLI
+    /// cannot match the assistant package against the daemon's core.
+    #[error("the daemon reports version {version:?}, which is not a semantic version")]
+    HostCapProbe {
+        /// The unparseable daemon version.
+        version: String,
+    },
+
     /// Input provided through stdin violated the CLI's bounded text contract.
     #[error("invalid stdin input: {detail}")]
     InvalidStdinInput {
@@ -486,6 +494,12 @@ impl CliError {
                 "cli_usage",
                 format!("duplicate --opt option {option:?} (each option takes one choice)"),
                 Some("pass --opt only once per option".to_owned()),
+            ),
+            CliError::HostCapProbe { version } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "host_cap_probe_failed",
+                format!("the daemon reports version {version:?}, which is not a semantic version"),
+                Some("upgrade the daemon to a release with a semantic version, then retry".to_owned()),
             ),
             CliError::InvalidStdinInput { detail } => ProtocolError::new(
                 ErrorClass::Configuration,
