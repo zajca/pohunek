@@ -454,8 +454,8 @@ entries: a document lives at most 14 days (`LifetimeTooLong`, `Expired`), the
 sequence cannot lead the host clock by more than a day, the endorser root can
 revoke the key at any time, and every install shows the resolved package, version
 and digest before it writes. Per-kind key scopes (a `kinds` allow-list on the key
-record) are the next step if that risk is not acceptable. Per-kind scopes are
-deferred to #1619 together with the verified tier (see
+record) are the next step if that risk is not acceptable. The verified scope
+itself is deferred to #1619 (see
 [Admission through the index](../guides/plugin-repositories.md#admission-through-the-index)).
 
 **Freshness.** `sequence` is the Unix second of signing. A sequence below the

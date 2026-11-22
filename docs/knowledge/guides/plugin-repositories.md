@@ -373,18 +373,20 @@ install by id.
 - The pure predicates of an added entry are `cargo xtask index check-entry
   --entries <tree of the entry> --existing <admitted tree> --core-version
   <X.Y.Z> --stage schema|core-range`, built at the pinned core tag. Stage
-  `schema` refuses a package id that is not `pohunek.runtime.` plus the runtime
-  id, a refused runtime id, an identity or digest already admitted, a version
-  that is not a release semver above every admitted version of the package id,
-  refuses an entry that would take the index past its entry or size limit, refuses a `url` outside letters, digits and `:/._+-`, and prints the validated
-  fields as `key=value` lines for `IFS== read -r`, never for `eval`. Stage `core-range`
+  `schema` enforces the identity binding (`check_identity_binding` in
+  `crates/xtask/src/plugin_index/admit.rs`): a runtime entry's package id is
+  `pohunek.runtime.` plus the runtime id, a context entry's is
+  `pohunek.context.` plus a non-empty name, and any other kind/`runtime_id`
+  combination is refused. It also refuses a refused runtime id, an identity
+  or digest already admitted, a version that is not a release semver above
+  every admitted version of the package id, an entry that would take the
+  index past its entry or size limit, and a `url` outside letters, digits and
+  `:/._+-`, and prints the validated fields as `key=value` lines for `IFS==
+  read -r`, never for `eval`. Stage `core-range`
   refuses a range that does not parse, names a pre-release, does not admit the
   pinned core or admits a core below `0.40.0`. A refusal exits 1 and prints
   `predicate=<name>: <detail>`, where `<name>` is one of `schema`, `existing-tree`, `package-id-binding`, `refused-runtime-id`, `url-charset`, `identity-conflict`, `duplicate-digest`, `version-not-semver`, `version-not-release`, `duplicate-version`, `version-not-greater`, `core-range-unparsed`, `core-prerelease`, `core-excludes-core-tag`, `core-lower-bound` (the `Predicate` enum in
-  `crates/xtask/src/plugin_index/admit.rs`). Stage `schema` also admits
-  `pohunek.context.` entries: a context entry's package id is
-  `pohunek.context.` plus a non-empty name and it carries no `runtime_id`
-  (`crates/xtask/src/plugin_index/admit.rs:246`).
+  `crates/xtask/src/plugin_index/admit.rs`).
 - Without admission, an owner can still install a published archive by its
   digest (community tier); such an install is refused a runtime id the daemon
   reserves (see the [trust model](runtime-packages.md#trust-model)).
@@ -394,21 +396,24 @@ install by id.
 The remaining open items of #2467 are the accepted design, recorded here so
 every checkbox links one doc line:
 
-- Verified scope: index key records and documents keep the single scope
-  `official` (`crates/package/src/plugin_index.rs:101`); the separation of
-  runtime and context entries lives in the verifier rules, not in a second
-  key hierarchy. The shared scope keeps one residual risk, and per-kind key
-  scopes are deferred to #1619 (see the
+- Verified scope: only the `official` scope exists (`OFFICIAL_SCOPE`,
+  `crates/package/src/plugin_index.rs:101`); the separation of runtime and
+  context entries lives in the verifier rules, not in a second key
+  hierarchy. A verified scope, where a verified key cannot sign official
+  documents and the reverse, is deferred to #1619 (owner ruling
+  q-8e5ac9ab1a6a). The shared scope keeps one residual risk; per-kind key
+  scopes are the next step if that risk is not acceptable (see the
   [plugin index](../concepts/runtime-catalog.md#plugin-index)).
 - Key records are their own type: `IndexKeyRecord` (`plugin_index.rs:210`)
   under its own signature domain `pohunek-plugin-index-key-record-v1`
   (`plugin_index.rs:128`), never a catalog key record.
 - Entry fields: the signed entry carries no `repo`, `repo_id`, `tag`,
-  `signer_workflow`, `runtime_api` or `requires`. `repo`, `repo_id`, `tag`
-  and `signer_workflow` (as `[source]`) are checked at admission and never
-  copied into the signed document; `runtime_api` and required features stay
-  in the package descriptor, checked by the install path and previewed with
-  `pohunek plugin compat`.
+  `signer_workflow`, `runtime_api` or `requires`. `[source]` holds `repo`,
+  `repo_id`, `tag`, `commit` and `built_with`; it is checked at admission
+  and never copied into the signed document. The signer workflow is fixed
+  by admission (`plugin-release.yml`), not entry data. `runtime_api` and
+  required features stay in the package descriptor, checked by the install
+  path and previewed with `pohunek plugin compat`.
 - Core cap: there is no "last proved core" upper cap on an entry range.
   Admission already refuses a range that excludes the pinned core tag
   (`core-excludes-core-tag`, `crates/xtask/src/plugin_index/admit.rs:425`);
