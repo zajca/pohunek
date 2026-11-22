@@ -77,7 +77,7 @@ impl AssistantStep {
 
 /// The request for the assistant package at `version`, or the newest one this
 /// core release can use.
-fn request(version: Option<&protocol::PackageVersion>) -> Result<PackageRef, CliError> {
+pub(crate) fn request(version: Option<&protocol::PackageVersion>) -> Result<PackageRef, CliError> {
     debug_assert!(ASSISTANT_PACKAGE.starts_with(OFFICIAL_CONTEXT_PACKAGE_PREFIX));
     let text = match version {
         Some(version) => format!("{ASSISTANT_PACKAGE}@{version}"),
@@ -197,8 +197,59 @@ pub(crate) fn selected_package<'a>(
     Some(SelectedPackage { info, older })
 }
 
+/// An owner's choice that a service upgrade leaves as it is.
+pub(crate) struct OwnerHold {
+    /// What the owner set, as a clause.
+    pub(crate) detail: String,
+    /// The commands that undo the choice.
+    pub(crate) command: String,
+}
+
+/// The owner's hold on `package_id` among `packages`: it is installed and
+/// either no version is selected or the selected version is disabled. A
+/// package that is not installed, or whose selected version is enabled, has
+/// no hold, so an upgrade may install a newer version of it.
+pub(crate) fn owner_hold(
+    packages: &[protocol::PackageInfo],
+    package_id: &str,
+) -> Option<OwnerHold> {
+    let installed = || {
+        packages
+            .iter()
+            .filter(|info| info.package.id.to_string() == package_id)
+    };
+    match installed().find(|info| info.selected) {
+        Some(info) if info.enabled => None,
+        Some(info) => Some(OwnerHold {
+            detail: format!("version {} is selected but disabled", info.package.version),
+            command: format!(
+                "pohunek plugin enable {package_id} --digest {}",
+                info.digest.as_str()
+            ),
+        }),
+        None => {
+            let newest = installed().max_by(|left, right| {
+                match (
+                    semver::Version::parse(left.package.version.as_ref()),
+                    semver::Version::parse(right.package.version.as_ref()),
+                ) {
+                    (Ok(left), Ok(right)) => left.cmp_precedence(&right),
+                    _ => std::cmp::Ordering::Equal,
+                }
+            })?;
+            Some(OwnerHold {
+                detail: "a version is installed and none is selected".to_owned(),
+                command: format!(
+                    "pohunek plugin enable {package_id} --digest {digest} && pohunek plugin select {package_id} --digest {digest}",
+                    digest = newest.digest.as_str()
+                ),
+            })
+        }
+    }
+}
+
 /// Whether `info` is a package that serves fresh launches and bare requests.
-fn serves(info: &protocol::PackageInfo) -> bool {
+pub(crate) fn serves(info: &protocol::PackageInfo) -> bool {
     info.enabled && info.selected && info.fault.is_none() && !info.revoked
 }
 
@@ -292,7 +343,7 @@ pub(crate) fn is_older(current: &str, listed: &str) -> bool {
 }
 
 /// Installs the previewed package; the error is the detail of the gap.
-async fn install(
+pub(crate) async fn install(
     client: &mut Client,
     version: &str,
     digest: &str,

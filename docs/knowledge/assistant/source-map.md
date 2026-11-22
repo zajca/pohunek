@@ -27,7 +27,7 @@ Current CLI and command surface:
 - `crates/hostcheck/src/macos.rs` — macOS doctor checks and the bounded `launchctl` domain probe.
 - `crates/hostcheck/src/executable.rs` — exec-bit-aware executable resolution.
 - `crates/cli/src/commands/daemon.rs`
-- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`; after an upgrade it reports the selected assistant package against the core (`assistant`, with the `pohunek setup` command when older).
+- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`; after a committed upgrade it hands the report to `crates/cli/src/commands/upgrade_assistant.rs`, which installs the assistant package the plugin index lists for the new core and reports it (`assistant`, with `install.result`; `--no-assistant-package` skips it).
 - `crates/cli/src/service/` — the service transactions: install journal and
   transaction lock with the holder record `pohunek service lock` publishes
   (`record.rs`), the holder token its command adopts the lock with through
@@ -46,6 +46,9 @@ Current CLI and command surface:
 - `crates/cli/src/commands/setup.rs`
 - `crates/cli/src/commands/setup_host.rs`
 - `crates/cli/src/commands/setup_assistant.rs`
+- `crates/cli/src/commands/upgrade_assistant.rs` — the assistant package step of
+  `pohunek service upgrade`: gate, owner hold, install through the index path of
+  `setup_assistant.rs`, and the `assistant.install` outcome.
 - `crates/cli/src/commands/setup_hooks.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`

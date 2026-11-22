@@ -466,15 +466,32 @@ with the step to take; build the archive from a checkout of
 [`plugin-assistant`](https://github.com/pohunekd/plugin-assistant) (its README)
 instead.
 
-`pohunek service upgrade` (and `packaging/install-daemon.sh`, which runs it) does
-not install or replace this package, because the release archive does not carry
-it. The upgrade report says so: an `assistant` line names the selected version
-and `pohunek setup` when the package is older than the new core, and
-`pohunek assistant` prints the same note while the older bundle is selected.
-`pohunek setup` replaces the older selected package with the version the signed
-plugin index lists for the release (the package is published right after the core
-release, so a run just after the release can find the index without it); a package
-you disabled or did not select stays as set and `setup` names the steps.
+`pohunek service upgrade` (and `packaging/install-daemon.sh`, which runs it)
+installs the matching package itself, because the release archive does not carry
+it: after a committed upgrade to a newer version it asks the signed plugin index
+for the version listed for the new release, installs and selects it through the
+daemon (which verifies the signature and the digest as `setup` does) and prints
+an `assistant` line with the outcome. The package is published right after the
+core release and listed by the official index once it is admitted, so an upgrade
+made before that reports `not_published` and keeps the old package; run
+`pohunek setup` later to install it. The step never fails the upgrade: an
+unreachable index or a refused document is reported as `failed` and the old
+package stays. A package you disabled, or an installed one with no selected version, stays
+as set (`held`, with the `plugin enable` and `plugin select` steps), and so
+does a case where the version the index lists is already installed but not
+selected, for example after you rolled back with `plugin select` (`held`, naming
+`pohunek plugin select pohunek.context.assistant --digest <digest>`): the
+upgrade changes no selection that way, as `setup` does not. An older version you
+selected on purpose is otherwise replaced like `setup` replaces it, when the
+listed version is not installed yet; the report names the
+replaced digest, so `pohunek plugin select pohunek.context.assistant --digest
+<replaced_digest>` selects it again. A rollback with `pohunek service upgrade
+--from <previous>` keeps the newer package selected and serving; select the older
+digest the same way if you want the older bundle. On a host without access to the
+index pass `--no-assistant-package` to `pohunek service upgrade` or to
+`install-daemon.sh`. A fresh `install-daemon.sh` install does not install the
+package: `pohunek setup` does, and the installer names it. `pohunek assistant`
+prints a note while an older bundle is selected.
 Without the index, move to the package version whose release notes name your
 core version with `plugin update`, which installs the new version next to the old
 one and selects it (a plain `plugin install` keeps the old version selected):

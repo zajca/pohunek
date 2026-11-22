@@ -215,8 +215,8 @@ pub struct UpgradeReport {
         serialize_with = "serialize_purge_paths"
     )]
     pub refused_entries: Vec<PathBuf>,
-    /// The assistant context package as the new daemon reports it. The upgrade
-    /// never installs it; `null` while the daemon was not asked.
+    /// The assistant context package as the new daemon reports it, with what
+    /// the upgrade did about it; `null` while the daemon was not asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<AssistantPackageReport>,
 }
@@ -237,6 +237,50 @@ pub struct AssistantPackageReport {
     /// The command that moves an `outdated` package to the version the plugin
     /// index lists for this core.
     pub command: Option<String>,
+    /// What the upgrade did about the package; absent when it did nothing
+    /// about it (the package is current, the run is no version change, or the
+    /// daemon was not asked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<AssistantInstall>,
+}
+
+/// What `pohunek service upgrade` did about the assistant context package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssistantInstall {
+    /// The outcome. Every one leaves the core upgrade committed.
+    pub result: AssistantInstallResult,
+    /// The version now selected, for `installed`.
+    pub version: Option<String>,
+    /// The digest now selected, for `installed`.
+    pub digest: Option<String>,
+    /// The version that was selected before the install, when there was one.
+    pub replaced_version: Option<String>,
+    /// The digest that was selected before the install; `pohunek plugin select
+    /// <package> --digest <digest>` selects it again.
+    pub replaced_digest: Option<String>,
+    /// Why, for every result but `installed`.
+    pub detail: Option<String>,
+    /// The command that retries, undoes the hold or opts in again.
+    pub command: Option<String>,
+}
+
+/// How the assistant package step of an upgrade ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantInstallResult {
+    /// A newer version was installed from the signed plugin index and
+    /// selected.
+    Installed,
+    /// The plugin index lists no newer version for this core release.
+    NotPublished,
+    /// The owner disabled the selected version or selected none, so the
+    /// package stays as set.
+    Held,
+    /// The index, the download or the daemon refused; `status` and `version`
+    /// are read after the attempt.
+    Failed,
+    /// `--no-assistant-package` was given.
+    Skipped,
 }
 
 /// How the selected assistant package compares with the upgraded core.

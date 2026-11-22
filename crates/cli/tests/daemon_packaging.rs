@@ -800,6 +800,83 @@ fn a_stray_legacy_unit_on_macos_is_named_for_removal() {
     assert!(fixture.pohunek_calls().is_empty());
 }
 
+/// The opt-out of the assistant package step reaches `service upgrade` only,
+/// in either argument order and through the lock re-execution.
+#[test]
+fn an_upgrade_passes_the_assistant_package_opt_out_to_the_upgrade_only() {
+    for args in [
+        &["--no-assistant-package"][..],
+        &["--no-assistant-package", "--accept-runtime-loss"][..],
+        &["--accept-runtime-loss", "--no-assistant-package"][..],
+    ] {
+        let fixture = Fixture::new();
+        write(&fixture.config_home.join("pohunek/service.toml"), "");
+        let output = fixture.run(args, &[]);
+        assert_success(&output);
+        let loss = args.contains(&"--accept-runtime-loss");
+        let mut locked = Vec::new();
+        let mut checked = fixture.check_call();
+        let mut upgraded = fixture.upgrade_call();
+        if loss {
+            locked.push("--accept-runtime-loss");
+            checked.push_str(" --accept-runtime-loss");
+            upgraded.push_str(" --accept-runtime-loss");
+        }
+        locked.push("--no-assistant-package");
+        upgraded.push_str(" --no-assistant-package");
+        assert_eq!(
+            fixture.guard_calls(),
+            [fixture.lock_call(&locked), checked],
+            "{args:?}"
+        );
+        assert_eq!(
+            fixture.pohunek_calls(),
+            [STATUS.to_owned(), upgraded],
+            "{args:?}"
+        );
+    }
+}
+
+/// A fresh install is never given the opt-out and names `pohunek setup` as the
+/// way to install the assistant package; an upgrade installs the package
+/// itself and prints no such hint.
+#[test]
+fn an_install_names_setup_for_the_assistant_package_and_never_receives_the_opt_out() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["--no-assistant-package"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("install the assistant context package with `pohunek setup`"),
+        "{stderr}"
+    );
+
+    let upgrade = Fixture::new();
+    write(&upgrade.config_home.join("pohunek/service.toml"), "");
+    let output = upgrade.run(&[], &[]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("assistant context package"), "{stderr}");
+}
+
+#[test]
+fn a_repeated_flag_fails_without_side_effects() {
+    for args in [
+        &["--no-assistant-package", "--no-assistant-package"][..],
+        &["--accept-runtime-loss", "--accept-runtime-loss"][..],
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture.run(args, &[]);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(fixture.pohunek_calls().is_empty());
+        assert!(fixture.guard_calls().is_empty());
+    }
+}
+
 #[test]
 fn an_unknown_argument_fails_without_side_effects() {
     let fixture = Fixture::new();

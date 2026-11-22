@@ -215,8 +215,8 @@ class InstallDaemonWarningTest(unittest.TestCase):
         order = [
             "service refresh-path --dry-run",
             "then $archive_dir/pohunek service refresh-path",
-            "re-run $0 without --accept-runtime-loss",
-            "otherwise re-run $0 --accept-runtime-loss",
+            "re-run $rerun without --accept-runtime-loss",
+            "otherwise re-run $rerun --accept-runtime-loss",
         ]
         position = -1
         for step in order:
@@ -237,7 +237,7 @@ class InstallDaemonRefreshEchoTest(unittest.TestCase):
         steps = [
             "the refusal names the recorded search path",
             "service refresh-path --dry-run",
-            "otherwise re-run $0 --accept-runtime-loss",
+            "otherwise re-run $rerun --accept-runtime-loss",
         ]
         positions = []
         for step in steps:
@@ -253,7 +253,7 @@ class InstallDaemonRefreshEchoTest(unittest.TestCase):
         order = [
             "service refresh-path --dry-run",
             "then $archive_dir/pohunek service refresh-path",
-            "then re-run $0 without --accept-runtime-loss",
+            "then re-run $rerun without --accept-runtime-loss",
         ]
         position = -1
         for step in order:
@@ -277,7 +277,7 @@ class InstallDaemonRefreshEchoTest(unittest.TestCase):
         order = [
             "run the same pohunek that started the refresh",
             "service refresh-path (without a dry run) to finish it",
-            "then re-run $0 without --accept-runtime-loss",
+            "then re-run $rerun without --accept-runtime-loss",
         ]
         position = -1
         for step in order:

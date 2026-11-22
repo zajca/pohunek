@@ -223,12 +223,17 @@ print(value if isinstance(value, (str, int, float)) else json.dumps(value, sort_
 PY
 }
 
+# Arguments the installer wrapper gets (split on blanks on purpose). The
+# upgrade step sets `--no-assistant-package`, so the run asks no plugin index.
+installer_args=
+
 # Runs the installer wrapper of the extracted archive $1; further arguments
 # are `VAR=value` environment assignments for the run.
 run_installer() {
   ri_dir=$1
   shift
-  iso_env POHUNEK_INSTALL_PREFIX="$prefix" "$@" sh "$ri_dir/packaging/install-daemon.sh"
+  # shellcheck disable=SC2086
+  iso_env POHUNEK_INSTALL_PREFIX="$prefix" "$@" sh "$ri_dir/packaging/install-daemon.sh" $installer_args
 }
 
 status_json() {
@@ -454,8 +459,10 @@ expect_refused writable "$variant" 'writable by another account'
 
 # ---------------------------------------------------------------------------
 say "5. Upgrade to $version_b with live sessions"
+installer_args=--no-assistant-package
 run_installer "$dir_b" >"$work/ev/upgrade.out" 2>"$work/ev/upgrade.err" ||
   die "the upgrade failed; see $work/ev/upgrade.err"
+installer_args=
 status_json "$work/ev/status-b.json"
 [ "$(json_get "$work/ev/status-b.json" ok.active_version)" = "$version_b" ] || die "active version is not $version_b"
 daemon_pid_b=$(json_get "$work/ev/status-b.json" ok.daemon.pid)
