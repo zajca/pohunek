@@ -433,6 +433,8 @@ fn capability_snapshot(
         session_adopt_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
+        package_setup_supported: true,
+        package_create_profile_program_supported: true,
         package_install_index_supported: false,
         package_install_index_context_supported: false,
         package_index_apply_supported: false,

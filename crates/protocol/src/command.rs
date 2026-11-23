@@ -111,6 +111,12 @@ command_error_kinds! {
     /// digest of a catalog-authorized package (or the revocation set cannot
     /// be read), the run could not be set up, or the daemon is shutting down.
     Unavailable,
+    /// The selected version declares no setup entry of that name
+    /// (`package.setup_resolve`).
+    SetupNotDeclared,
+    /// `package.setup_resolve` arrived over the overlay or a relay path; a
+    /// setup entry runs on the owner's terminal of the host itself.
+    SetupNotLocal,
 }
 
 impl CommandErrorKind {
@@ -130,6 +136,8 @@ impl CommandErrorKind {
             Self::OutputTooLarge => "command_output_too_large",
             Self::OutputNotUtf8 => "command_output_not_utf8",
             Self::Unavailable => "command_unavailable",
+            Self::SetupNotDeclared => "command_setup_not_declared",
+            Self::SetupNotLocal => "command_setup_not_local",
         }
     }
 
@@ -147,6 +155,8 @@ impl CommandErrorKind {
             Self::OutputTooLarge => "the command wrote more output than allowed and was stopped",
             Self::OutputNotUtf8 => "the command output is not valid UTF-8",
             Self::Unavailable => "the command could not be run on this host",
+            Self::SetupNotDeclared => "the selected package version declares no such setup entry",
+            Self::SetupNotLocal => "a setup entry can only be resolved on the host itself",
         }
     }
 
@@ -168,6 +178,8 @@ impl CommandErrorKind {
             }
             Self::OutputNotUtf8 => "fix the program so it writes UTF-8",
             Self::Unavailable => "run `pohunek plugin doctor` on the host and retry",
+            Self::SetupNotDeclared => "check the package id and setup name with `pohunek plugin inspect`",
+            Self::SetupNotLocal => "run `pohunek plugin run` on the host itself, not over the overlay",
         }
     }
 

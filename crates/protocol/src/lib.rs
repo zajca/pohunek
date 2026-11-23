@@ -25,6 +25,7 @@ mod agent_options;
 mod assistant;
 mod capabilities;
 mod command;
+mod setup;
 pub mod compat;
 mod condition;
 mod decimal;
@@ -61,6 +62,8 @@ pub use capabilities::{
 };
 #[doc(inline)]
 pub use command::{CommandErrorKind, CommandRunParams, CommandRunResult};
+#[doc(inline)]
+pub use setup::{SetupInfo, SetupResolveParams, SetupResolveResult};
 #[doc(inline)]
 pub use condition::{SessionCondition, SessionRecovery};
 #[doc(inline)]

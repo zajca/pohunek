@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, CommandRunParams, CommandRunResult,
+    SetupResolveParams, SetupResolveResult,
     DaemonDoctorResult, DaemonHealthResult, HostCapabilities, HostDiscoverParams,
     HostGovernanceStatus, HostRecord, HostResolution, HostResolveParams, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationInstallParams, IntegrationInstallResult,
@@ -717,4 +718,14 @@ method_table!(
     CommandRunResult,
     "CommandRunParams",
     "CommandRunResult";
+
+    /// Resolve one setup entry of a package to a verified program path
+    /// (local-only); the CLI runs the program on the owner's terminal.
+    PackageSetupResolve,
+    PACKAGE_SETUP_RESOLVE,
+    "package.setup_resolve",
+    SetupResolveParams,
+    SetupResolveResult,
+    "SetupResolveParams",
+    "SetupResolveResult";
 );
