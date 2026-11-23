@@ -15,11 +15,10 @@ use std::fs;
 use std::io::Read as _;
 use std::process::{Output, Stdio};
 use std::thread;
-use std::time::Duration;
 
 use package::{build_archive, read_archive, ArchiveEntry, Limits};
 use pohunek_test_support::bin_exe;
-use pohunek_test_support::wait::guard;
+use pohunek_test_support::wait::{guard, poll_until};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::Value;
 
@@ -74,12 +73,6 @@ const SETUP_ENV: [&str; 3] = [
 /// Columns and rows of the pseudo terminal the CLI runs on.
 const TERMINAL_COLS: u16 = 120;
 const TERMINAL_ROWS: u16 = 40;
-
-/// Pause between polls of a child that has not exited yet.
-const POLL_STEP: Duration = Duration::from_millis(50);
-
-/// Polls before a child that has not exited is reported as hung.
-const POLL_LIMIT: u32 = 1200;
 
 /// The fixture setup program. It prints the argument vector, then the names of
 /// the variables it inherited, then acts on the first owner argument.
@@ -239,17 +232,8 @@ fn run_on_terminal(harness: &Harness, arguments: &[&str]) -> (u32, String) {
         let _ = reader.read_to_end(&mut output);
         output
     });
-    let mut status = None;
-    for _ in 0..POLL_LIMIT {
-        if let Some(exited) = child.try_wait().expect("poll pohunek") {
-            status = Some(exited);
-            break;
-        }
-        thread::sleep(POLL_STEP);
-    }
-    let status = status.unwrap_or_else(|| {
-        let _ = child.kill();
-        panic!("pohunek {arguments:?} did not exit");
+    let status = poll_until("the pohunek child to exit", || {
+        child.try_wait().expect("poll pohunek")
     });
     let output = transcript.join().expect("transcript thread");
     let text = String::from_utf8_lossy(&output).replace("\r\n", "\n");

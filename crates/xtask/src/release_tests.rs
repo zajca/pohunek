@@ -66,6 +66,21 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) {
 }
 
 /// Names of the official runtimes, read from the package directories.
+/// Copies the files below `from` into `to`, keeping the directory layout and
+/// each file's mode, so a package with a `bin/` directory copies whole.
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).expect("list") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            fs::create_dir(&target).expect("mkdir");
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
 fn runtimes() -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(root().join("runtime-packages"))
         .expect("runtime-packages")
@@ -692,10 +707,7 @@ fn a_package_archive_swapped_after_attestation_is_refused() {
     let runtime = &runtimes()[0];
     let source = fixture.path("swapped-source");
     fs::create_dir(&source).expect("mkdir");
-    for entry in fs::read_dir(root().join("runtime-packages").join(runtime)).expect("list") {
-        let entry = entry.expect("entry");
-        fs::copy(entry.path(), source.join(entry.file_name())).expect("copy");
-    }
+    copy_tree(&root().join("runtime-packages").join(runtime), &source);
     let mut descriptor = fs::read(source.join("runtime.toml")).expect("descriptor");
     descriptor.extend_from_slice(b"\n# swapped after the attestation\n");
     fs::write(source.join("runtime.toml"), descriptor).expect("write");

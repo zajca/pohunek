@@ -236,8 +236,12 @@ expanded). The pieces fit together like this:
   each profile). Entries with the same value launch against the same directory,
   for example two profile names for one subscription, or a profile that names
   the ambient home; entries with different values are different accounts. The
-  value is an opaque keyed digest of the directory: stable on one host, different
-  on another, and it carries no path or environment value. A client groups by it
+  value identifies a config directory, not an account: profiles that share a home
+  but select different accounts through their environment, such as the Claude
+  account presets of [One Claude subscription per session](../guides/claude-package.md#one-claude-subscription-per-session),
+  report the same value. The value is an opaque keyed digest of the directory:
+  stable on one host, different on another, and it carries no path or environment
+  value. A client groups by it
   and never tries to decode it. The entry is absent when the home cannot be
   resolved or the host cannot key the digest.
 - **External observer.** With external observation enabled the daemon watches
@@ -322,6 +326,17 @@ is replaced only with `--replace <file digest>`, the `file_digest` that
 use changes its revision, so a resume then needs `--accept-profile-change`.
 `--dry-run` prints the profile and its digest and writes nothing. The command is
 local only.
+
+`--program <abs-path>` writes the profile's `program`, the executable a launch
+runs in place of the base's program. That is how a wrapper program is attached:
+an owner-written executable that reads its selector from the environment (for
+example `CLAUDE_ACCOUNT`), prepares the environment and then execs the real agent
+with the arguments it receives. The daemon accepts the path only when it names
+a regular executable file, not a symbolic link, owned by the effective user or
+root and not writable by its group or others; a launch then runs the wrapper,
+and the base's version probe answers through it (see
+[Wrapper programs](#wrapper-programs-and-version-probes)). A daemon without the
+`package_create_profile_program_supported` capability is not sent the field.
 
 `--options-file <path>` adds launch options: the path must name a regular
 file (not a symbolic link, FIFO or device), the file's only root key is

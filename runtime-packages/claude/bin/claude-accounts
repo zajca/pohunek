@@ -25,8 +25,8 @@ TOKEN_MAX_BYTES=512
 # First release that accepts setup-token tokens on machines with
 # forceLoginOrgUUID (Claude Code changelog 2.1.318).
 CLAUDE_MIN_VERSION=2.1.318
-# The Pohunek CLI on PATH; the program passes the daemon it must reach in
-# POHUNEK_SETUP_HOST.
+# The Pohunek CLI on PATH; it reaches the daemon through XDG_RUNTIME_DIR, which
+# `plugin run` passes on.
 POHUNEK_BIN=pohunek
 CLEAR_SCREEN='\033[H\033[2J\033[3J'
 
