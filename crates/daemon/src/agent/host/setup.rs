@@ -69,8 +69,7 @@ pub(super) fn setup_of(
     }
     let mut entries = BTreeMap::new();
     for (name, value) in table {
-        let name =
-            CommandName::parse(name).map_err(|_error| field("has an invalid entry name"))?;
+        let name = CommandName::parse(name).map_err(|_error| field("has an invalid entry name"))?;
         let raw: RawSetup = value
             .clone()
             .try_into()

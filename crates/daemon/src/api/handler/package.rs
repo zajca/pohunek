@@ -251,7 +251,12 @@ pub(super) async fn handle_package_setup_resolve(
         );
     }
     match parse_params::<SetupResolveParams>(request) {
-        Ok(params) => match state.sessions.packages().package_setup_resolve(params).await {
+        Ok(params) => match state
+            .sessions
+            .packages()
+            .package_setup_resolve(params)
+            .await
+        {
             Ok(result) => ok_value(request, &result),
             Err(kind) => error_value(request, ProtocolError::from(kind)),
         },

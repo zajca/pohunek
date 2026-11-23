@@ -25,7 +25,6 @@ mod agent_options;
 mod assistant;
 mod capabilities;
 mod command;
-mod setup;
 pub mod compat;
 mod condition;
 mod decimal;
@@ -44,6 +43,7 @@ mod runtime_id;
 mod secret_env;
 mod session;
 mod session_tree;
+mod setup;
 mod store;
 pub mod tolerant;
 mod turn_wait;
@@ -62,8 +62,6 @@ pub use capabilities::{
 };
 #[doc(inline)]
 pub use command::{CommandErrorKind, CommandRunParams, CommandRunResult};
-#[doc(inline)]
-pub use setup::{SetupInfo, SetupResolveParams, SetupResolveResult};
 #[doc(inline)]
 pub use condition::{SessionCondition, SessionRecovery};
 #[doc(inline)]
@@ -206,6 +204,8 @@ pub use session::{
 };
 #[doc(inline)]
 pub use session_tree::{SessionTree, TreeNode};
+#[doc(inline)]
+pub use setup::{SetupInfo, SetupResolveParams, SetupResolveResult};
 #[doc(inline)]
 pub use store::{StoreRejectedLine, STORE_REJECTED_TEXT_MAX_BYTES};
 #[doc(inline)]

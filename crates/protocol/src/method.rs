@@ -10,7 +10,6 @@ use serde::Serialize;
 
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, CommandRunParams, CommandRunResult,
-    SetupResolveParams, SetupResolveResult,
     DaemonDoctorResult, DaemonHealthResult, HostCapabilities, HostDiscoverParams,
     HostGovernanceStatus, HostRecord, HostResolution, HostResolveParams, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationInstallParams, IntegrationInstallResult,
@@ -38,8 +37,8 @@ use crate::{
     SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
     SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, SetupResolveParams,
+    SetupResolveResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.

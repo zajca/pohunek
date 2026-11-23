@@ -178,8 +178,12 @@ impl CommandErrorKind {
             }
             Self::OutputNotUtf8 => "fix the program so it writes UTF-8",
             Self::Unavailable => "run `pohunek plugin doctor` on the host and retry",
-            Self::SetupNotDeclared => "check the package id and setup name with `pohunek plugin inspect`",
-            Self::SetupNotLocal => "run `pohunek plugin run` on the host itself, not over the overlay",
+            Self::SetupNotDeclared => {
+                "check the package id and setup name with `pohunek plugin inspect`"
+            }
+            Self::SetupNotLocal => {
+                "run `pohunek plugin run` on the host itself, not over the overlay"
+            }
         }
     }
 

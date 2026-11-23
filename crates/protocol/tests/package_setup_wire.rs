@@ -91,7 +91,10 @@ fn an_install_result_without_setup_entries_omits_the_field() {
         "reloaded": true
     });
     let parsed: PackageInstallResult = serde_json::from_value(value).expect("a pre-setup result");
-    assert!(parsed.setup.is_empty(), "a result without the key has no entries");
+    assert!(
+        parsed.setup.is_empty(),
+        "a result without the key has no entries"
+    );
     let encoded = serde_json::to_value(&parsed).expect("serialize");
     assert!(
         encoded.get("setup").is_none(),
@@ -129,7 +132,10 @@ fn the_setup_and_program_refusals_have_their_wire_codes() {
         CommandErrorKind::SetupNotDeclared.code(),
         "command_setup_not_declared"
     );
-    assert_eq!(CommandErrorKind::SetupNotLocal.code(), "command_setup_not_local");
+    assert_eq!(
+        CommandErrorKind::SetupNotLocal.code(),
+        "command_setup_not_local"
+    );
     assert_eq!(
         PackageErrorKind::ProfileProgramInvalid.code(),
         "package_profile_program_invalid"

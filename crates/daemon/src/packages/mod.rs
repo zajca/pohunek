@@ -56,10 +56,9 @@ use package::{
 };
 use protocol::{
     CommandErrorKind, CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind,
-    PackageFinding,
-    PackageFindingKind, PackageId, PackageIdentity, PackageInfo, PackageInspectResult,
-    PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
-    PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
+    PackageFinding, PackageFindingKind, PackageId, PackageIdentity, PackageInfo,
+    PackageInspectResult, PackageInstallParams, PackageInstallResult, PackageInstallStatus,
+    PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
     PackageSelectionBlock, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
     PackageUninstallResult, PluginIndexApplyParams, PluginIndexApplyResult, ProtocolError,
     SetupInfo, SetupResolveParams, SetupResolveResult,

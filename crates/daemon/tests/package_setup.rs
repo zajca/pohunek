@@ -21,8 +21,7 @@ use futures::{SinkExt, StreamExt};
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
 use protocol::{
     method, PackageCreateProfileResult, PackageCreateProfileStatus, PackageInspectResult,
-    PackageInstallResult, ProtocolError, Request as ProtocolRequest, Response,
-    SetupResolveResult,
+    PackageInstallResult, ProtocolError, Request as ProtocolRequest, Response, SetupResolveResult,
 };
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -270,7 +269,11 @@ where
 }
 
 /// Calls `method` and returns the error it is refused with.
-async fn refused<S>(framed: &mut Framed<S, LinesCodec>, method: &str, params: Value) -> ProtocolError
+async fn refused<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    method: &str,
+    params: Value,
+) -> ProtocolError
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -366,10 +369,7 @@ fn setup_table() -> String {
 /// The program the entry runs. It records that it ran, so a scenario can tell
 /// a resolution from a run.
 fn program_script(work: &Path) -> String {
-    format!(
-        "#!/bin/sh\n: > \"{}/{RAN_MARKER}\"\n",
-        work.display()
-    )
+    format!("#!/bin/sh\n: > \"{}/{RAN_MARKER}\"\n", work.display())
 }
 
 /// The archive entries of a package whose descriptor is `document`.
@@ -446,10 +446,7 @@ where
 }
 
 /// Installs the fixture enabled and selected, with the opt-in the review needs.
-async fn install_fixture<S>(
-    framed: &mut Framed<S, LinesCodec>,
-    servers: &Servers,
-) -> PackageDigest
+async fn install_fixture<S>(framed: &mut Framed<S, LinesCodec>, servers: &Servers) -> PackageDigest
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -705,13 +702,14 @@ async fn a_descriptor_that_misuses_the_setup_table_is_refused_at_install() {
             descriptor("", &setup_table()),
             FEATURE_UNSUPPORTED,
         ),
-        ("a setup entry without a runtime", setup_only, DESCRIPTOR_INVALID),
+        (
+            "a setup entry without a runtime",
+            setup_only,
+            DESCRIPTOR_INVALID,
+        ),
         (
             "an unknown key in the entry",
-            descriptor(
-                SETUP_FEATURE,
-                &format!("{}extra = true\n", setup_table()),
-            ),
+            descriptor(SETUP_FEATURE, &format!("{}extra = true\n", setup_table())),
             DESCRIPTOR_INVALID,
         ),
         (
@@ -724,10 +722,7 @@ async fn a_descriptor_that_misuses_the_setup_table_is_refused_at_install() {
         ),
         (
             "a program that is not an executable of the package",
-            descriptor(
-                SETUP_FEATURE,
-                &setup_table().replace(PROGRAM, "bin/absent"),
-            ),
+            descriptor(SETUP_FEATURE, &setup_table().replace(PROGRAM, "bin/absent")),
             DESCRIPTOR_INVALID,
         ),
         (
@@ -790,11 +785,7 @@ async fn a_profile_program_creates_a_profile_and_a_refused_one_writes_nothing() 
         "the composed profile names the program: {}",
         created.text
     );
-    assert_eq!(
-        listing(&servers.agents),
-        before,
-        "a dry run writes nothing"
-    );
+    assert_eq!(listing(&servers.agents), before, "a dry run writes nothing");
 
     let refusals: Vec<(&str, PathBuf)> = {
         let relative = PathBuf::from("bin/tool");

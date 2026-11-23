@@ -105,7 +105,7 @@ pub fn lint(args: &LintArgs) -> Result<LintReport, Error> {
     let context_dir = descriptor.context_dir().is_some();
     let has_commands = !descriptor.commands().is_empty();
     let runtime_id = match descriptor.into_parts() {
-        (Some(definition), _commands) => {
+        (Some(definition), _commands, _setup) => {
             let BindingProvenance::Package { package, .. } = &definition.binding().provenance
             else {
                 return Err(Error::Usage(
@@ -119,7 +119,7 @@ pub fn lint(args: &LintArgs) -> Result<LintReport, Error> {
             }
             Some(definition.runtime_id().clone())
         }
-        (None, _commands) => None,
+        (None, _commands, _setup) => None,
     };
     let kind = match (&runtime_id, context_dir, has_commands) {
         (Some(_), _, _) => PackageKind::Runtime,
