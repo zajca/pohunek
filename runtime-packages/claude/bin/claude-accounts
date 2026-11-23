@@ -30,15 +30,34 @@ CLAUDE_MIN_VERSION=2.1.318
 POHUNEK_BIN=pohunek
 CLEAR_SCREEN='\033[H\033[2J\033[3J'
 
+# The daemon refuses a parent profile with more choices than this, and every
+# account is one choice.
+MAX_ACCOUNTS=32
+# How long the pending-input drain waits for more pasted bytes, in tenths of a
+# second, and how many bytes it discards at most.
+DRAIN_WAIT_TENTHS=2
+DRAIN_MAX_BYTES=4096
+
 TMP_FILE=''
 OPTIONS_FILE=''
 STTY_SAVED=''
+# Set while `claude setup-token` output may be on screen.
+TOKEN_ON_SCREEN=0
+
+# Clears the screen and the scrollback once the token may have been shown.
+clear_token_screen() {
+    if [ "$TOKEN_ON_SCREEN" -eq 1 ]; then
+        printf "$CLEAR_SCREEN" >&2
+        TOKEN_ON_SCREEN=0
+    fi
+}
 
 cleanup() {
     if [ -n "$STTY_SAVED" ]; then
         stty "$STTY_SAVED" 2>/dev/null || :
         STTY_SAVED=''
     fi
+    clear_token_screen
     if [ -n "$TMP_FILE" ]; then
         rm -f -- "$TMP_FILE"
     fi
@@ -114,7 +133,7 @@ mode_matches() {
 # with its prefix.
 valid_name() {
     case $1 in
-        '' | *[!a-z0-9-]*) return 1 ;;
+        '' | -* | *[!a-z0-9-]*) return 1 ;;
     esac
     [ "${#1}" -le "$NAME_MAX_BYTES" ] || return 1
     [ "$1" != acct ] || return 1
@@ -230,6 +249,28 @@ profile_listed() {
     printf '%s' "$1" | tr -d '\n' | tr '}' '\n' | grep -q -E "\"name\": *\"$2\""
 }
 
+# Prints the listing entry of the named profile, or nothing.
+profile_entry() {
+    printf '%s' "$1" | tr -d '\n' | tr '}' '\n' | grep -E "\"name\": *\"$2\"" | awk 'NR == 1'
+}
+
+# Refuses, before any token is stored, a profile name this tool must not take
+# over: `claude-acct` must be a profile over the claude base, and `claude-<name>`
+# must be a preset of `claude-acct`. It also proves the daemon answers.
+preflight_profiles() {
+    listing=$("$POHUNEK_BIN" plugin profile list --json --all) \
+        || fail "the Pohunek daemon did not list the profiles"
+    if profile_listed "$listing" "$PARENT_PROFILE"; then
+        profile_entry "$listing" "$PARENT_PROFILE" | grep -q -E '"base": *"claude"' \
+            || fail "a profile named $PARENT_PROFILE exists and is not a Claude profile; this tool owns that name"
+    fi
+    preset=$PRESET_PREFIX$1
+    if profile_listed "$listing" "$preset"; then
+        profile_entry "$listing" "$preset" | grep -q -E "\"preset_of\": *\"$PARENT_PROFILE\"" \
+            || fail "a profile named $preset exists and is not a preset of $PARENT_PROFILE"
+    fi
+}
+
 # Writes the parent profile and one locked preset per account through the
 # daemon. The profile is replaced with the digest the listing reports, so a
 # digest change between the two calls is refused by the daemon, not overwritten.
@@ -264,6 +305,10 @@ read_hidden_line() {
     stty -echo
     printf 'Paste the token (input hidden), then press Enter: ' >&2
     IFS= read -r TOKEN_LINE || :
+    # Bytes that followed the first line (a wrapped paste) are discarded here,
+    # so they never reach the owner's shell after this program exits.
+    stty -icanon min 0 time "$DRAIN_WAIT_TENTHS" 2>/dev/null || :
+    dd bs="$DRAIN_MAX_BYTES" count=1 of=/dev/null 2>/dev/null || :
     stty "$STTY_SAVED"
     STTY_SAVED=''
     printf '\n' >&2
@@ -298,7 +343,11 @@ cmd_add() {
     login_file=$ACCOUNTS_DIR/$name.login
     if [ -e "$token_file" ] || [ -L "$token_file" ] || [ -e "$login_file" ] || [ -L "$login_file" ]; then
         [ "$replace" -eq 1 ] || fail "account $name exists; pass --replace to change it"
+    else
+        existing=$(account_names | awk 'END { print NR }')
+        [ "$existing" -lt "$MAX_ACCOUNTS" ] || fail "at most $MAX_ACCOUNTS accounts are supported"
     fi
+    preflight_profiles "$name"
 
     if [ "$login" -eq 1 ]; then
         for other in "$ACCOUNTS_DIR"/*.login; do
@@ -312,6 +361,7 @@ cmd_add() {
     else
         command -v claude >/dev/null 2>&1 || fail "claude is not on PATH"
         printf 'Sign in to %s in the browser that opens; then copy the token that setup-token prints.\n' "$name" >&2
+        TOKEN_ON_SCREEN=1
         claude setup-token || fail "claude setup-token did not finish"
         read_hidden_line
         token_len=${#TOKEN_LINE}
@@ -333,7 +383,7 @@ cmd_add() {
         done
         mv -f -- "$TMP_FILE" "$token_file"
         TMP_FILE=''
-        printf "$CLEAR_SCREEN" >&2
+        clear_token_screen
     fi
 
     # Replacing an account of the other kind must not leave its old file behind.

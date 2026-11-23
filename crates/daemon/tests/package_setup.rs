@@ -797,8 +797,17 @@ async fn a_profile_program_creates_a_profile_and_a_refused_one_writes_nothing() 
         std::os::unix::fs::symlink(&tool, &link).expect("symlink the program");
         let plain = servers.work.join("plain");
         std::fs::write(&plain, "data\n").expect("write a non-executable file");
+        let shared = servers.work.join("shared");
+        std::fs::create_dir(&shared).expect("create a shared directory");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770))
+            .expect("make the directory group-writable");
+        let shared_tool = shared.join("tool");
+        std::fs::copy(&tool, &shared_tool).expect("copy the program into the shared directory");
+        std::fs::set_permissions(&shared_tool, std::fs::Permissions::from_mode(0o755))
+            .expect("make the copy executable");
         vec![
             ("a relative path", relative),
+            ("a program in a group-writable directory", shared_tool),
             ("a world-writable file", writable),
             ("a symbolic link", link),
             ("a file that is not executable", plain),

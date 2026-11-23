@@ -56,6 +56,10 @@ const EXECUTABLE_BITS: u32 = 0o111;
 /// program, so a program that has any of them is refused.
 const GROUP_OR_OTHER_WRITE_BITS: u32 = 0o022;
 
+/// The sticky bit of a directory: only the owner of an entry can rename or
+/// remove it, so a shared directory with it cannot swap an owner-only program.
+const STICKY_BIT: u32 = 0o1000;
+
 impl PackageService {
     /// Creates the host agent profile `params.profile`.
     ///
@@ -182,9 +186,29 @@ fn is_trusted_program_file(program: &str) -> bool {
     #[expect(unsafe_code, reason = "libc::geteuid FFI; SAFETY documented above")]
     let euid = unsafe { libc::geteuid() };
     let mode = meta.permissions().mode();
-    (meta.uid() == euid || meta.uid() == 0)
+    let file_trusted = (meta.uid() == euid || meta.uid() == 0)
         && mode & EXECUTABLE_BITS != 0
-        && mode & GROUP_OR_OTHER_WRITE_BITS == 0
+        && mode & GROUP_OR_OTHER_WRITE_BITS == 0;
+    file_trusted
+        && std::path::Path::new(program)
+            .ancestors()
+            .skip(1)
+            .all(|directory| is_trusted_program_directory(directory, euid))
+}
+
+/// Whether `directory` is owned by `euid` or root and cannot be rewritten by
+/// anyone else: no group or other write bit, unless the sticky bit stops
+/// another user from renaming the entries of an owner-only file's directory.
+fn is_trusted_program_directory(directory: &std::path::Path, euid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(meta) = std::fs::metadata(directory) else {
+        return false;
+    };
+    let mode = meta.permissions().mode();
+    meta.is_dir()
+        && (meta.uid() == euid || meta.uid() == 0)
+        && (mode & GROUP_OR_OTHER_WRITE_BITS == 0 || mode & STICKY_BIT != 0)
 }
 
 /// Validates, composes and publishes the profile under the lifecycle authority

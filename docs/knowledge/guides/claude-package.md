@@ -201,8 +201,13 @@ Storage and generated files:
   preset that already exists is kept as it is.
 - The generated wrapper reads the account named by `CLAUDE_ACCOUNT`, and execs the real
   `claude` with the stored token in `CLAUDE_CODE_OAUTH_TOKEN` (token accounts). The
-  token goes into the environment of that process only, never into argv or a file.
-  A login account launches with the stored login of the shared config home.
+  token never goes into argv or a file, but the Claude process passes its
+  environment on: Bash tool commands, hooks and stdio MCP servers of a token
+  account inherit `CLAUDE_CODE_OAUTH_TOKEN`, so an agent in that session can read it
+  with `env`. Setting `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` in the profile `[env]`
+  strips credentials from those subprocesses; it is off by default because it also
+  isolates Bash subprocesses in a PID namespace on Linux and removes other
+  variables, and the wrapper does not set it. A login account launches with the stored login of the shared config home.
   `--version` passes straight through, so the version probe needs no account.
 
 Precedence and refusals the wrapper enforces before it starts Claude:

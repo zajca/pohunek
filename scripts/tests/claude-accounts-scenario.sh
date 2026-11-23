@@ -253,6 +253,7 @@ reset_transcript
 printf 'short\n' > "$next_token"
 run_pty "short" "$setup" add tiny || true
 check "a value outside the length bounds is refused" absent "$acc/tiny.token"
+check "the screen is cleared after a refused paste" contains "$transcript" "[2J"
 
 # --replace changes the value.
 reset_transcript
@@ -262,12 +263,30 @@ check "--replace keeps the file at mode 0600" mode_is "$acc/personal.token" 600
 
 # A listing that reports the parent profile digest makes the next create replace it.
 digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-printf '{"profiles":[{"name":"claude-acct","file_digest":"%s"}],"hidden":0,"truncated":false}\n' "$digest" > "$root/listing.json"
+printf '{"profiles":[{"name":"claude-acct","base":"claude","file_digest":"%s"}],"hidden":0,"truncated":false}\n' "$digest" > "$root/listing.json"
 reset_transcript
 printf '%s\n' "$TOKEN_C" > "$next_token"
 run_pty "$TOKEN_C" "$setup" add side
 check "the parent profile is replaced with the listed digest" contains "$pohunek_log" "[--replace] [$digest]"
 check "a new account stores its value" contains "$acc/side.token" "$TOKEN_C"
+
+# A name that starts with a dash is refused before anything is stored.
+reset_transcript
+run_pty "" "$setup" add -x || true
+check "a leading dash in the name is refused" absent "$acc/-x.token"
+
+# A profile that already holds a preset name, and is not a preset of the parent,
+# is refused before the token is asked for.
+printf '{"profiles":[{"name":"claude-acct","base":"claude","file_digest":"%s"},{"name":"claude-other","base":"claude"}],"hidden":0,"truncated":false}\n' "$digest" > "$root/listing.json"
+reset_transcript
+run_pty "$TOKEN_C" "$setup" add other || true
+check "an unrelated profile under the preset name is refused" absent "$acc/other.token"
+
+# An unrelated profile under the parent name is refused as well.
+printf '{"profiles":[{"name":"claude-acct","base":"shell","file_digest":"%s"}],"hidden":0,"truncated":false}\n' "$digest" > "$root/listing.json"
+reset_transcript
+run_pty "$TOKEN_C" "$setup" add third || true
+check "a parent name held by another profile is refused" absent "$acc/third.token"
 rm -f "$root/listing.json"
 
 # ----------------------------------------------------------------- wrapper
