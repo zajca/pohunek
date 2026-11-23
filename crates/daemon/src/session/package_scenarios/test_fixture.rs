@@ -195,6 +195,37 @@ impl Package {
     }
 }
 
+impl Package {
+    /// Like [`Self::build`], with `requires` added after `runtime_api` and
+    /// `tables` appended to the descriptor, next to the command fixture files.
+    pub(super) fn build_with_export(
+        package: &str,
+        version: &str,
+        runtime: &str,
+        requires: &str,
+        tables: &str,
+    ) -> Self {
+        let base = Self::build(package, version, runtime, INERT_PROGRAM);
+        let mut entries = read_archive(&base.bytes, &Limits::DEFAULT)
+            .expect("the fixture archive reads")
+            .entries()
+            .to_vec();
+        for entry in &mut entries {
+            if entry.path == "runtime.toml" {
+                let text = String::from_utf8(entry.contents.clone()).expect("utf-8 descriptor");
+                let text = text.replacen(
+                    "runtime_api = 1\n",
+                    &format!("runtime_api = 1\nrequires = [{requires}]\n"),
+                    1,
+                );
+                entry.contents = format!("{text}{tables}").into_bytes();
+            }
+        }
+        entries.extend(command_files());
+        Self::from_entries(&entries)
+    }
+}
+
 /// A command-only descriptor: the header, `requires` when `gated`, then
 /// `commands`.
 pub(super) fn commands_document(
@@ -214,7 +245,7 @@ pub(super) fn commands_document(
 }
 
 /// The programs the fixture commands name: one executable, one not.
-fn command_files() -> Vec<ArchiveEntry> {
+pub(super) fn command_files() -> Vec<ArchiveEntry> {
     vec![
         ArchiveEntry {
             path: COMMAND_PROGRAM.to_owned(),

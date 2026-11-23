@@ -168,18 +168,18 @@ impl Kind {
             })
             .collect();
         let descriptor = edit(rewritten.join("\n"));
-        Package::from_entries(&[
-            package::ArchiveEntry {
-                path: crate::agent::host::RUNTIME_DESCRIPTOR_PATH.to_owned(),
-                contents: descriptor.into_bytes(),
-                executable: false,
-            },
-            package::ArchiveEntry {
-                path: "detect.toml".to_owned(),
-                contents: detect.as_bytes().to_vec(),
-                executable: false,
-            },
-        ])
+        let mut entries = crate::agent::host::fixture::setup_stand_ins(&descriptor);
+        entries.push(package::ArchiveEntry {
+            path: crate::agent::host::RUNTIME_DESCRIPTOR_PATH.to_owned(),
+            contents: descriptor.into_bytes(),
+            executable: false,
+        });
+        entries.push(package::ArchiveEntry {
+            path: "detect.toml".to_owned(),
+            contents: detect.as_bytes().to_vec(),
+            executable: false,
+        });
+        Package::from_entries(&entries)
     }
 
     fn older(&self) -> Package {

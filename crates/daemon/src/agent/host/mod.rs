@@ -24,6 +24,7 @@ mod naming;
 mod package;
 mod placement;
 mod registry;
+mod setup;
 mod source;
 mod transcripts;
 

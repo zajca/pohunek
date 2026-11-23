@@ -3956,6 +3956,8 @@ fn host_capabilities_json_shape_roundtrips() {
         package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
         package_index_apply_supported: true,
+        package_setup_supported: true,
+        package_create_profile_program_supported: true,
         host_hooks: None,
         runtime_api: Some(1),
         runtime_features: vec!["launch-env-v1".to_owned()],
@@ -4007,6 +4009,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "package_remove_profile_supported": true,
             "integration_agent_skill_supported": true,
             "package_index_apply_supported": true,
+            "package_setup_supported": true,
+            "package_create_profile_program_supported": true,
             "runtime_api": 1,
             "runtime_features": ["launch-env-v1"]
         })
@@ -4164,6 +4168,14 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.integration_agent_skill_supported,
         "a host that omits the agent-skill flag rejects skill and skill_only"
+    );
+    assert!(
+        !caps.package_setup_supported,
+        "a host that omits the setup flag refuses `plugin run` with setup_unsupported"
+    );
+    assert!(
+        !caps.package_create_profile_program_supported,
+        "a host that omits the program flag gets nothing sent for `--program`"
     );
 }
 

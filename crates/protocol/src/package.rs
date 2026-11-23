@@ -1023,6 +1023,10 @@ pub enum PackageErrorKind {
     ProfileHomeInvalid,
     /// The base runtime declares no config home, so it takes no `home`.
     ProfileHomeUnsupported,
+    /// The program is not an absolute path of plain components naming a
+    /// regular executable file that its owner or root owns and nobody else can
+    /// write, or it is a symbolic link; nothing was written.
+    ProfileProgramInvalid,
     /// The agents directory or one of its ancestors is a symbolic link or is
     /// not owner-private; nothing was written.
     ProfileDirUnsafe,
@@ -1101,6 +1105,7 @@ impl PackageErrorKind {
             Self::ProfileCredentialLiteral => "package_profile_credential_literal",
             Self::ProfileHomeInvalid => "package_profile_home_invalid",
             Self::ProfileHomeUnsupported => "package_profile_home_unsupported",
+            Self::ProfileProgramInvalid => "package_profile_program_invalid",
             Self::ProfileDirUnsafe => "package_profile_dir_unsafe",
             Self::ProfileBuiltin => "package_profile_builtin",
             Self::ProfilePackageRuntime => "package_profile_package_runtime",
@@ -1187,6 +1192,9 @@ impl PackageErrorKind {
             }
             Self::ProfileHomeUnsupported => {
                 "the base runtime declares no config home, so the profile takes no home"
+            }
+            Self::ProfileProgramInvalid => {
+                "the program must be an absolute executable file that only its owner or root can write, not a symbolic link"
             }
             Self::ProfileDirUnsafe => {
                 "the agents directory or one of its ancestors is a symbolic link or not private to the owner"
@@ -1279,6 +1287,9 @@ impl PackageErrorKind {
                 "pass an absolute path without `~`, `.` or `..` components"
             }
             Self::ProfileHomeUnsupported => "create the profile without `--home`",
+            Self::ProfileProgramInvalid => {
+                "pass the absolute path of the executable itself, not a link, and make it writable by you only"
+            }
             Self::ProfileDirUnsafe => {
                 "make the agents directory a real directory owned by you and writable by you only"
             }
@@ -1443,6 +1454,7 @@ mod tests {
             PackageErrorKind::ProfileCredentialLiteral,
             PackageErrorKind::ProfileHomeInvalid,
             PackageErrorKind::ProfileHomeUnsupported,
+            PackageErrorKind::ProfileProgramInvalid,
             PackageErrorKind::ProfileDirUnsafe,
             PackageErrorKind::ProfileBuiltin,
             PackageErrorKind::ProfilePackageRuntime,
