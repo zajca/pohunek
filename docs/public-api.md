@@ -3162,8 +3162,9 @@ not apply are `null`. `result` is one of:
   the old version stays installed. The daemon verifies the signed index and the
   archive digest for it, as for `pohunek setup`;
 - `not_published`: the index lists no version newer than the selected one for the
-  new core (the package is published after the core release, and the official
-  index lists it only once it is admitted), so the old package is kept;
+  new core and this host's platform (the package is published after the core
+  release, and the official index lists it only once it is admitted), so the old
+  package is kept;
   `command` is `pohunek setup`;
 - `held`: the selected version is disabled, or a version is installed and none
   is selected (no index request is made), or the listed version is installed

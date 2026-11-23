@@ -397,6 +397,42 @@ async fn an_unpublished_package_is_reported_and_the_old_one_stays() {
     assert_eq!(selected.digest, archive.digest.as_str());
 }
 
+/// An index that lists the package only for a core this build is not in, or
+/// only for another platform, is "not published" for this host, not a failure.
+#[tokio::test]
+async fn an_entry_for_another_core_or_platform_is_not_published() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    let archive = assistant_index::assistant_archive(VERSION, VERSION);
+    let path = assistant_index::archive_path(VERSION);
+
+    // The only entry needs a core far above this build.
+    let mut entry = assistant_index::assistant_entry(&archive, VERSION, rig.server.url(&path));
+    entry.core = format!(">={FUTURE_VERSION}");
+    rig.server.set(INDEX_PATH, rig.keys.signed(vec![entry]));
+    let document = document_of_upgrade(&rig).await;
+    assert_eq!(
+        install_of(&document)["result"],
+        "not_published",
+        "{document}"
+    );
+    assert!(rig.listed().await.is_empty());
+
+    // The only entry is for a platform this host is not.
+    let mut entry = assistant_index::assistant_entry(&archive, VERSION, rig.server.url(&path));
+    entry.platforms = vec!["unlisted-os-unlisted-arch".to_owned()];
+    rig.server.set(INDEX_PATH, rig.keys.signed(vec![entry]));
+    let document = document_of_upgrade(&rig).await;
+    assert_eq!(
+        install_of(&document)["result"],
+        "not_published",
+        "{document}"
+    );
+    assert!(rig.listed().await.is_empty());
+}
+
 /// An index or an archive that cannot be fetched, a signature the host does
 /// not trust and an archive whose bytes are not the listed digest are refused
 /// without a change, and a later good index installs: a refused install does

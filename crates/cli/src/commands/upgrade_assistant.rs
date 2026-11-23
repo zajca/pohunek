@@ -150,7 +150,12 @@ async fn install(
     };
     let resolved = match plugin_index::resolve(&wanted, options.index_url, None).await {
         Ok(resolved) => resolved,
-        Err(Error::IndexPackageNotFound { .. } | Error::IndexVersionNotFound { .. }) => {
+        Err(error)
+            if plugin_index::is_unlisted_for_core(&error)
+                || matches!(error, Error::IndexPlatformUnsupported { .. }) =>
+        {
+            // No entry fits this core or this platform: the index does not
+            // publish the package for this host yet.
             return not_published(core, selected_version);
         }
         Err(error) => return failed(error.to_string()),

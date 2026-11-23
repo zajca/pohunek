@@ -315,13 +315,13 @@ fn serve_remote_missing_package(
     });
 }
 
-/// Linux-only with `serve_remote_missing_package`, its only caller.
-#[cfg(target_os = "linux")]
-fn serve_remote_connection(
-    stream: std::net::TcpStream,
+/// Serves the fixture answers on any byte stream, a TCP peer for the remote
+/// scenario or a Unix socket for the local one, and records each method.
+fn serve_remote_connection<S: std::io::Read + std::io::Write>(
+    stream: S,
     served: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
-    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::io::{BufRead as _, BufReader};
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -525,6 +525,85 @@ async fn s4_remote_host_installs_nothing_against_the_index() {
         rig.server.requests().is_empty(),
         "no install is attempted against the index: {:?}",
         rig.server.requests()
+    );
+    assert!(rig.listed().await.is_empty(), "nothing installed");
+}
+
+/// A local launch against a daemon that still answers the N-1 placeholder
+/// remedy: the CLI prints the plan's outcome for an empty index, never the
+/// daemon's placeholder text. The scripted daemon owns the socket the CLI
+/// dials; the real daemon of the rig only supplies the trust anchor and the
+/// index.
+#[tokio::test]
+async fn s5_old_daemon_placeholder_hint_never_reaches_the_local_output() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let rig = Rig::start().await;
+    rig.publish_nothing();
+    let root = rig.install.env.root().to_path_buf();
+    let runtime = root.join("old-daemon-run");
+    std::fs::create_dir_all(runtime.join("pohunek")).expect("create the socket directory");
+    std::fs::set_permissions(
+        runtime.join("pohunek"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make the socket directory owner-private");
+    let listener = std::os::unix::net::UnixListener::bind(runtime.join("pohunek/daemon.sock"))
+        .expect("bind the old daemon socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let accepting = std::sync::Arc::clone(&served);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept a fixture connection");
+            let served = std::sync::Arc::clone(&accepting);
+            std::thread::spawn(move || serve_remote_connection(stream, &served));
+        }
+    });
+    let url = rig.url();
+    let output = rig
+        .install
+        .env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", &url)
+        .args([
+            "assistant",
+            "--agent",
+            "fixture-agent",
+            "--print-prompt",
+            "--no-snapshot",
+            "--no-start-daemon",
+            "--yes",
+            "--json",
+            "help me",
+        ])
+        .output()
+        .expect("run pohunek assistant");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    let document: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("stdout is one JSON document ({error}): {combined}"));
+    assert!(!output.status.success(), "{combined}");
+    assert_eq!(
+        document["err"]["code"], "assistant_package_missing",
+        "{combined}"
+    );
+    assert!(
+        combined.contains("pohunek assistant setup"),
+        "the plan outcome names the runnable command: {combined}"
+    );
+    for needle in ["<archive>", "<digest>", "--sha256 <digest>"] {
+        assert!(
+            !combined.contains(needle),
+            "the old placeholder never reaches the output: {combined}"
+        );
+    }
+    let served = served.lock().expect("served requests").clone();
+    assert!(
+        served
+            .iter()
+            .any(|served| served == protocol::method::ASSISTANT_MATERIALIZE),
+        "materialize reached the old daemon: {served:?}"
     );
     assert!(rig.listed().await.is_empty(), "nothing installed");
 }
