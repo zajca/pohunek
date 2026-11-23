@@ -944,7 +944,7 @@ async fn apply_steps(
 
     let assistant_gap = match (&plan.preview.assistant, &plan.assistant_index) {
         (Some(step), Some(index)) => {
-            match setup_assistant::apply(&mut client, step, index.url()).await {
+            match setup_assistant::apply(&mut client, step, index.url(), None).await {
                 AssistantOutcome::Installed(line) => {
                     applied.push(line);
                     None

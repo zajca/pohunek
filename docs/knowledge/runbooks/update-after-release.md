@@ -537,9 +537,9 @@ lists for the new core and prints an `assistant` line (and `--json` an
 `assistant` object with `install.result`). An index that does not list it yet
 gives `not_published`, and `pohunek setup` installs it later; a package you
 disabled or did not select stays as set; `--no-assistant-package` skips the
-step on a host without access to the index. Without the index, `pohunek plugin update pohunek.context.assistant
-<archive> --sha256 <digest>` installs and selects it (a plain `plugin install` leaves the old version
-selected); see `docs/install.md`, "Install the assistant package", and the
+step on a host without access to the index. When the index cannot be
+reached, rerun `pohunek assistant setup` (or `pohunek setup`) once it can;
+see `docs/install.md`, "Install the assistant package", and the
 [context package guide](../guides/runtime-packages.md#declaring-a-context-package).
 When the assistant feature is available, its update intent should compare the
 snapshot's `pohunek_version` and the package version in the prompt with the

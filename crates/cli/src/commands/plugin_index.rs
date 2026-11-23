@@ -67,6 +67,21 @@ pub(crate) fn official_index_url_v2() -> String {
 /// Core version an entry's `core` range is matched against: this build's.
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The core version `core_override` names, or this build's when `None`.
+/// The owned value lives in `owned` so the borrow outlives the call.
+fn or_own_core<'a>(
+    core_override: Option<&'a Version>,
+    owned: &'a mut Version,
+) -> Result<&'a Version, Error> {
+    if let Some(core) = core_override {
+        return Ok(core);
+    }
+    *owned = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
+        detail: "this build has no semantic version to match entries against".to_owned(),
+    })?;
+    Ok(owned)
+}
+
 /// Longest wait for a connection to be established.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -357,6 +372,11 @@ pub(crate) fn wanted_kind(request: &PackageRef) -> IndexEntryKind {
 /// With a pinned version the exact entry is chosen; otherwise the highest
 /// semantic version. An entry whose version is not semantic is never chosen
 /// by the unpinned form.
+///
+/// An empty candidate set distinguishes three causes so callers never claim a
+/// core-specific reason without checking: no entry names the id at all,
+/// entries name it but none supports `core`, or entries support `core` but
+/// not `platform`.
 fn select<'a>(
     entries: &'a [IndexEntry],
     request: &PackageRef,
@@ -373,7 +393,22 @@ fn select<'a>(
         })
         .collect();
     if candidates.is_empty() {
-        return Err(Error::IndexPackageNotFound {
+        let wanted = wanted_kind(request);
+        let named = entries
+            .iter()
+            .filter(|entry| entry.package_id == request.id && entry.kind() == wanted);
+        if named.clone().next().is_none() {
+            return Err(Error::IndexPackageNotFound {
+                package: request.id.to_string(),
+            });
+        }
+        if named.clone().all(|entry| !entry.core_supports(core)) {
+            return Err(Error::IndexCoreUnsupported {
+                package: request.id.to_string(),
+                core: core.to_string(),
+            });
+        }
+        return Err(Error::IndexPlatformUnsupported {
             package: request.id.to_string(),
         });
     }
@@ -422,15 +457,16 @@ struct Selection {
 }
 
 /// Fetch the index at `index_url` (the official one when `None`) and select
-/// the entry `request` resolves to for this core version and platform.
+/// the entry `request` resolves to for `core_override` (this build's core
+/// version when `None`) on this platform.
 async fn select_entry(
     client: &Client,
     request: &PackageRef,
     index_url: Option<&str>,
+    core_override: Option<&Version>,
 ) -> Result<Selection, Error> {
-    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
-        detail: "this build has no semantic version to match entries against".to_owned(),
-    })?;
+    let mut owned = Version::new(0, 0, 0);
+    let core = or_own_core(core_override, &mut owned)?;
     let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
     let index_bytes = match index_url {
         Some(url) => fetch(client, &checked_url(url)?, Download::Index).await?,
@@ -442,7 +478,7 @@ async fn select_entry(
     if unix_now() >= envelope.index.expires_at {
         return Err(Error::IndexExpired);
     }
-    let entry = select(&envelope.index.entries, request, &core, &platform)?.clone();
+    let entry = select(&envelope.index.entries, request, core, &platform)?.clone();
     Ok(Selection { index_bytes, entry })
 }
 
@@ -457,7 +493,8 @@ impl Selection {
 }
 
 /// Fetch the index at `index_url` (the official one when `None`) and resolve
-/// `request` without downloading the archive.
+/// `request` without downloading the archive, matching entries against
+/// `core_override` (this build's core version when `None`).
 ///
 /// The result is what the unverified index claims; the daemon verifies the
 /// signature, revocations, freshness and digest when the package installs.
@@ -468,9 +505,12 @@ impl Selection {
 pub(crate) async fn resolve(
     request: &PackageRef,
     index_url: Option<&str>,
+    core_override: Option<&Version>,
 ) -> Result<Resolved, Error> {
     let client = client()?;
-    Ok(select_entry(&client, request, index_url).await?.resolved())
+    Ok(select_entry(&client, request, index_url, core_override)
+        .await?
+        .resolved())
 }
 
 /// Fetch the index at `index_url` (the official one when `None`), resolve
@@ -511,34 +551,61 @@ async fn stage_from_selection(client: &Client, selection: Selection) -> Result<S
 }
 
 /// Stage the archive for `request` from the stored index copy, with no index
-/// fetch. Fails when nothing usable is stored or the package is not listed.
-pub(crate) async fn stage_from_stored(request: &PackageRef) -> Result<Staged, Error> {
+/// fetch, matching against `core_override` (this build's core version when
+/// `None`). Fails when nothing usable is stored or the package is not listed.
+pub(crate) async fn stage_from_stored(
+    request: &PackageRef,
+    core_override: Option<&Version>,
+) -> Result<Staged, Error> {
     let client = client()?;
     let stored = read_stored(wanted_kind(request)).ok_or(Error::IndexInvalid {
         detail: "no stored index document to install from".to_owned(),
     })?;
-    let selection = select_from_bytes(&stored.bytes, request)?;
+    let selection = select_from_bytes(&stored.bytes, request, core_override)?;
     stage_from_selection(&client, selection).await
 }
 
-/// Whether this error means "the index does not list this package or
+/// Whether this error means "the stored copy does not list this package or
 /// version": the result the CLI fallback may retry against a fresh fetch.
 ///
-/// Digest mismatches, archive availability, refused URLs, platform and
-/// expiry failures are fatal: re-fetching cannot fix them, so they are
-/// surfaced instead of retried.
+/// Digest mismatches, archive availability, refused URLs and expiry failures
+/// are fatal: re-fetching cannot fix them, so they are surfaced instead of
+/// retried. A fresh fetch may list a package the stored copy lacks, support
+/// a new core version, or add a platform, so all four listing failures retry.
 #[must_use]
 pub(crate) fn is_not_listed(error: &Error) -> bool {
     matches!(
         error,
-        Error::IndexPackageNotFound { .. } | Error::IndexVersionNotFound { .. }
+        Error::IndexPackageNotFound { .. }
+            | Error::IndexVersionNotFound { .. }
+            | Error::IndexCoreUnsupported { .. }
+            | Error::IndexPlatformUnsupported { .. }
     )
 }
 
-/// Fetch the index and select the entry for `request`. One fetch.
-pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
+/// Whether this error means "the index lists no entry of this package the
+/// core version can use": the id is absent, the pinned version is absent,
+/// or no entry supports the core. Platform-only and other failures are
+/// fatal, not unlisted.
+#[must_use]
+pub(crate) fn is_unlisted_for_core(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::IndexPackageNotFound { .. }
+            | Error::IndexVersionNotFound { .. }
+            | Error::IndexCoreUnsupported { .. }
+    )
+}
+
+/// Fetch the index and select the entry for `request`, matching against
+/// `core_override` (this build's core version when `None`). One fetch.
+pub(crate) async fn stage(
+    request: &PackageRef,
+    index_url: Option<&str>,
+    core_override: Option<&Version>,
+) -> Result<Staged, Error> {
     let client = client()?;
-    let selection = select_entry(&client, request, index_url).await?;
+    let selection = select_entry(&client, request, index_url, core_override).await?;
     stage_from_selection(&client, selection).await
 }
 
@@ -685,10 +752,13 @@ fn read_marks(plugins: &std::path::Path) -> Marks {
         .unwrap_or_default()
 }
 
-fn select_from_bytes(bytes: &[u8], request: &PackageRef) -> Result<Selection, Error> {
-    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
-        detail: "this build has no semantic version to match entries against".to_owned(),
-    })?;
+fn select_from_bytes(
+    bytes: &[u8],
+    request: &PackageRef,
+    core_override: Option<&Version>,
+) -> Result<Selection, Error> {
+    let mut owned = Version::new(0, 0, 0);
+    let core = or_own_core(core_override, &mut owned)?;
     let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
     let envelope = parse_index_envelope(bytes).map_err(|error| Error::IndexInvalid {
         detail: error.to_string(),
@@ -696,7 +766,7 @@ fn select_from_bytes(bytes: &[u8], request: &PackageRef) -> Result<Selection, Er
     if unix_now() >= envelope.index.expires_at {
         return Err(Error::IndexExpired);
     }
-    let entry = select(&envelope.index.entries, request, &core, &platform)?.clone();
+    let entry = select(&envelope.index.entries, request, core, &platform)?.clone();
     Ok(Selection {
         index_bytes: bytes.to_vec(),
         entry,

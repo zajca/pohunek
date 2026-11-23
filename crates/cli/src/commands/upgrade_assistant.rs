@@ -148,9 +148,14 @@ async fn install(
         Ok(wanted) => wanted,
         Err(error) => return failed(error.to_string()),
     };
-    let resolved = match plugin_index::resolve(&wanted, options.index_url).await {
+    let resolved = match plugin_index::resolve(&wanted, options.index_url, None).await {
         Ok(resolved) => resolved,
-        Err(Error::IndexPackageNotFound { .. } | Error::IndexVersionNotFound { .. }) => {
+        Err(error)
+            if plugin_index::is_unlisted_for_core(&error)
+                || matches!(error, Error::IndexPlatformUnsupported { .. }) =>
+        {
+            // No entry fits this core or this platform: the index does not
+            // publish the package for this host yet.
             return not_published(core, selected_version);
         }
         Err(error) => return failed(error.to_string()),
@@ -192,7 +197,7 @@ async fn install(
             Some(command),
         );
     }
-    match setup_assistant::install(&mut client, &version, &digest, options.index_url).await {
+    match setup_assistant::install(&mut client, &version, &digest, options.index_url, None).await {
         Ok(()) => installed_outcome(version, digest, selected),
         Err(detail) => failed(detail),
     }

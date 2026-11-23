@@ -176,14 +176,22 @@ impl IndexEntry {
         self.kind.unwrap_or(IndexEntryKind::Runtime)
     }
 
+    /// Whether the entry lists `core` in its core range, without checking
+    /// the platform. A caller that already knows the platform mismatches
+    /// uses this to tell a core gap (the index lists no entry the core can
+    /// use) from a platform gap.
+    #[must_use]
+    pub fn core_supports(&self, core: &Version) -> bool {
+        parse_core_range(&self.core).is_some_and(|range| range.matches(core))
+    }
+
     /// Whether the entry lists `platform` and its core range parses and
     /// matches `core`. The same two checks [`VerifiedIndex::authorize`] ends
     /// with, so a client that selects by this predicate never picks an entry
     /// the verifier would refuse for those reasons.
     #[must_use]
     pub fn supports(&self, core: &Version, platform: &str) -> bool {
-        parse_core_range(&self.core).is_some_and(|range| range.matches(core))
-            && self.platforms.iter().any(|listed| listed == platform)
+        self.core_supports(core) && self.platforms.iter().any(|listed| listed == platform)
     }
 }
 

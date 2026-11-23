@@ -446,25 +446,23 @@ hermes`. The new version is selected and the old one stays installed for
 `pohunek.context.assistant`; the daemon binaries carry no copy. `pohunek setup`
 installs the package that matches the release from the signed plugin index, so
 a host set up with 0.42.0 or later has it (`pohunek setup --dry-run --json`
-shows the package and its digest in `assistant`). When the package is a gap in a
+shows the package and its digest in `assistant`). A `pohunek assistant` launch
+whose daemon reports the package missing installs it itself through the same
+index path (preview, one confirmation unless `--yes`, then a single retried
+launch): the index resolution matches the daemon's core version, and when the
+official index lists no package that core can use the launch stops with a
+message naming that core version and `pohunek assistant setup` to rerun after
+admission. A remote launch names `pohunek assistant setup` for that host and
+installs nothing remotely. When the package is a gap in a
 setup run (the index is unreachable or does not list it yet, or the daemon
-refuses it), install it by hand once per host that runs assistant sessions (a
-remote assistant reads the package installed on that remote host). The package is published as a release
-asset of [`pohunekd/plugin-assistant`](https://github.com/pohunekd/plugin-assistant)
-and the pohunek release notes carry its SHA-256 digest; a context package
-installs by digest, never through the catalog. Each pohunek release publishes
-the matching package right after the core release, so the package is available
-from the first pohunek release that contains the context package kind (0.41.0):
-
-```bash
-pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
-```
-
-The first install selects the package. A build from `main` before that release
-has no published archive, and `pohunek assistant` answers `assistant_package_missing`
-with the step to take; build the archive from a checkout of
-[`plugin-assistant`](https://github.com/pohunekd/plugin-assistant) (its README)
-instead.
+refuses it), run `pohunek assistant setup` (or `pohunek setup`) once per host
+that runs assistant sessions (a remote assistant reads the package installed
+on that remote host) after the official index admits the package for that
+core release. Until the index lists it, the launch stops with a message
+naming the daemon's core version and the same command to rerun. No archive
+download, attestation check, or digest-pinned hand install is part of this
+path: the signed plugin index is the only source, and the daemon verifies
+the signature, revocations, freshness and digest at install.
 
 `pohunek service upgrade` (and `packaging/install-daemon.sh`, which runs it)
 installs the matching package itself, because the release archive does not carry
@@ -492,13 +490,9 @@ index pass `--no-assistant-package` to `pohunek service upgrade` or to
 `install-daemon.sh`. A fresh `install-daemon.sh` install does not install the
 package: `pohunek setup` does, and the installer names it. `pohunek assistant`
 prints a note while an older bundle is selected.
-Without the index, move to the package version whose release notes name your
-core version with `plugin update`, which installs the new version next to the old
-one and selects it (a plain `plugin install` keeps the old version selected):
-
-```bash
-pohunek plugin update pohunek.context.assistant ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
-```
+Only the official index installs `pohunek.context.assistant`. When the index
+cannot be reached, rerun `pohunek assistant setup` (or `pohunek setup`) once it
+can.
 
 `pohunek plugin list` shows the installed versions and which one is selected;
 `pohunek plugin select pohunek.context.assistant --digest <digest>` switches

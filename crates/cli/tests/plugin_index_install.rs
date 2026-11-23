@@ -1346,11 +1346,28 @@ async fn an_index_the_cli_cannot_use_is_reported_before_the_archive_is_requested
         rig.server.requests()
     );
 
-    // Entries for another package, another platform, or another core.
+    // Entries for another package, another platform, or another core each
+    // report their own cause.
     let mut foreign_platform = rig.listing("0.1.0");
     foreign_platform.platform = "m68k-unknown-linux-gnu".to_owned();
     let mut future_core = rig.listing("0.2.0");
     future_core.core = ">=999.0.0";
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.signed(vec![foreign_platform.entry()])),
+    );
+    rig.clear_stored();
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_platform_unsupported");
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.signed(vec![future_core.entry()])),
+    );
+    rig.clear_stored();
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_core_unsupported");
     rig.server.set(
         INDEX_PATH,
         Route::Body(
@@ -1358,9 +1375,10 @@ async fn an_index_the_cli_cannot_use_is_reported_before_the_archive_is_requested
                 .signed(vec![foreign_platform.entry(), future_core.entry()]),
         ),
     );
+    rig.clear_stored();
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
-    assert_eq!(err_code(&document), "plugin_index_package_not_found");
+    assert_eq!(err_code(&document), "plugin_index_platform_unsupported");
     let (code, document) = rig.install("pohunek.runtime.other", &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_package_not_found");

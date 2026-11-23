@@ -269,7 +269,7 @@ async fn an_absent_package_is_named_with_the_install_command() {
         error
             .recover
             .as_deref()
-            .is_some_and(|hint| hint.contains("plugin install")),
+            .is_some_and(|hint| hint.contains("pohunek assistant setup") && !hint.contains('<')),
         "{error:?}"
     );
     servers.stop().await;
@@ -442,7 +442,7 @@ async fn an_installed_but_unselected_package_is_refused_with_the_select_command(
         error
             .recover
             .as_deref()
-            .is_some_and(|hint| hint.contains("plugin select")),
+            .is_some_and(|hint| hint.contains("pohunek assistant setup")),
         "{error:?}"
     );
     servers.stop().await;

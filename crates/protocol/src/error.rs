@@ -1065,6 +1065,17 @@ impl ProtocolError {
         )
     }
 
+    /// Concrete text for the missing assistant package when the official index
+    /// does not list it for the daemon's core version, following QA-a.
+    ///
+    /// Returns a copy-paste command that installs the assistant package and
+    /// explains that the host must run the command again after the index lists
+    /// the package. The daemon version is rendered; no placeholders remain.
+    #[must_use]
+    pub fn assistant_missing_hint(daemon_version: &str) -> String {
+        format!("the assistant package is not available for core v{daemon_version} yet; run `pohunek assistant setup` again later")
+    }
+
     /// The canonical `runtime/assistant_daemon_outdated` error for a daemon that
     /// answers `assistant.materialize` without the prompt contract.
     ///

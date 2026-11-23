@@ -2299,8 +2299,8 @@ async fn an_index_that_cannot_serve_the_package_is_a_gap() {
         assert_eq!(error.code(), "setup_incomplete", "{name}");
         let text = error.to_string();
         assert!(
-            text.contains("pohunek plugin install ./assistant.tar.zst --sha256"),
-            "{name}: the manual command is named: {text}"
+            text.contains("pohunek assistant setup"),
+            "{name}: the runnable command is named: {text}"
         );
         assert!(host.assistant_packages().await.is_empty(), "{name}");
         assert_eq!(rig.archive_requests(), 0, "{name}: no archive is fetched");

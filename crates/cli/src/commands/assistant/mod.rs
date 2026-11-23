@@ -162,6 +162,248 @@ pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), Cli
     // any daemon is started or dialed.
     let workdir = assistant_workdir(&opts, paths)?;
     let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
+    match run_prepared(&opts, paths, auto_started, workdir.clone()).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_missing_package(&error) => {
+            recover_missing_package(error, &opts, paths, auto_started, workdir).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `error` is the daemon's `assistant_package_missing` refusal.
+///
+/// The match keys on the stable error code alone, never on the message or
+/// the remedy text, so an older daemon's placeholder hint cannot leak
+/// through: the recovery prints the plan's outcome instead. The launch path
+/// surfaces the daemon refusal wrapped in the SDK client error, so both the
+/// bare protocol error and the client wrapper match.
+fn is_missing_package(error: &CliError) -> bool {
+    match error {
+        CliError::Protocol(error) => error.code == "assistant_package_missing",
+        CliError::Client(error) => matches!(
+            error,
+            pohunek_client::ClientError::Protocol(error)
+            | pohunek_client::ClientError::RemoteProtocol { source: error, .. }
+            if error.code == "assistant_package_missing"
+        ),
+        _ => false,
+    }
+}
+
+/// Recovers a launch the daemon refused with `assistant_package_missing`.
+///
+/// A remote host prints the command to run on that host; nothing is
+/// installed remotely because `plugin install` is local-only. A local host
+/// runs the shared `setup_assistant` plan: an `Install` step previews, asks
+/// (unless `--yes`) and installs through the daemon's index verification,
+/// then the launch is retried once. A `Gap` or `Present` step prints the
+/// plan's outcome with the error. Without a TTY and without `--yes` nothing
+/// is installed and the preview is printed.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the recovery keeps install, gap and remote arms in one place"
+)]
+async fn recover_missing_package(
+    error: CliError,
+    opts: &AssistantOptions,
+    paths: &Paths,
+    auto_started: bool,
+    workdir: Option<std::path::PathBuf>,
+) -> Result<(), CliError> {
+    if opts.is_remote() {
+        let recover = format!(
+            "assistant package missing on host '{}': run `pohunek assistant setup` on that host, then retry",
+            opts.host
+        );
+        eprintln!("pohunek: {recover}");
+        return Err(with_recover(error, Some(recover)));
+    }
+    let Ok(mut client) = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await
+    else {
+        return Err(error);
+    };
+    // One inspection serves the plan and the apply: the daemon version must
+    // not be sampled twice behind one recovery.
+    let daemon_version = match client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await
+    {
+        Ok(capabilities) => capabilities.daemon_version,
+        Err(error) => return Err(error),
+    };
+    let daemon_core = match semver::Version::parse(&daemon_version) {
+        Ok(core) => core,
+        Err(_error) => {
+            return Err(CliError::HostCapProbe {
+                version: daemon_version.clone(),
+            });
+        }
+    };
+    let (step, cause) = crate::commands::setup_assistant::plan_with_cause(
+        None,
+        Some(&mut client),
+        Some(&daemon_core),
+    )
+    .await;
+    match step {
+        crate::commands::setup_assistant::AssistantStep::Install { .. } => {
+            install_and_retry(
+                &step,
+                cause,
+                opts,
+                paths,
+                auto_started,
+                workdir,
+                Some(daemon_version.as_str()),
+            )
+            .await
+        }
+        crate::commands::setup_assistant::AssistantStep::Present { .. }
+        | crate::commands::setup_assistant::AssistantStep::Gap { .. } => {
+            let recover = outcome_recover(&step, cause, Some(daemon_version.as_str()));
+            if let Some(text) = &recover {
+                eprintln!("pohunek: {text}");
+            }
+            Err(with_recover(error, recover))
+        }
+    }
+}
+
+/// The recovery hint of a plan outcome: the runnable remedy the returned
+/// error carries, so both the human line and the `--json` document name a
+/// concrete command and never a `<placeholder>`.
+fn outcome_recover(
+    step: &crate::commands::setup_assistant::AssistantStep,
+    cause: Option<crate::commands::setup_assistant::GapCause>,
+    daemon_version: Option<&str>,
+) -> Option<String> {
+    use crate::commands::setup_assistant::{AssistantStep, GapCause};
+    match step {
+        AssistantStep::Gap { detail, command } => Some(match (cause, daemon_version) {
+            (Some(GapCause::NotListed), Some(version)) => {
+                crate::commands::setup_assistant::not_listed_text(version)
+            }
+            _ => format!("{detail}; install it by hand with `{command}`"),
+        }),
+        AssistantStep::Present {
+            package_id,
+            version,
+            ..
+        } => Some(format!(
+            "assistant package {package_id}@{version} is installed; the daemon still refuses it; \
+             run `pohunek assistant setup` to repair the selection, or `pohunek plugin list` to inspect it"
+        )),
+        AssistantStep::Install { .. } => None,
+    }
+}
+
+/// The error `error` with its recovery hint replaced by `recover`: the human
+/// line and the `--json` document then name the same runnable remedy.
+fn with_recover(error: CliError, recover: Option<String>) -> CliError {
+    let Some(recover) = recover else {
+        return error;
+    };
+    match error {
+        CliError::Protocol(mut error) => {
+            error.recover = Some(recover);
+            CliError::Protocol(error)
+        }
+        CliError::Client(error) => match error {
+            pohunek_client::ClientError::Protocol(mut source) => {
+                source.recover = Some(recover);
+                CliError::Client(pohunek_client::ClientError::Protocol(source))
+            }
+            pohunek_client::ClientError::RemoteProtocol { host, mut source } => {
+                source.recover = Some(recover);
+                CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source })
+            }
+            error => CliError::Client(error),
+        },
+        error => error,
+    }
+}
+
+/// Previews an `Install` step, installs through the daemon's index
+/// verification, and retries the launch once.
+async fn install_and_retry(
+    step: &crate::commands::setup_assistant::AssistantStep,
+    cause: Option<crate::commands::setup_assistant::GapCause>,
+    opts: &AssistantOptions,
+    paths: &Paths,
+    auto_started: bool,
+    workdir: Option<std::path::PathBuf>,
+    daemon_version: Option<&str>,
+) -> Result<(), CliError> {
+    use crate::commands::setup_assistant::{AssistantOutcome, AssistantStep};
+    // One inspection feeds the plan above; the apply reuses that version so
+    // a transient probe failure cannot stage the wrong core.
+    let daemon_core = match daemon_version {
+        Some(version) => match semver::Version::parse(version) {
+            Ok(core) => Some(core),
+            Err(_error) => {
+                return Err(CliError::HostCapProbe {
+                    version: version.to_owned(),
+                });
+            }
+        },
+        None => None,
+    };
+    let AssistantStep::Install {
+        package_id,
+        version,
+        digest,
+        ..
+    } = step
+    else {
+        let recover = outcome_recover(step, cause, daemon_version);
+        if let Some(text) = &recover {
+            eprintln!("pohunek: {text}");
+        }
+        return Err(with_recover(
+            CliError::Protocol(protocol::ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                "assistant_package_missing",
+                "the assistant context package cannot be used",
+                None,
+            )),
+            recover,
+        ));
+    };
+    let (package_id, version, digest) = (package_id.clone(), version.clone(), digest.clone());
+    eprintln!("pohunek: assistant package missing: installing {package_id}@{version} ({digest})");
+    // A request read from stdin leaves nothing for the prompt: stdin as the
+    // request source takes the non-interactive rule like `--json` does.
+    if !opts.yes
+        && (opts.json
+            || opts.request_from_stdin
+            || !std::io::IsTerminal::is_terminal(&std::io::stdin()))
+    {
+        let recover = "preview only (no TTY or `--json`, unless `--yes`): rerun `pohunek assistant --yes` to install, or run `pohunek assistant setup`".to_owned();
+        eprintln!("pohunek: {recover}");
+        return Err(with_recover(CliError::SetupConsentRequired, Some(recover)));
+    }
+    if !opts.yes && !crate::commands::setup_host::confirm()? {
+        return Err(CliError::SetupDeclined);
+    }
+    let mut client = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await?;
+    match crate::commands::setup_assistant::apply(&mut client, step, None, daemon_core.as_ref())
+        .await
+    {
+        AssistantOutcome::Installed(line) => {
+            eprintln!("pohunek: {line}");
+        }
+        AssistantOutcome::Present => {}
+        AssistantOutcome::Gap(text) => {
+            eprintln!("pohunek: {text}");
+            return Err(CliError::SetupIncomplete {
+                detail: text,
+                applied: Vec::new(),
+            });
+        }
+    }
     run_prepared(opts, paths, auto_started, workdir).await
 }
 
@@ -187,24 +429,24 @@ fn validate_target(opts: &AssistantOptions) -> Result<(), CliError> {
 }
 
 async fn run_prepared(
-    opts: AssistantOptions,
+    opts: &AssistantOptions,
     paths: &Paths,
     auto_started: bool,
     workdir: Option<std::path::PathBuf>,
 ) -> Result<(), CliError> {
-    let host = assistant_host_config(&opts, paths).await?;
-    let params = assistant_params(&opts, auto_started, workdir);
+    let host = assistant_host_config(opts, paths).await?;
+    let params = assistant_params(opts, auto_started, workdir);
     let mut prepared =
         core_assistant::prepare_with_options(&host, params, ConnectionOptions::default())
             .await
             .map_err(core_error)?;
 
     if opts.print_prompt {
-        print_prompt(&opts, &prepared)?;
+        print_prompt(opts, &prepared)?;
         return Ok(());
     }
 
-    confirm_remote_launch(&opts)?;
+    confirm_remote_launch(opts)?;
     prepared.session_params.metadata = opts.metadata.clone();
     let options = ConnectionOptions {
         request_timeout: opts
@@ -222,7 +464,7 @@ async fn run_prepared(
             opts.host
         );
     }
-    emit_launch_output(&opts, &launched)
+    emit_launch_output(opts, &launched)
 }
 
 fn print_prompt(
@@ -587,6 +829,8 @@ fn core_error(err: AssistantError) -> CliError {
     }
 }
 
+#[cfg(test)]
+mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -774,7 +774,7 @@ fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
     assert!(
         preview["assistant"]["command"]
             .as_str()
-            .is_some_and(|command| command.contains("pohunek plugin install ./assistant.tar.zst")),
+            .is_some_and(|command| command.contains("pohunek assistant setup")),
         "{preview}"
     );
     assert!(
