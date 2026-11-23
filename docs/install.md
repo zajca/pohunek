@@ -490,13 +490,9 @@ index pass `--no-assistant-package` to `pohunek service upgrade` or to
 `install-daemon.sh`. A fresh `install-daemon.sh` install does not install the
 package: `pohunek setup` does, and the installer names it. `pohunek assistant`
 prints a note while an older bundle is selected.
-Without the index, move to the package version whose release notes name your
-core version with `plugin update`, which installs the new version next to the old
-one and selects it (a plain `plugin install` keeps the old version selected):
-
-```bash
-pohunek plugin update pohunek.context.assistant ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
-```
+Only the official index installs `pohunek.context.assistant`. When the index
+cannot be reached, rerun `pohunek assistant setup` (or `pohunek setup`) once it
+can.
 
 `pohunek plugin list` shows the installed versions and which one is selected;
 `pohunek plugin select pohunek.context.assistant --digest <digest>` switches
