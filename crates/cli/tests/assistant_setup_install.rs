@@ -174,17 +174,21 @@ async fn s1_missing_package_installs_from_the_index_and_launches() {
 #[tokio::test]
 async fn s2_without_yes_and_without_tty_nothing_installs() {
     let rig = Rig::start().await;
-    rig.publish("0.42.0");
+    let archive = rig.publish("0.42.0");
     let (code, document, stderr) = rig.assistant(&["help me"]);
     assert_ne!(
         code, 0,
         "no TTY and no --yes installs nothing: {document} / {stderr}"
     );
     assert!(rig.listed().await.is_empty(), "nothing installed");
-    let combined = format!("{document}{stderr}");
+    assert_eq!(
+        document["err"]["code"], "setup_consent_required",
+        "{document} / {stderr}"
+    );
+    let digest = archive.digest.as_str();
     assert!(
-        combined.contains("preview") || combined.contains("install"),
-        "the preview is printed: {combined}"
+        stderr.contains(&format!("installing {ASSISTANT_PACKAGE}@0.42.0 ({digest})")),
+        "the preview names the package, version and digest: {stderr}"
     );
 }
 
@@ -288,10 +292,18 @@ async fn s3b_installed_but_disabled_package_installs_nothing() {
     let (code, document, stderr) = rig.assistant(&["--yes", "help me"]);
     assert_ne!(code, 0, "{document} / {stderr}");
     let combined = format!("{document}{stderr}");
+    // The plan's outcome names the installed digest; the daemon's own
+    // refusal for a disabled package never does.
+    let recover = document["err"]["recover"].as_str().unwrap_or_default();
     assert!(
-        combined.contains("disabled") || combined.contains("not enabled"),
-        "the plan outcome is printed: {combined}"
+        recover.contains("pohunek plugin enable")
+            && recover.contains(&format!("--digest {}", archive.digest.as_str())),
+        "the plan outcome is the recover text: {combined}"
     );
+    let listed = rig.listed().await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["digest"], archive.digest.as_str(), "{listed:?}");
+    assert_eq!(listed[0]["enabled"], false, "stays disabled: {listed:?}");
 }
 
 /// A fixture remote daemon behind the overlay redirect: `host.inspect`
