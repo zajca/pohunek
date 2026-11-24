@@ -671,6 +671,76 @@ fn kit_smoke_skips_the_script_when_the_screen_check_fails() {
 }
 
 #[test]
+fn kit_smoke_waits_for_screen_lines_after_control_bytes() {
+    let kit = Kit::new();
+    let release = release_dir();
+    // Emits terminal setup control bytes immediately (transitioning activity
+    // past `unknown` while visible_lines is still 0), then paints visible text
+    // after a short pause, matching TUIs that probe the terminal before their
+    // first draw.
+    let package = kit.variant(
+        "delayed-paint-package",
+        "args = [\"-c\", \"echo ready; exec sleep 300\"]",
+        "args = [\"-c\", \"printf '\\\\033[?1049h\\\\033[?2004h'; sleep 0.6; echo ready; exec sleep 300\"]",
+    );
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&package),
+        "--release-dir",
+        s(&release),
+        "--detection-timeout",
+        "10",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke with delayed first paint failed: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("json report");
+    assert!(
+        document["screen_lines"].as_u64().unwrap_or(0) > 0,
+        "expected non-empty screen lines: {document}"
+    );
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_fails_when_screen_stays_empty_after_control_bytes() {
+    let kit = Kit::new();
+    let release = release_dir();
+    // Emits control bytes only (leaving `unknown`) and never paints a visible
+    // line: the smoke must refuse once the detection bound expires.
+    let package = kit.variant(
+        "empty-screen-package",
+        "args = [\"-c\", \"echo ready; exec sleep 300\"]",
+        "args = [\"-c\", \"printf '\\\\033[?1049h\\\\033[?2004h'; exec sleep 300\"]",
+    );
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&package),
+        "--release-dir",
+        s(&release),
+        "--detection-timeout",
+        "1",
+        "--json",
+    ]);
+    assert!(
+        !output.status.success(),
+        "smoke with control bytes and empty screen passed: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("the session screen stayed empty"),
+        "expected empty-screen refusal, got: {}",
+        stderr_of(&output)
+    );
+    named_root(&output);
+}
+
+#[test]
 fn kit_smoke_kills_the_background_child_of_the_script() {
     use std::os::unix::fs::PermissionsExt as _;
     let kit = Kit::new();
