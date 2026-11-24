@@ -454,7 +454,9 @@ entries: a document lives at most 14 days (`LifetimeTooLong`, `Expired`), the
 sequence cannot lead the host clock by more than a day, the endorser root can
 revoke the key at any time, and every install shows the resolved package, version
 and digest before it writes. Per-kind key scopes (a `kinds` allow-list on the key
-record) are the next step if that risk is not acceptable.
+record) are the next step if that risk is not acceptable. The verified scope
+itself is deferred to #1619 (see
+[Admission through the index](../guides/plugin-repositories.md#admission-through-the-index)).
 
 **Freshness.** `sequence` is the Unix second of signing. A sequence below the
 persisted high-water mark is `StaleSequence` (an equal one is accepted); one
@@ -591,7 +593,12 @@ subset (`parse_index_channel`, typed `IndexChannelError`). The file holds no key
 material: `IndexChannel::endorser(&anchor)` returns the anchor root with that id
 and fails with `EndorserNotInAnchor` when there is none. There is no compiled
 fallback, so a missing channel file leaves index installs refused (the reader of
-the file owns that refusal).
+the file owns that refusal). The official document URLs, in contrast, are
+compiled into the CLI (`OFFICIAL_INDEX_URL`, `OFFICIAL_INDEX_URL_V2`,
+`crates/cli/src/commands/plugin_index.rs:32`, `:52`): those URLs are a fetch
+address the daemon still verifies, while the channel file names the endorser
+root that trust decision rests on. Both are the accepted design (see
+[Admission through the index](../guides/plugin-repositories.md#admission-through-the-index)).
 
 The daemon reads the channel file in the anchor's directory, after a loaded
 anchor only, under the anchor's file policy (regular, size-bounded, owned by
