@@ -95,9 +95,24 @@ run_plain() {
     env -i HOME="$home" PATH="$path_value" LANG=C "$@" </dev/null >/dev/null 2>"$root/stderr.txt"
 }
 
+# wait_for_prompt : waits, bounded by PROMPT_WAIT_TENTHS, until the transcript
+# holds the hidden-input prompt. The program prints it after echo is off, so a
+# value typed once it shows up is never echoed. A run that refuses before the
+# prompt never prints it; the bound ends the wait and the value is typed anyway.
+PROMPT_WAIT_TENTHS=60
+wait_for_prompt() {
+    waited=0
+    while [ "$waited" -lt "$PROMPT_WAIT_TENTHS" ]; do
+        if grep -q 'Paste the token' "$transcript" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+}
+
 # run_pty INPUT ARGS... : runs ARGS under a pseudo-terminal. INPUT, when not
-# empty, is typed after a delay, so `claude setup-token` has finished and the
-# hidden prompt is active when the value arrives.
+# empty, is typed once the hidden prompt is on screen (see wait_for_prompt).
 run_pty() {
     input=$1
     shift
@@ -107,7 +122,7 @@ run_pty() {
     done
     if [ -n "$input" ]; then
         rc=0
-        (sleep 1; printf '%s\n' "$input") | script -q -e -c "$line" "$transcript" >/dev/null 2>"$root/stderr.txt" || rc=$?
+        (wait_for_prompt; printf '%s\n' "$input") | script -q -e -c "$line" "$transcript" >/dev/null 2>"$root/stderr.txt" || rc=$?
     else
         rc=0
         script -q -e -c "$line" "$transcript" </dev/null >/dev/null 2>"$root/stderr.txt" || rc=$?

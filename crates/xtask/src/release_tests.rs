@@ -65,7 +65,6 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-/// Names of the official runtimes, read from the package directories.
 /// Copies the files below `from` into `to`, keeping the directory layout and
 /// each file's mode, so a package with a `bin/` directory copies whole.
 fn copy_tree(from: &Path, to: &Path) {
@@ -81,6 +80,7 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
+/// Names of the official runtimes, read from the package directories.
 fn runtimes() -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(root().join("runtime-packages"))
         .expect("runtime-packages")
