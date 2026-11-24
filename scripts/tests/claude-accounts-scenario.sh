@@ -96,10 +96,11 @@ run_plain() {
 }
 
 # wait_for_prompt : waits, bounded by PROMPT_WAIT_TENTHS, until the transcript
-# holds the hidden-input prompt. The program prints it after echo is off, so a
-# value typed once it shows up is never echoed. A run that refuses before the
-# prompt never prints it; the bound ends the wait and the value is typed anyway.
-PROMPT_WAIT_TENTHS=60
+# holds the hidden-input prompt, and fails when the bound expires. The program
+# prints the prompt after echo is off, so a value typed once it shows up is
+# never echoed. `script -f` flushes the transcript on every write, so the
+# prompt is visible as soon as it is printed.
+PROMPT_WAIT_TENTHS=100
 wait_for_prompt() {
     waited=0
     while [ "$waited" -lt "$PROMPT_WAIT_TENTHS" ]; do
@@ -109,10 +110,13 @@ wait_for_prompt() {
         sleep 0.1
         waited=$((waited + 1))
     done
+    return 1
 }
 
 # run_pty INPUT ARGS... : runs ARGS under a pseudo-terminal. INPUT, when not
-# empty, is typed once the hidden prompt is on screen (see wait_for_prompt).
+# empty, is typed once the hidden prompt is on screen (see wait_for_prompt); a
+# prompt that never appears is a failure and the value is not typed. A run that
+# must refuse before the prompt passes an empty INPUT (see run_pty_refused).
 run_pty() {
     input=$1
     shift
@@ -122,12 +126,25 @@ run_pty() {
     done
     if [ -n "$input" ]; then
         rc=0
-        (wait_for_prompt; printf '%s\n' "$input") | script -q -e -c "$line" "$transcript" >/dev/null 2>"$root/stderr.txt" || rc=$?
+        rm -f "$root/prompt-missing"
+        ( if wait_for_prompt; then printf '%s\n' "$input"; else : > "$root/prompt-missing"; fi ) | script -q -f -e -c "$line" "$transcript" >/dev/null 2>"$root/stderr.txt" || rc=$?
+        if [ -e "$root/prompt-missing" ]; then
+            rm -f "$root/prompt-missing"
+            printf 'FAIL the hidden prompt never appeared for: %s\n' "$*" >&2
+            failures=$((failures + 1))
+        fi
     else
         rc=0
-        script -q -e -c "$line" "$transcript" </dev/null >/dev/null 2>"$root/stderr.txt" || rc=$?
+        script -q -f -e -c "$line" "$transcript" </dev/null >/dev/null 2>"$root/stderr.txt" || rc=$?
     fi
     return "$rc"
+}
+
+# run_pty_refused ARGS... : a run that must be refused before the hidden prompt;
+# it fails when the prompt shows up anyway.
+run_pty_refused() {
+    run_pty "" "$@" || true
+    check "refused before the hidden prompt: $*" absent_in_file "$transcript" 'Paste the token'
 }
 
 reset_transcript() {
@@ -260,7 +277,7 @@ check "duplicate token under a second name is refused" absent "$acc/side.token"
 # Existing name without --replace.
 reset_transcript
 printf '%s\n' "$TOKEN_B" > "$next_token"
-run_pty "$TOKEN_B" "$setup" add personal || true
+run_pty_refused "$setup" add personal
 check "existing name without --replace is refused" contains "$acc/personal.token" "$TOKEN_A"
 
 # Short value.
@@ -294,13 +311,13 @@ check "a leading dash in the name is refused" absent "$acc/-x.token"
 # is refused before the token is asked for.
 printf '{"profiles":[{"name":"claude-acct","base":"claude","file_digest":"%s"},{"name":"claude-other","base":"claude"}],"hidden":0,"truncated":false}\n' "$digest" > "$root/listing.json"
 reset_transcript
-run_pty "$TOKEN_C" "$setup" add other || true
+run_pty_refused "$setup" add other
 check "an unrelated profile under the preset name is refused" absent "$acc/other.token"
 
 # An unrelated profile under the parent name is refused as well.
 printf '{"profiles":[{"name":"claude-acct","base":"shell","file_digest":"%s"}],"hidden":0,"truncated":false}\n' "$digest" > "$root/listing.json"
 reset_transcript
-run_pty "$TOKEN_C" "$setup" add third || true
+run_pty_refused "$setup" add third
 check "a parent name held by another profile is refused" absent "$acc/third.token"
 rm -f "$root/listing.json"
 
