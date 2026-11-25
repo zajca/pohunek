@@ -3854,7 +3854,8 @@ async fn the_preflight_repair_writes_nothing() {
 }
 
 #[tokio::test]
-async fn a_reported_id_of_an_assigned_runtime_without_its_file_would_lose_recovery() {
+async fn a_reported_id_of_an_assigned_runtime_without_its_file_is_already_lost_on_every_preflight()
+{
     let damaged = DamagedHost::new().await;
     fs::remove_file(
         damaged
@@ -3868,17 +3869,21 @@ async fn a_reported_id_of_an_assigned_runtime_without_its_file_would_lose_recove
         .host
         .write_store(&[damaged_line("s-1", DAMAGED_BASE)]);
 
-    let report = damaged.report();
-
-    assert_eq!(
-        stopped_verdict_of(&report, "s-1"),
-        (
-            &Verdict::WouldLoseRecovery,
-            "agent_native_reference_missing"
-        ),
-        "{:?}",
-        report.stopped_sessions
-    );
+    // The running release only starts an empty conversation under the id, so
+    // the verdict is the stored fact, and a later upgrade over the same store
+    // reaches it again without a flag.
+    for upgrade in 1..=2 {
+        let report = damaged.report();
+        assert_eq!(
+            stopped_verdict_of(&report, "s-1"),
+            (
+                &Verdict::AlreadyNotResumable,
+                "agent_native_reference_missing"
+            ),
+            "upgrade {upgrade}: {:?}",
+            report.stopped_sessions
+        );
+    }
 }
 
 #[tokio::test]

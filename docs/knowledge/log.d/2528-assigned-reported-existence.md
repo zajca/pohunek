@@ -6,8 +6,8 @@
   stored-binding preflight, the activity lookup and the upgrade preflight
   share it, so a reported id whose conversation file is gone is refused with
   `agent_native_reference_missing`. The upgrade preflight judges such a
-  missing file `would_lose_recovery`, because the running release may not
-  check a reported id (`reported_check_identity` in
+  missing file `already_not_resumable`, because the running release only
+  starts an empty conversation under it (`reported_check_identity` in
   `reconcile/upgrade_preflight.rs`). Covered by
   `recovery_checks_an_assigned_reference_and_a_reported_one`
   in `crates/daemon/src/session/tests/native_supersede.rs`. Docs: the

@@ -3585,7 +3585,7 @@ assigns) keeps its check across the upgrade only when the preflight can show it 
 content addressing fixes, or a built-in that the upgrade adopts from a 0.34.0 to 0.34.2 store (store schema 5) whose adopted package declares
 the existence check of the v0.34.2 golden. Any other reported reference is `would_lose_recovery` with resume's code and a detail that names the
 reason: a built-in the upgrade does not adopt, an adopted package from a store that is not schema 5, or a package whose check differs from the
-golden. A reported id of an `assigned` runtime is never provably identical, because the running release may not check it. Hermes has no golden here, so its reported references are fail-closed too. A stopped session whose reference the preflight budget
+golden. A reported id of an `assigned` runtime whose conversation file is missing is `already_not_resumable` with resume's code and needs no flag: the running release only starts an empty conversation under it, so the upgrade loses nothing and every later preflight reports the same verdict. Hermes has no golden here, so its reported references are fail-closed too. A stopped session whose reference the preflight budget
 reached before its check is `would_lose_recovery` with `reference_unverified_within_budget`: the reference is not known to be present, so it is
 never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
 the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline
