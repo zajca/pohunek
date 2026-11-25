@@ -988,9 +988,9 @@ async fn recovery_checks_an_assigned_reference_and_a_reported_one() {
         .expect_err("an assigned reference needs its conversation");
     assert_eq!(refused.code, "agent_native_reference_missing");
 
-    // The agent reports another conversation: the declared check now applies to
-    // the reported id, so a conversation file that is gone is refused and
-    // nothing is launched.
+    // The agent reports another conversation; the declared check applies to the
+    // reported id, so a conversation file that is gone is refused and nothing
+    // is launched.
     let second = Rig::with_agents(
         "supersede-existence-reported",
         crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,

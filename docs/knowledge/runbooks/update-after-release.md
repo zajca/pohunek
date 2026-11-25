@@ -765,7 +765,9 @@ the upgrade is not what ends it.
   pinned to a package digest, or a built-in that a 0.34.0 to 0.34.2 store (schema
   5) adopts into the official package whose check equals the v0.34.2 golden. Any
   other session the upgrade adopts from the built-in runtime is `would lose
-  recovery`, with the same code and a detail that names the reason. Sources
+  recovery`, with the same code and a detail that names the reason. A reported
+  id of an `assigned` runtime is always `would lose recovery` when its file is
+  missing, because the running release may not check it. Sources
   outside those are fail-closed, so the verdict is `would lose recovery` there.
 - `would not be adopted`: the new daemon would not manage the worker
   (`record_unreadable`, `worker_without_session_record`, `store_unusable`,

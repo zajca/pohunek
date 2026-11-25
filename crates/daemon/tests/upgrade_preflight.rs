@@ -3854,6 +3854,34 @@ async fn the_preflight_repair_writes_nothing() {
 }
 
 #[tokio::test]
+async fn a_reported_id_of_an_assigned_runtime_without_its_file_would_lose_recovery() {
+    let damaged = DamagedHost::new().await;
+    fs::remove_file(
+        damaged
+            .host
+            .env
+            .home()
+            .join(".pi/agent/sessions/stamp_native-fixture-2.jsonl"),
+    )
+    .expect("remove the conversation");
+    damaged
+        .host
+        .write_store(&[damaged_line("s-1", DAMAGED_BASE)]);
+
+    let report = damaged.report();
+
+    assert_eq!(
+        stopped_verdict_of(&report, "s-1"),
+        (
+            &Verdict::WouldLoseRecovery,
+            "agent_native_reference_missing"
+        ),
+        "{:?}",
+        report.stopped_sessions
+    );
+}
+
+#[tokio::test]
 async fn a_stop_intent_record_is_repaired_before_its_merge() {
     // The resume binding contradicts the record, which a stopped record
     // ignores; the record is then judged on its repaired recovery.
