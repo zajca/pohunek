@@ -446,7 +446,7 @@ fi
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
     CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
     CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD \
-    CLAUDE_CODE_USE_MANTLE CLAUDE_CONFIG_DIR
+    CLAUDE_CODE_USE_MANTLE
 IFS= read -r CLAUDE_CODE_OAUTH_TOKEN < "$file" || true
 case "$CLAUDE_CODE_OAUTH_TOKEN" in
     *[![:space:]]*) ;;
@@ -463,8 +463,8 @@ exec "$agent" "$@"
 Save it as an executable. The launch is identified by the program the wrapper
 `exec`s into, so keep the final `exec` and never add `set -x` or an `echo` of the token, and keep each account's file separate. The
 `stat -c` form is GNU; on macOS use `stat -f %Lp`. `pohunek integration status
---agent claude --profile <profile>` should report the hooks of `~/.claude`,
-because the home is the ambient one.
+--agent claude --profile <profile>` should report the hooks of the config home
+the session uses: `CLAUDE_CONFIG_DIR` as the wrapper finds it, else `~/.claude`.
 
 **Credential precedence.** Claude picks the first credential present in this
 order ([authentication
