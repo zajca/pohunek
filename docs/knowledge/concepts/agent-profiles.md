@@ -235,13 +235,16 @@ expanded). The pieces fit together like this:
   every runtime entry whose runtime declares a config home (the bare runtime and
   each profile). Entries with the same value launch against the same directory,
   for example two profile names for one subscription, or a profile that names
-  the ambient home; entries with different values are different accounts. The
+  the ambient home; entries with different values use different directories. The
   value identifies a config directory, not an account: profiles that share a home
   but select different accounts through their environment, such as the Claude
   account presets of [One Claude subscription per session](../guides/claude-package.md#one-claude-subscription-per-session),
-  report the same value. The value is an opaque keyed digest of the directory:
-  stable on one host, different on another, and it carries no path or environment
-  value. A client groups by it
+  report the same value (see [Choosing a credential with a launch
+  option](#choosing-a-credential-with-a-launch-option)). A client shows
+  `display_name` and the session's recorded `agent_options` for the account, and
+  uses `config_home_id` only to group directories. The
+  value is an opaque keyed digest of the directory: stable on one host, different
+  on another, and it carries no path or environment value. A client groups by it
   and never tries to decode it. The entry is absent when the home cannot be
   resolved or the host cannot key the digest.
 - **External observer.** With external observation enabled the daemon watches
@@ -254,6 +257,53 @@ expanded). The pieces fit together like this:
 
 Resume freezing of the profile follows in a later change of the same work; this
 page grows with it.
+
+### Choosing a credential with a launch option
+
+Accounts that must share one config home (one memory, settings, skills, plugins
+and history) differ only in the credential the agent reads. A profile can offer
+that choice as a launch option over a wrapper program:
+
+- The option's choices set a non-secret selector in their `env`, such as
+  `AGENT_ACCOUNT = "work"`. A choice env whose name carries a credential segment
+  (`TOKEN`, `KEY`, `AUTH` and the others the profile checks refuse) is refused,
+  so the selector names an account, never a secret.
+- The profile's `program` is a wrapper that follows the
+  [wrapper contract](#wrapper-programs-and-version-probes): it answers the
+  version-only probe without a credential, validates the selector, reads the
+  credential from an owner file that only it opens, exports it for the agent and
+  ends in `exec` so the launched process is the agent itself.
+
+```toml
+# Keep the profile's existing base, package and digest binding.
+program = "/home/owner/bin/agent-account"
+
+[options.account]
+label = "Account"
+default = "work"
+choices.work     = { label = "Work",     env = { AGENT_ACCOUNT = "work" } }
+choices.personal = { label = "Personal", env = { AGENT_ACCOUNT = "personal" } }
+```
+
+`pohunek session new --opt account=personal` records the choice in the session,
+and a resume relaunches with it, with no flag. Pohunek stores, logs and freezes
+only the selector, never what the wrapper reads: the daemon never sees the
+credential, and `secret_env` is not needed (it would make every resume fail with
+`secret_env_missing`).
+
+The profile revision covers the program path and the selected choice env but not
+the files the wrapper reads, so a resume re-reads whatever the wrapper reads
+now. Replacing the credential file of one account with another account's
+credential, or repointing a choice inside the wrapper, switches the identity of
+every later resume without `agent_profile_changed`. Keep one credential file per
+choice and never reuse or rename a choice for another account; rotating the
+credential of the same account is safe. Which variable a runtime reads, and the
+rules for choosing an account, belong to the runtime's own guide: for Claude
+Code see [one Claude subscription per
+session](../guides/claude-package.md#one-claude-subscription-per-session). A
+generic launch-time credential reference in the core is tracked in
+[#2504](https://github.com/zajca/pohunek/issues/2504); until it exists the
+wrapper is the supported way.
 
 ## Launch sources
 
