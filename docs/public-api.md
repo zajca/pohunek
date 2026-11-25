@@ -1401,8 +1401,9 @@ and whose `cwd`, when absolute, is the working directory. `*.messages.json` file
 are never opened; a larger, malformed or non-object manifest is not a session. A
 pass visits the highest directory names first, which is age order for the ids
 Cline generates (`<13-digit millisecond time>_<5 characters>`), so the newest
-sessions are indexed when a store outgrows the per-pass entry bound. A foreground
-agent in a shell session is attributed through it. A profile that sets only
+sessions are indexed when a store outgrows the per-pass entry bound. An agent
+outside any Pohunek session is attributed through it; a shell session reports its
+own active agent, and the rescan skips the processes the session owns. A profile that sets only
 `CLINE_DATA_DIR` moves the store out of reach of `[config_home]` and is not
 followed, and the `project.candidates` history source lists no Cline session. The
 parser id without the feature is `runtime_feature_unsupported`; with

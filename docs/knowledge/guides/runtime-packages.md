@@ -609,8 +609,10 @@ a new session directory evicts the watch registered longest ago, and older sessi
 by the periodic pass, so a large store never takes watches from other runtimes.
 On both backends (inotify on Linux, the recursive FSEvents watch on macOS) a change
 event the backend reports for a session log indexes it, wherever the pass stopped.
-A foreground agent started inside a shell session is
-attributed through this root; the agent's session log is the only evidence.
+An agent started outside any Pohunek session is
+attributed through this root; the agent's session log is the only evidence. An agent
+started inside a shell session is not: the session reports its own active agent, and
+the rescan skips every process a Pohunek session owns.
 
 A hook runtime whose conversation is a directory named after its id declares
 that next to its `hook` strategy:
@@ -660,8 +662,10 @@ working directory is `cwd`, used only when absolute. `<id>.messages.json` and th
 highest directory names first, so a store that outgrows the per-pass entry bound
 has its newest sessions indexed; that equals age order only for ids Cline
 generates (`<13-digit millisecond time>_<5 characters>`), not for the UUIDs Pohunek
-assigns with `--id`, which the observer finds through the periodic pass. A foreground
-`cline` started in a shell is attributed through this root. The parser id is refused
+assigns with `--id`, which the observer finds through the periodic pass. A
+`cline` started outside any Pohunek session is attributed through this root; one
+started inside a shell session is not, because that session reports its own active
+agent. The parser id is refused
 without the feature (`runtime_feature_unsupported`) and takes no `id_path` or `cwd_path`
 (`descriptor_invalid`).
 
