@@ -241,9 +241,7 @@ pub(crate) async fn run(args: &RunArgs) -> Result<ExitCode, CliError> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = tokio::task::spawn_blocking(move || command.status())
-        .await
-        .map_err(std::io::Error::other)??;
+    let status = run_until_exit(command).await?;
     let code = status_code(status);
     tracing::info!(
         package = %resolved.package.id,
@@ -253,6 +251,31 @@ pub(crate) async fn run(args: &RunArgs) -> Result<ExitCode, CliError> {
         "setup program finished"
     );
     Ok(ExitCode::from(code))
+}
+
+/// Runs `command` and waits for it, surviving the terminal's interrupt and quit
+/// signals.
+///
+/// The program shares the terminal's foreground process group, so Ctrl-C and
+/// Ctrl-\ reach it directly. This process installs handlers for both before the
+/// program starts and drops what they receive, so it neither dies first nor
+/// leaves the program running outside job control: the program restores the
+/// terminal in its own cleanup and its exit status becomes this command's.
+/// Handlers are reset to the default action by `exec`, so the program keeps the
+/// disposition it would have had without this command.
+async fn run_until_exit(mut command: Command) -> Result<ExitStatus, std::io::Error> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut quit = signal(SignalKind::quit())?;
+    let mut wait = tokio::task::spawn_blocking(move || command.status());
+    loop {
+        tokio::select! {
+            joined = &mut wait => return joined.map_err(std::io::Error::other)?,
+            _ = interrupt.recv() => {}
+            _ = quit.recv() => {}
+        }
+    }
 }
 
 /// Refuses an owner argument list that breaks a bound.

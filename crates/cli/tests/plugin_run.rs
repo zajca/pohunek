@@ -12,8 +12,9 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use package::{build_archive, read_archive, ArchiveEntry, Limits};
@@ -47,6 +48,18 @@ const EXIT_STATUS_CODE: u32 = 7;
 
 /// Owner argument that makes the fixture terminate itself with SIGTERM.
 const SIGNAL_ARG: &str = "term";
+
+/// Owner argument that makes the fixture trap SIGINT and wait for it.
+const INTERRUPT_ARG: &str = "interrupt";
+
+/// What the fixture prints once its SIGINT trap is set.
+const INTERRUPT_READY: &str = "READY_FOR_INT";
+
+/// Exit status the fixture's SIGINT trap chooses.
+const INTERRUPT_STATUS: u32 = 9;
+
+/// The terminal's interrupt character (Ctrl-C).
+const CTRL_C: &[u8] = b"\x03";
 
 /// Exit status of a program ended by SIGTERM, `128 + 15` in the shell convention.
 const SIGTERM_STATUS: u32 = 143;
@@ -84,6 +97,11 @@ awk 'BEGIN { for (name in ENVIRON) print "ENV " name }' | sort
 case " $* " in
 *" exit-seven "*) exit 7 ;;
 *" term "*) kill -TERM $$ ;;
+*" interrupt "*)
+    trap 'printf "GOT_INT\n"; exit 9' INT
+    printf 'READY_FOR_INT\n'
+    sleep 60
+    exit 3 ;;
 esac
 exit 0
 "#;
@@ -202,6 +220,16 @@ async fn run_detached(harness: &Harness, arguments: &[&str], extra: &[(&str, &st
 /// Runs `pohunek` on a pseudo terminal, so stdin and stderr are terminals, and
 /// returns the exit status and the transcript with CRLF line endings folded.
 fn run_on_terminal(harness: &Harness, arguments: &[&str]) -> (u32, String) {
+    run_on_terminal_typing(harness, arguments, None)
+}
+
+/// Like [`run_on_terminal`]; with `type_after` set to `(marker, bytes)`, writes
+/// `bytes` to the terminal once the transcript holds `marker`.
+fn run_on_terminal_typing(
+    harness: &Harness,
+    arguments: &[&str],
+    type_after: Option<(&str, &[u8])>,
+) -> (u32, String) {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: TERMINAL_ROWS,
@@ -226,16 +254,36 @@ fn run_on_terminal(harness: &Harness, arguments: &[&str]) -> (u32, String) {
     let mut child = pair.slave.spawn_command(command).expect("start pohunek");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("pty reader");
+    let collected = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&collected);
     let transcript = thread::spawn(move || {
-        let mut output = Vec::new();
+        let mut chunk = [0_u8; 4096];
         // The read fails with EIO once the child has closed the terminal.
-        let _ = reader.read_to_end(&mut output);
-        output
+        while let Ok(read) = reader.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            sink.lock()
+                .expect("transcript lock")
+                .extend_from_slice(&chunk[..read]);
+        }
     });
+    if let Some((marker, bytes)) = type_after {
+        let mut writer = pair.master.take_writer().expect("pty writer");
+        poll_until("the setup program to print its marker", || {
+            let seen = collected.lock().expect("transcript lock");
+            String::from_utf8_lossy(&seen)
+                .contains(marker)
+                .then_some(())
+        });
+        writer.write_all(bytes).expect("type into the terminal");
+        writer.flush().expect("flush the terminal");
+    }
     let status = poll_until("the pohunek child to exit", || {
         child.try_wait().expect("poll pohunek")
     });
-    let output = transcript.join().expect("transcript thread");
+    transcript.join().expect("transcript thread");
+    let output = collected.lock().expect("transcript lock").clone();
     let text = String::from_utf8_lossy(&output).replace("\r\n", "\n");
     (status.exit_code(), text)
 }
@@ -406,6 +454,19 @@ async fn reports_a_signalled_program_as_128_plus_signal() {
     let (code, transcript) =
         run_on_terminal(&harness, &["plugin", "run", PACKAGE, SETUP, SIGNAL_ARG]);
     assert_eq!(code, SIGTERM_STATUS, "{transcript}");
+}
+
+#[tokio::test]
+async fn an_interrupt_reaches_the_program_and_the_command_ends_with_its_status() {
+    let harness = Harness::start().await;
+    harness.install_setup_package().await;
+    let (code, transcript) = run_on_terminal_typing(
+        &harness,
+        &["plugin", "run", PACKAGE, SETUP, INTERRUPT_ARG],
+        Some((INTERRUPT_READY, CTRL_C)),
+    );
+    assert_eq!(code, INTERRUPT_STATUS, "{transcript}");
+    assert!(transcript.contains("GOT_INT"), "{transcript}");
 }
 
 #[tokio::test]

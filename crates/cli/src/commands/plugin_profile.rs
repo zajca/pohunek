@@ -1264,8 +1264,8 @@ async fn run_create(args: &CreateArgs) -> Result<(), CliError> {
     if options_toml.is_some() && !capabilities.package_create_profile_options_supported {
         return Err(Error::ProfileCreateOptionsUnsupported.into());
     }
-    // An older daemon would ignore the field and write the base program
-    // instead, so the refusal comes before anything is sent.
+    // An older daemon refuses the unknown `program` field, so the capability
+    // check reports it before anything is sent.
     if args.program.is_some() && !capabilities.package_create_profile_program_supported {
         return Err(Error::ProfileCreateProgramUnsupported.into());
     }
