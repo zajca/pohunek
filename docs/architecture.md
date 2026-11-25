@@ -1248,9 +1248,30 @@ the screen rules stay the fallback.
   they are never stored, logged or exposed. `kind` counts only with `blocked`. A
   probe (`7501;?`) is never a record. A record the daemon cannot map (an
   unknown `state` or another rejection of the whole payload, or an unknown
-  `kind`) is logged at debug level under `session.program_status.unmapped` with
+  `kind`) is logged at info level under `session.program_status.unmapped` with
   its `state`, `kind` and `app` tokens only; the text of `msg`, `title` and
-  `progress` is never logged.
+  `progress` is never logged. The line is info rather than debug because the
+  daemon's default filter is `info`: a debug-only journal would leave the
+  evidence of a newer agent's record nowhere. It is written only when the
+  manifest opted in to `[program_status]`, and carries one line per distinct
+  `(reason, state, kind, app)` tuple, up to a bounded set per session; after the
+  set is full it writes one `further unmapped program-status records suppressed`
+  line, so a program that repeats or varies the tokens cannot flood the log.
+- **Usage-limit capture.** A provider usage limit cannot be triggered on
+  demand, so the daemon journals what the screen shows when it happens. When
+  the visible screen names a usage limit (the detector's bounded marker list,
+  matched ASCII case-insensitively) and a manifest opted in to program-status
+  evidence, the detector records one sighting per screen, not one per redraw,
+  and journals at most a bounded number of sightings per detector before one
+  `further usage-limit screen sightings suppressed` line.
+  The session loop logs it at info under
+  `session.program_status.limit_screen` with the matched marker, the held root
+  record in canonical form (`app=..:state=..[:kind=..]`), its age and
+  staleness, the latest unmapped payload's tokens, and the published activity.
+  The unmapped journal is deduped per session as above.
+  The sighting changes no activity, attention or input readiness; the screen
+  text and every `msg`/`title` value stay out of the log. The evidence of a real
+  limit hit is therefore the journal line plus the record it names (#2101).
 - **Release gate.** A manifest may declare `[program_status] authority_from =
   "<MAJOR.MINOR.PATCH>"`. The records are authoritative only while the release
   the session's launch probed (the `version_probe` of the exact executable it

@@ -134,6 +134,56 @@ fn log_staleness_change(id: &SessionId, change: Option<crate::detect::StalenessC
     }
 }
 
+/// Journals a usage-limit screen sighting with the OSC 7501 evidence held at
+/// that moment, never screen or record text beyond the canonical record.
+///
+/// The line exists so the next real usage limit leaves evidence even though it
+/// cannot be triggered on demand (#2101). It carries the marker, the canonical
+/// held record, the record's age and staleness, the latest unmapped 7501 tokens
+/// and the published activity. Fields a sighting does not have render empty
+/// (`record`, the `unmapped_*` tokens) or `0` (`record_age_ms`). After
+/// `MAX_LIMIT_SIGHTINGS` lines the detector queues one suppression line, and
+/// that is the last line the session writes for the cap.
+fn log_usage_limit_sighting(id: &SessionId, sighting: Option<crate::detect::LimitSighting>) {
+    let Some(sighting) = sighting else {
+        return;
+    };
+    let sighting = match sighting {
+        crate::detect::LimitSighting::Screen(sighting) => sighting,
+        crate::detect::LimitSighting::Suppressed { sightings } => {
+            tracing::info!(
+                target: "session.program_status.limit_screen",
+                session = %id.0,
+                sightings,
+                "further usage-limit screen sightings suppressed"
+            );
+            return;
+        }
+    };
+    let record_age_ms = sighting
+        .record_age
+        .map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+    let unmapped = sighting.unmapped.as_ref();
+    tracing::info!(
+        target: "session.program_status.limit_screen",
+        session = %id.0,
+        marker = sighting.marker,
+        record = sighting.record,
+        record_age_ms,
+        stale = sighting.stale,
+        activity = sighting
+            .activity
+            .map_or("", |activity| activity.as_str()),
+        unmapped_reason = unmapped.map_or("", |unmapped| unmapped.reason),
+        unmapped_state = unmapped.map_or("", |unmapped| unmapped.state.as_str()),
+        unmapped_kind = unmapped.map_or("", |unmapped| unmapped.kind.as_str()),
+        unmapped_app = unmapped.map_or("", |unmapped| unmapped.app.as_str()),
+        unmapped_has_msg = unmapped.is_some_and(|unmapped| unmapped.has_msg),
+        unmapped_has_title = unmapped.is_some_and(|unmapped| unmapped.has_title),
+        "usage-limit screen seen"
+    );
+}
+
 fn reply_to_preview(
     detector: &mut Detector,
     tick: &mut tokio::time::Interval,
@@ -303,6 +353,10 @@ impl SessionRegistry {
                                         .await;
                                 }
                                 log_staleness_change(&id, detector.take_staleness_change());
+                                log_usage_limit_sighting(
+                                    &id,
+                                    detector.take_usage_limit_sighting(),
+                                );
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 // Skipped chunks are output too.

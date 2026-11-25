@@ -259,7 +259,32 @@ evidence in the commit message.
 
 Every non-null value is taken from the cited evidence in the `source` field
 of each row, never from a capture run. A usage-limit scenario is not part of
-the table (#2101: passive journaling only).
+the table: a limit cannot be triggered on demand, so it is captured passively
+(#2101).
+
+## Usage-limit evidence
+
+The daemon journals a usage-limit screen instead of a scenario capturing it.
+When the visible screen names a usage limit, the detector records one sighting
+and the session loop writes an info line under
+`session.program_status.limit_screen` to `~/.local/state/pohunek/logs/`, at
+most a bounded number of sightings per detector; after the cap it writes one
+`further usage-limit screen sightings suppressed` line and no further sighting.
+The
+line carries the matched marker, the held OSC 7501 record in canonical form,
+its age and staleness, the latest unmapped record's tokens (`state`, `kind`,
+`app`, whether it carried a message or a title) and the published activity;
+screen and message text never reach the log. A record the daemon cannot map is
+journaled at info under `session.program_status.unmapped`, once per distinct
+`(reason, state, kind, app)` tuple and only for a runtime that opted in to
+program status, up to a bounded set per session; after the set is full it writes
+one suppression line.
+
+After a real limit hit, collect the evidence for #2101 from those two targets,
+not from a canary run: the capture command has no usage-limit scenario. Record
+how Pohunek read the session (`session inspect` activity, attention and the
+notification) beside the journal lines, and post the sanitized lines to the
+issue. Never paste terminal output or a message body.
 
 ## How a difference is handled
 

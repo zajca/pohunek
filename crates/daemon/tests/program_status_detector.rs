@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
-    ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestError,
-    ProgramStatusConfig,
+    ActivityTransition, DetectionConfig, Detector, DetectorConfig, LimitSighting, Manifest,
+    ManifestError, ProgramStatusConfig, MAX_JOURNALED_UNMAPPED_TUPLES, MAX_LIMIT_SIGHTINGS,
 };
 use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
@@ -28,6 +28,30 @@ const COLUMNS: u16 = 100;
 const STEP: Duration = Duration::from_millis(10);
 /// Virtual time the debounce needs to confirm an idle or blocked candidate.
 const SETTLE_STEP: Duration = Duration::from_millis(100);
+
+/// A log writer the journal scenario can read back.
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// Settling ticks after which every debounced candidate has published.
 const SETTLE_TICKS: u32 = 12;
 /// The `app` the Claude test manifest opts in with.
@@ -302,6 +326,30 @@ fn captured(runtime: &str, name: &str) -> Vec<u8> {
         .map(|title| title.trim_end().to_owned());
     let rows: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
     frame(title.as_deref(), &rows)
+}
+
+/// A synthetic usage-limit screen.
+///
+/// No real usage-limit capture exists (#2101), so this fixture is invented:
+/// it pins the diagnostic trigger and the evidence it carries, not Claude's
+/// real limit layout.
+fn usage_limit_screen() -> Vec<u8> {
+    let text = read("crates/daemon/tests/fixtures/claude/usage-limit-screen.txt");
+    let rows: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+    frame(None, &rows)
+}
+
+/// A synthetic usage-limit screen naming `phrase`.
+fn usage_limit_banner(phrase: &str) -> Vec<u8> {
+    let line = format!("  Claude {phrase}");
+    frame(
+        None,
+        &[
+            "Claude Code",
+            line.as_str(),
+            "  Your limit will reset at 5:00 PM.",
+        ],
+    )
 }
 
 /// An activity and the source that reported it.
@@ -1824,5 +1872,261 @@ fn stale_after_ms_rejects_zero_and_an_hour_plus_a_millisecond() {
         parsed.program_status().expect("opted in").stale_after(),
         Some(Duration::from_secs(30)),
         "the window is kept as a duration"
+    );
+}
+
+/// A usage-limit screen is sighted once with the record held at that moment,
+/// and only a screen that stopped naming the limit re-arms the sighting.
+#[test]
+fn a_usage_limit_screen_is_sighted_once_with_the_held_record() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&claude_record("working"));
+    harness.feed(&usage_limit_screen());
+
+    let sighting = match harness
+        .detector
+        .take_usage_limit_sighting()
+        .expect("the usage-limit screen is sighted")
+    {
+        LimitSighting::Screen(sighting) => sighting,
+        LimitSighting::Suppressed { .. } => panic!("expected a screen sighting"),
+    };
+    assert_eq!(sighting.marker, "usage limit reached");
+    assert_eq!(sighting.record, "app=claude-code:state=working");
+    assert!(
+        sighting.record_age.is_some_and(|age| age > Duration::ZERO),
+        "the held record names its age"
+    );
+    assert!(!sighting.stale, "a fresh record is not stale");
+    assert_eq!(sighting.activity, WORKING.map(|(activity, _)| activity));
+    assert!(sighting.unmapped.is_none(), "the record mapped");
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a sighting is taken once"
+    );
+
+    // A redraw that keeps the limit text is no second sighting.
+    let mut redraw = usage_limit_screen();
+    redraw.extend_from_slice(b"\r\n  resets in 4h 59m");
+    harness.feed(&redraw);
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a redraw of the same limit screen is no sighting"
+    );
+
+    // A screen that stopped naming the limit re-arms the journal.
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&usage_limit_screen());
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_some(),
+        "the next hit is sighted again"
+    );
+}
+
+/// Alternating limit phrases are capped per detector: `MAX_LIMIT_SIGHTINGS`
+/// screens are journaled, the next one queues exactly one suppression line, and
+/// a lag resync or reconfigure keeps the budget spent (#2101 review).
+#[test]
+fn alternating_limit_screens_are_capped_with_one_suppression_line() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    let phrases = ["usage limit reached", "weekly limit"];
+    for index in 0..MAX_LIMIT_SIGHTINGS {
+        harness.feed(&usage_limit_banner(phrases[index % phrases.len()]));
+        let sighting = harness
+            .detector
+            .take_usage_limit_sighting()
+            .unwrap_or_else(|| panic!("sighting {index} is under the cap"));
+        assert!(
+            matches!(sighting, LimitSighting::Screen(_)),
+            "sighting {index}: {sighting:?}"
+        );
+    }
+
+    harness.feed(&usage_limit_banner(
+        phrases[MAX_LIMIT_SIGHTINGS % phrases.len()],
+    ));
+    assert_eq!(
+        harness.detector.take_usage_limit_sighting(),
+        Some(LimitSighting::Suppressed {
+            sightings: MAX_LIMIT_SIGHTINGS
+        }),
+        "one suppression line after the cap"
+    );
+
+    harness.detector.resync_after_lag();
+    harness.feed(&usage_limit_banner("usage limit resets"));
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a lag resync does not start a second budget"
+    );
+
+    harness.detector.reconfigure(
+        harness.now,
+        config(
+            &opted_in_source("claude", CLAUDE_APP, true),
+            InputReadiness::ScreenIdle,
+        ),
+    );
+    harness.feed(&usage_limit_banner("5-hour limit"));
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a reconfigure does not start a second budget"
+    );
+}
+
+/// A limit screen names the unmapped 7501 record too, because an unknown
+/// `kind` is exactly what the passive capture is meant to learn.
+#[test]
+fn a_usage_limit_screen_names_the_unmapped_record_too() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&record(&format!(
+        "state=blocked:app={CLAUDE_APP}:kind=limit"
+    )));
+    harness.feed(&usage_limit_screen());
+
+    let sighting = match harness
+        .detector
+        .take_usage_limit_sighting()
+        .expect("the usage-limit screen is sighted")
+    {
+        LimitSighting::Screen(sighting) => sighting,
+        LimitSighting::Suppressed { .. } => panic!("expected a screen sighting"),
+    };
+    assert_eq!(
+        sighting.record, "app=claude-code:state=blocked",
+        "the unknown kind is dropped from the held record"
+    );
+    let unmapped = sighting.unmapped.expect("the unmapped payload is kept");
+    assert_eq!(unmapped.reason, "unknown_kind");
+    assert_eq!(unmapped.state, "blocked");
+    assert_eq!(unmapped.kind, "limit");
+    assert_eq!(unmapped.app, CLAUDE_APP);
+    assert!(!unmapped.has_msg);
+    assert!(!unmapped.has_title);
+}
+
+/// A runtime without `[program_status]` reads no 7501 evidence, so a usage-limit
+/// screen is not sighted for it.
+#[test]
+fn a_runtime_without_program_status_has_no_usage_limit_sighting() {
+    let mut harness = Harness::claude_without_opt_in();
+    harness.feed(&usage_limit_screen());
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "the diagnostic needs the program-status opt-in"
+    );
+}
+
+/// The lines a detector journaled for an unmapped 7501 record.
+fn unmapped_journal_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains("session.program_status.unmapped"))
+        .collect()
+}
+
+/// Reads the log the scenario captured.
+fn journal_text(log: &CapturedLog) -> String {
+    String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned()
+}
+
+/// The unmapped journal needs the manifest's opt-in and carries one line per
+/// distinct tuple, alternating tuples included; after the bounded set it writes
+/// one suppression line, so a program that varies the tokens cannot flood the
+/// log (#2101 review).
+#[test]
+fn the_unmapped_journal_is_opted_in_and_deduped() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let log = CapturedLog::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    )
+    .expect("no other subscriber is installed in this test process");
+
+    let rejected = record(&format!("state=limit:app={CLAUDE_APP}:msg=c2VjcmV0"));
+
+    // Without the opt-in the payload is no diagnostic and is not journaled.
+    let mut plain = Harness::claude_without_opt_in();
+    plain.feed(&rejected);
+    assert!(
+        unmapped_journal_lines(&journal_text(&log)).is_empty(),
+        "a runtime without [program_status] journals no unmapped record"
+    );
+
+    // Three identical payloads carry one line.
+    let mut opted_in = Harness::claude();
+    for _ in 0..3 {
+        opted_in.feed(&rejected);
+    }
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(lines.len(), 1, "one line per distinct tuple: {lines:?}");
+    assert!(lines[0].contains("reason=\"rejected\""), "{}", lines[0]);
+    assert!(lines[0].contains("state=\"limit\""), "{}", lines[0]);
+
+    // A different tuple is one more line.
+    opted_in.feed(&record(&format!(
+        "state=blocked:app={CLAUDE_APP}:kind=limit"
+    )));
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(lines.len(), 2, "a new tuple is journaled: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("reason=\"unknown_kind\"")),
+        "{lines:?}"
+    );
+
+    // Alternating tuples are in the set, not only the last one.
+    for bytes in [
+        rejected.clone(),
+        record(&format!("state=blocked:app={CLAUDE_APP}:kind=limit")),
+        rejected.clone(),
+    ] {
+        opted_in.feed(&bytes);
+    }
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(lines.len(), 2, "A, B, A stays at two lines: {lines:?}");
+
+    // Fill the bounded set, then a further tuple adds one suppression line.
+    for index in 0..(MAX_JOURNALED_UNMAPPED_TUPLES - 2) {
+        opted_in.feed(&record(&format!("state=fill{index}:app={CLAUDE_APP}")));
+    }
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(
+        lines.len(),
+        MAX_JOURNALED_UNMAPPED_TUPLES,
+        "the set is full: {lines:?}"
+    );
+    opted_in.feed(&record(&format!("state=overflow:app={CLAUDE_APP}")));
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(
+        lines.len(),
+        MAX_JOURNALED_UNMAPPED_TUPLES + 1,
+        "one suppression line: {lines:?}"
+    );
+    assert!(
+        lines.last().is_some_and(|line| line.contains("suppressed")),
+        "{lines:?}"
+    );
+    opted_in.feed(&record(&format!("state=overflow2:app={CLAUDE_APP}")));
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(
+        lines.len(),
+        MAX_JOURNALED_UNMAPPED_TUPLES + 1,
+        "the suppression line is written once: {lines:?}"
     );
 }

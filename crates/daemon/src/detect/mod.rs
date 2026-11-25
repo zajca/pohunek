@@ -18,6 +18,7 @@ use crate::procwatch::ProcessFact;
 mod machine;
 mod manifest;
 mod osc;
+mod usage_limit;
 
 pub use machine::{ActivityEvidence, ActivityTransition, DetectionConfig, StateMachine};
 pub(crate) use manifest::MAX_MANIFEST_SOURCE_BYTES;
@@ -25,7 +26,11 @@ pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
     ProcessMatchers, ProgramStatusConfig,
 };
-pub use osc::{OscEvidence, OscParser, ProgressReport, ProgressState};
+pub use osc::{
+    OscEvidence, OscParser, ProgressReport, ProgressState, UnmappedProgramStatus,
+    MAX_JOURNALED_UNMAPPED_TUPLES,
+};
+pub use usage_limit::MAX_LIMIT_SIGHTINGS;
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
 use package::version_probe::ProbeVersion;
@@ -146,6 +151,44 @@ pub enum StalenessChange {
         /// Why the fallback ended.
         reason: StalenessEnd,
     },
+}
+
+/// What the session loop journals after a usage-limit screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitSighting {
+    /// A screen named a usage limit, with the OSC 7501 evidence held then.
+    Screen(LimitScreenSighting),
+    /// The detector reached [`MAX_LIMIT_SIGHTINGS`]; this is the one line
+    /// saying later screens are not journaled.
+    Suppressed {
+        /// The cap that produced this line.
+        sightings: usize,
+    },
+}
+
+/// A usage-limit screen the detector saw, with the OSC 7501 evidence held at
+/// that moment.
+///
+/// The sighting is diagnostics only (#2101): the session loop journals it so
+/// the next real usage limit leaves evidence. It changes no activity, no
+/// attention and no input readiness, and it never carries screen or record
+/// text beyond the canonical record tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitScreenSighting {
+    /// The bounded phrase the screen named.
+    pub marker: &'static str,
+    /// The held root record in its canonical form, empty when none is held.
+    pub record: String,
+    /// How long the held record was held when the screen was seen; `None`
+    /// when none is held.
+    pub record_age: Option<std::time::Duration>,
+    /// Whether the held record was stale when the screen was seen.
+    pub stale: bool,
+    /// The latest 7501 payload the parser could not map, when it is the
+    /// session's most recent program-status evidence.
+    pub unmapped: Option<UnmappedProgramStatus>,
+    /// The published activity when the screen was seen.
+    pub activity: Option<AgentActivity>,
 }
 
 /// The evidence state of a detector, as `session.detection` reports it.
@@ -491,6 +534,19 @@ pub struct Detector {
     stale: Option<StaleRecord>,
     /// The latest staleness change, for the session loop to journal.
     staleness_change: Option<StalenessChange>,
+    /// The phrase of the usage-limit screen currently on display, when one is.
+    /// It latches the diagnostic sighting: one journal line per sighting, not
+    /// one per redraw, and a fresh line only after the screen stopped naming
+    /// the limit.
+    usage_limit_marker: Option<&'static str>,
+    /// The latest usage-limit sighting, for the session loop to journal.
+    usage_limit_sighting: Option<LimitSighting>,
+    /// Usage-limit screens this detector journaled. The count survives
+    /// reconfiguration and lag resync: the cap is per detector, not per
+    /// latch, so a re-armed screen cannot start a second budget.
+    limit_sightings: usize,
+    /// Whether the one suppression line after the cap was queued.
+    limit_sightings_capped: bool,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
     /// Whether terminal context or the active manifest changed since the last
@@ -524,7 +580,7 @@ pub struct Detector {
 impl Detector {
     #[must_use]
     pub fn new(rows: u16, cols: u16, started_at: Instant, config: DetectorConfig) -> Self {
-        Self {
+        let mut detector = Self {
             osc: OscParser::new(),
             screen: ScreenTracker::new(rows, cols),
             state: StateMachine::new(started_at, config.detection),
@@ -544,6 +600,10 @@ impl Detector {
             disagreement_since: None,
             stale: None,
             staleness_change: None,
+            usage_limit_marker: None,
+            usage_limit_sighting: None,
+            limit_sightings: 0,
+            limit_sightings_capped: false,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
             context_dirty: true,
@@ -555,7 +615,18 @@ impl Detector {
             latch_evaluations: 0,
             #[cfg(test)]
             latch_sightings: 0,
-        }
+        };
+        detector
+            .osc
+            .set_journal_unmapped(detector.program_status_opt_in());
+        detector
+    }
+
+    /// Whether the active manifest opted in to `[program_status]`.
+    fn program_status_opt_in(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.program_status().is_some())
     }
 
     /// Ends the initial-input wait. Ordered startup observation stops with it
@@ -588,11 +659,7 @@ impl Detector {
         let mut applied_osc_evidence = false;
         // Without the opt-in a 7501 report is no event, so the screen is fed in
         // the same segments as for any other output.
-        if self
-            .manifest
-            .as_ref()
-            .is_none_or(|manifest| manifest.program_status().is_none())
-        {
+        if !self.program_status_opt_in() {
             osc_events.retain(|(item, _end)| !matches!(item, OscEvidence::ProgramStatus(_)));
         }
 
@@ -629,7 +696,8 @@ impl Detector {
 
         // Overall screen change keeps the debounced classification's
         // value-changed freshness semantics, unchanged for activity.
-        let screen_changed = self.screen.recent_text() != recent_before;
+        let recent_after = self.screen.recent_text();
+        let screen_changed = recent_after != recent_before;
         let freshness = ContextFreshness {
             screen: screen_changed,
             osc_title: osc_changes.title,
@@ -705,7 +773,70 @@ impl Detector {
             push_transition(&mut transitions, self.state.observe_bytes(now));
         }
 
+        // A screen that changes no text is the screen already seen, so the
+        // usage-limit sighting is read only from a chunk that changed it.
+        self.observe_usage_limit_screen(now, screen_changed.then_some(recent_after.as_str()));
+
         transitions
+    }
+
+    /// Records one usage-limit sighting per screen, never per redraw, up to
+    /// [`MAX_LIMIT_SIGHTINGS`] per detector.
+    ///
+    /// The diagnostic applies only to a runtime whose manifest opted in to
+    /// program-status evidence: it names the record held at that moment, which
+    /// is the 7501 evidence #2101 is missing. A screen that stopped naming the
+    /// limit re-arms the latch for the next hit; the cap suppresses the line
+    /// once the budget is spent.
+    fn observe_usage_limit_screen(&mut self, now: Instant, text: Option<&str>) {
+        if self
+            .manifest
+            .as_deref()
+            .and_then(Manifest::program_status)
+            .is_none()
+        {
+            return;
+        }
+        let Some(text) = text else {
+            return;
+        };
+        let Some(marker) = usage_limit::marker(text) else {
+            self.usage_limit_marker = None;
+            return;
+        };
+        if self.usage_limit_marker == Some(marker) {
+            return;
+        }
+        self.usage_limit_marker = Some(marker);
+        if self.limit_sightings >= MAX_LIMIT_SIGHTINGS {
+            if !self.limit_sightings_capped {
+                self.limit_sightings_capped = true;
+                self.usage_limit_sighting = Some(LimitSighting::Suppressed {
+                    sightings: MAX_LIMIT_SIGHTINGS,
+                });
+            }
+            return;
+        }
+        self.limit_sightings += 1;
+        self.usage_limit_sighting = Some(LimitSighting::Screen(LimitScreenSighting {
+            marker,
+            record: self
+                .program_status
+                .as_ref()
+                .map(ProgramStatusRecord::canonical)
+                .unwrap_or_default(),
+            record_age: self
+                .program_status_at
+                .map(|held_at| now.saturating_duration_since(held_at)),
+            stale: self.stale.is_some(),
+            unmapped: self.osc.last_unmapped().cloned(),
+            activity: self.state.published_activity(),
+        }));
+    }
+
+    /// Takes the latest usage-limit sighting, if one is pending.
+    pub fn take_usage_limit_sighting(&mut self) -> Option<LimitSighting> {
+        self.usage_limit_sighting.take()
     }
 
     #[cfg(test)]
@@ -1146,6 +1277,7 @@ impl Detector {
         self.context_dirty = true;
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
+        self.osc.set_journal_unmapped(self.program_status_opt_in());
         self.input_readiness = config.input_readiness;
         self.launch_name = config.launch_name;
         self.runtime_version = config.runtime_version;
@@ -1158,6 +1290,8 @@ impl Detector {
         self.program_status = None;
         self.program_status_at = None;
         self.disagreement_since = None;
+        self.usage_limit_marker = None;
+        self.osc.clear_unmapped();
         self.process_activity.reset();
         self.state.clear_pending();
         self.needs_visible_recheck = true;
@@ -1173,6 +1307,7 @@ impl Detector {
     /// next agent refresh.
     pub fn resync_after_lag(&mut self) {
         self.osc.reset();
+        self.osc.clear_unmapped();
         self.process_activity.reset();
         self.state.clear_pending();
         self.context_dirty = true;
@@ -1182,6 +1317,7 @@ impl Detector {
         self.program_status = None;
         self.program_status_at = None;
         self.disagreement_since = None;
+        self.usage_limit_marker = None;
         // No `now` is in scope here; the state machine stays, so its
         // `emitted_at` remains the honest refresh timestamp.
         if self.stale.take().is_some() {

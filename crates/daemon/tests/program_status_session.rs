@@ -127,7 +127,12 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// manifest's title blocker (priority above every dialog) matches. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
-/// transcript bullet that only looks like one, above the prompt box.
+/// transcript bullet that only looks like one, above the prompt box. `Q` draws
+/// a usage-limit screen.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the stand-in agent's command table is one script by design"
+)]
 fn agent_script() -> String {
     format!(
         r#"#!/bin/sh
@@ -211,9 +216,10 @@ run() {{
     W) show '' 'Waiting for permission\r\n' ;;
     S) printf '\033[2J\033[H✻ Billowing… (1…\r\n'; box ;;
     M) printf '\033]7501;state=blocked:kind=permission:app={APP}:msg=U0VDUkVULVBST01QVC1URVhU\033\\' ;;
-    L) printf '\033]7501;state=blocked:app={APP}:kind=limit:msg=c2VjcmV0LWxpbWl0LXRleHQ=\033\\'
-       printf '\033]7501;state=limit:app={APP}:msg=c2VjcmV0LXN0YXRlLXRleHQ=\033\\' ;;
+    L) printf '\033]7501;state=limit:app={APP}:msg=c2VjcmV0LXN0YXRlLXRleHQ=\033\\'
+       printf '\033]7501;state=blocked:app={APP}:kind=limit:msg=c2VjcmV0LWxpbWl0LXRleHQ=\033\\' ;;
     m) printf 'SYNC\r\n' ;;
+    Q) printf '\033[2J\033[H────────────────────────────────────────\r\n  Claude usage limit reached\r\n\r\n  Your limit will reset at 5:00 PM.\r\n\r\n  ❯ 1. Upgrade\r\n    2. Exit\r\n' ;;
     q) exit 0 ;;
   esac
 }}
@@ -1810,16 +1816,24 @@ fn unmapped_journal_lines(log: &str) -> Vec<&str> {
         .collect()
 }
 
-/// A record the detector cannot map is journaled at debug level without the
-/// text it carries, and it changes no state: an unknown `kind` still applies
-/// the record as blocked without a kind, and a rejected payload is only
-/// journaled.
+/// The lines the detector journaled for a usage-limit screen.
+fn usage_limit_journal_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains("session.program_status.limit_screen"))
+        .collect()
+}
+
+/// A record the detector cannot map is journaled at info without the text it
+/// carries, and a usage-limit screen journals the 7501 evidence held at that
+/// moment. Neither changes state: an unknown `kind` still applies the record as
+/// blocked without a kind, a rejected payload is only journaled, and the
+/// usage-limit screen is diagnostics only (#2101).
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "the journal scenario pins both unmapped shapes, their count, and the late-line recount"
+    reason = "the journal scenario pins both unmapped shapes, their count, the late-line recount, and the usage-limit sighting"
 )]
-async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
+async fn the_program_status_diagnostics_are_journaled_at_info_without_their_text() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -1828,7 +1842,7 @@ async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
         tracing_subscriber::fmt()
             .with_writer(captured.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(tracing::Level::INFO)
             .finish(),
     )
     .expect("no other subscriber is installed in this test process");
@@ -1928,6 +1942,46 @@ async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
         Some("blocked")
     );
     assert_eq!(attention.records(&created.id).len(), 1, "one record");
+
+    command(&fixture, b'Q');
+    let logged = wait_until("the usage-limit sighting", || async {
+        let logged = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
+        (!usage_limit_journal_lines(&logged).is_empty()).then_some(logged)
+    })
+    .await;
+    let lines = usage_limit_journal_lines(&logged);
+    assert_eq!(lines.len(), 1, "one sighting per screen: {lines:?}");
+    let sighting = lines[0];
+    for expected in [
+        "marker=\"usage limit reached\"",
+        "record=\"app=fake:state=blocked\"",
+        "record_age_ms=",
+        "stale=false",
+        "activity=\"blocked\"",
+        "unmapped_reason=\"unknown_kind\"",
+        "unmapped_state=\"blocked\"",
+        "unmapped_kind=\"limit\"",
+        "unmapped_app=\"fake\"",
+        "unmapped_has_msg=true",
+        "unmapped_has_title=false",
+    ] {
+        assert!(sighting.contains(expected), "{expected}: {sighting}");
+    }
+    // The usage-limit screen is diagnostics only: the held record and the
+    // activity are unchanged, and no message text reaches the log.
+    assert_eq!(
+        fixture.activity(&created.id).await,
+        Some((AgentActivity::Blocked, StateSource::OscProgress)),
+        "the limit screen changes no activity"
+    );
+    for secret in [
+        "secret-limit-text",
+        "secret-state-text",
+        "c2VjcmV0LWxpbWl0LXRleHQ=",
+        "c2VjcmV0LXN0YXRlLXRleHQ=",
+    ] {
+        assert!(!logged.contains(secret), "{secret}: {logged}");
+    }
 
     let logged = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
     let lines = unmapped_journal_lines(&logged);
