@@ -3564,6 +3564,11 @@ impl DamagedHost {
         let release = host.env.root().join("release").join("runtime");
         catalog.write_release(&release, &[DAMAGED_BASE]);
         let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+        // The damaged bindings name a Pi conversation; the declared check
+        // applies to it, so its session file exists.
+        let sessions = host.env.home().join(".pi/agent/sessions");
+        fs::create_dir_all(&sessions).expect("pi sessions dir");
+        fs::write(sessions.join("stamp_native-fixture-2.jsonl"), b"{}\n").expect("pi session");
         Self {
             host,
             release,
