@@ -1374,7 +1374,8 @@ pub(super) fn check_recovery_reference(
 /// The existence check the native-reference preflight and the last-activity
 /// enrichment run on `binding`, from the runtime descriptor alone.
 ///
-/// An assigned reference carries its check frozen into the launch spec; a hook
+/// An assigned runtime carries its check frozen into the launch spec and applies
+/// it to its assigned reference and to an id a hook reported; a hook
 /// runtime's id-kind reference uses the `[native_reference.existence]`
 /// declaration of the descriptor. A hook reference of a runtime that leaves
 /// the check undeclared, and any path-kind reference, verifies nothing: the
@@ -1392,7 +1393,10 @@ pub(super) fn reference_existence(
         NativeReferenceProvenance::Assigned => launch
             .and_then(NativeSessionLaunch::assigned)
             .map(|assigned| assigned.existence().clone()),
-        NativeReferenceProvenance::Reported => definition.hook_existence().cloned(),
+        NativeReferenceProvenance::Reported => launch
+            .and_then(NativeSessionLaunch::assigned)
+            .map(|assigned| assigned.existence().clone())
+            .or_else(|| definition.hook_existence().cloned()),
     }
 }
 
