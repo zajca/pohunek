@@ -5,7 +5,10 @@
   runtime, falling back to the hook runtime's declared check. Resume, the
   stored-binding preflight, the activity lookup and the upgrade preflight
   share it, so a reported id whose conversation file is gone is refused with
-  `agent_native_reference_missing`. Covered by
+  `agent_native_reference_missing`. The upgrade preflight judges such a
+  missing file `would_lose_recovery`, because the running release may not
+  check a reported id (`reported_check_identity` in
+  `reconcile/upgrade_preflight.rs`). Covered by
   `recovery_checks_an_assigned_reference_and_a_reported_one`
   in `crates/daemon/src/session/tests/native_supersede.rs`. Docs: the
   `sessions.md` assigned-reference paragraph and the `runtime-packages.md`
