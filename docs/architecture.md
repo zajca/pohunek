@@ -1254,8 +1254,9 @@ the screen rules stay the fallback.
   daemon's default filter is `info`: a debug-only journal would leave the
   evidence of a newer agent's record nowhere. It is written only when the
   manifest opted in to `[program_status]`, and carries one line per distinct
-  `(reason, state, kind, app)` tuple per session, so a program that repeats one
-  unmapped record cannot flood the log.
+  `(reason, state, kind, app)` tuple, up to a bounded set per session; after the
+  set is full it writes one `further unmapped program-status records suppressed`
+  line, so a program that repeats or varies the tokens cannot flood the log.
 - **Usage-limit capture.** A provider usage limit cannot be triggered on
   demand, so the daemon journals what the screen shows when it happens. When
   the visible screen names a usage limit (the detector's bounded marker list,

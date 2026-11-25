@@ -467,8 +467,9 @@ open and the records stay authoritative
   `session.program_status.limit_screen`: the matched marker, the held record in
   canonical form, its age and staleness, the latest unmapped 7501 tokens and the
   published activity. The unmapped journal that feeds it is written only for an
-  opted-in runtime and once per distinct `(reason, state, kind, app)` tuple, so
-  repeated records do not flood the log. Claude's real limit screen has not been
+  opted-in runtime and once per distinct `(reason, state, kind, app)` tuple, up
+  to a bounded set per session; after the set is full it writes one suppression
+  line, so repeated or varied records do not flood the log. Claude's real limit screen has not been
   captured yet; the marker list and the journal line are how the next real hit
   leaves evidence (#2101). The journal changes no activity, attention or input
   readiness.

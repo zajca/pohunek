@@ -26,7 +26,10 @@ pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
     ProcessMatchers, ProgramStatusConfig,
 };
-pub use osc::{OscEvidence, OscParser, ProgressReport, ProgressState, UnmappedProgramStatus};
+pub use osc::{
+    OscEvidence, OscParser, ProgressReport, ProgressState, UnmappedProgramStatus,
+    MAX_JOURNALED_UNMAPPED_TUPLES,
+};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
 use package::version_probe::ProbeVersion;

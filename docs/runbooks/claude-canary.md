@@ -274,7 +274,8 @@ its age and staleness, the latest unmapped record's tokens (`state`, `kind`,
 screen and message text never reach the log. A record the daemon cannot map is
 journaled at info under `session.program_status.unmapped`, once per distinct
 `(reason, state, kind, app)` tuple and only for a runtime that opted in to
-program status.
+program status, up to a bounded set per session; after the set is full it writes
+one suppression line.
 
 After a real limit hit, collect the evidence for #2101 from those two targets,
 not from a canary run: the capture command has no usage-limit scenario. Record

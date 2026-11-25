@@ -22,6 +22,14 @@ const UNMAPPED_PROGRAM_STATUS_TARGET: &str = "session.program_status.unmapped";
 /// such a token from turning into a long log line.
 const MAX_JOURNAL_TOKEN_CHARS: usize = 16;
 
+/// Most distinct unmapped 7501 tuples one session journals at info.
+///
+/// The journal keeps one line per distinct tuple so a program that repeats a
+/// record cannot flood the log. A program that varies the bounded tokens could
+/// still rotate the log, so the set is bounded: after this many tuples the
+/// parser writes one "further records suppressed" line and nothing more.
+pub const MAX_JOURNALED_UNMAPPED_TUPLES: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscEvidence {
     Title(String),
@@ -226,9 +234,11 @@ pub struct OscParser {
     /// Whether the active manifest opted in to `[program_status]`. Only then is
     /// an unmapped payload journaled; the detector sets this from the manifest.
     journal_unmapped: bool,
-    /// The latest tuple journaled, so a program that repeats one unmapped
-    /// record cannot flood the log.
-    last_journaled_unmapped: Option<UnmappedProgramStatus>,
+    /// The distinct unmapped tuples this session journaled, bounded by
+    /// [`MAX_JOURNALED_UNMAPPED_TUPLES`].
+    journaled_unmapped: Vec<UnmappedProgramStatus>,
+    /// Whether the one "further records suppressed" line has been written.
+    unmapped_journal_full: bool,
 }
 
 impl OscParser {
@@ -321,30 +331,43 @@ impl OscParser {
     /// The line is INFO, not debug: the daemon's default filter is `info`, so a
     /// debug-only journal would leave the evidence a real hit is meant to
     /// collect nowhere. The record is bounded, and the journal carries one line
-    /// per distinct `(reason, state, kind, app)` tuple per session: a program
-    /// that prints the same unmapped record in a loop cannot flood the log.
+    /// per distinct `(reason, state, kind, app)` tuple per session, up to
+    /// [`MAX_JOURNALED_UNMAPPED_TUPLES`]. After the bound it writes one "further
+    /// unmapped records suppressed" line, so a program that varies the bounded
+    /// tokens cannot rotate the log either.
     fn journal_unmapped_record(&mut self, unmapped: &UnmappedProgramStatus) {
         if !self.journal_unmapped {
             return;
         }
         if self
-            .last_journaled_unmapped
-            .as_ref()
-            .is_some_and(|last| last.same_journal_tuple(unmapped))
+            .journaled_unmapped
+            .iter()
+            .any(|known| known.same_journal_tuple(unmapped))
         {
             return;
         }
-        tracing::info!(
-            target: UNMAPPED_PROGRAM_STATUS_TARGET,
-            reason = unmapped.reason,
-            state = unmapped.state.as_str(),
-            kind = unmapped.kind.as_str(),
-            app = unmapped.app.as_str(),
-            has_msg = unmapped.has_msg,
-            has_title = unmapped.has_title,
-            "unmapped program-status record"
-        );
-        self.last_journaled_unmapped = Some(unmapped.clone());
+        if self.journaled_unmapped.len() < MAX_JOURNALED_UNMAPPED_TUPLES {
+            tracing::info!(
+                target: UNMAPPED_PROGRAM_STATUS_TARGET,
+                reason = unmapped.reason,
+                state = unmapped.state.as_str(),
+                kind = unmapped.kind.as_str(),
+                app = unmapped.app.as_str(),
+                has_msg = unmapped.has_msg,
+                has_title = unmapped.has_title,
+                "unmapped program-status record"
+            );
+            self.journaled_unmapped.push(unmapped.clone());
+            return;
+        }
+        if !self.unmapped_journal_full {
+            self.unmapped_journal_full = true;
+            tracing::info!(
+                target: UNMAPPED_PROGRAM_STATUS_TARGET,
+                journaled = MAX_JOURNALED_UNMAPPED_TUPLES,
+                "further unmapped program-status records suppressed"
+            );
+        }
     }
 
     fn advance_ground(&mut self, byte: u8) {

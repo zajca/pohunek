@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
     ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestError,
-    ProgramStatusConfig,
+    ProgramStatusConfig, MAX_JOURNALED_UNMAPPED_TUPLES,
 };
 use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
@@ -1960,7 +1960,8 @@ fn journal_text(log: &CapturedLog) -> String {
 }
 
 /// The unmapped journal needs the manifest's opt-in and carries one line per
-/// distinct tuple: a program that repeats one unmapped record cannot flood the
+/// distinct tuple, alternating tuples included; after the bounded set it writes
+/// one suppression line, so a program that varies the tokens cannot flood the
 /// log (#2101 review).
 #[test]
 fn the_unmapped_journal_is_opted_in_and_deduped() {
@@ -2010,5 +2011,49 @@ fn the_unmapped_journal_is_opted_in_and_deduped() {
             .iter()
             .any(|line| line.contains("reason=\"unknown_kind\"")),
         "{lines:?}"
+    );
+
+    // Alternating tuples are in the set, not only the last one.
+    for bytes in [
+        rejected.clone(),
+        record(&format!("state=blocked:app={CLAUDE_APP}:kind=limit")),
+        rejected.clone(),
+    ] {
+        opted_in.feed(&bytes);
+    }
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(lines.len(), 2, "A, B, A stays at two lines: {lines:?}");
+
+    // Fill the bounded set, then a further tuple adds one suppression line.
+    for index in 0..(MAX_JOURNALED_UNMAPPED_TUPLES - 2) {
+        opted_in.feed(&record(&format!("state=fill{index}:app={CLAUDE_APP}")));
+    }
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(
+        lines.len(),
+        MAX_JOURNALED_UNMAPPED_TUPLES,
+        "the set is full: {lines:?}"
+    );
+    opted_in.feed(&record(&format!("state=overflow:app={CLAUDE_APP}")));
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(
+        lines.len(),
+        MAX_JOURNALED_UNMAPPED_TUPLES + 1,
+        "one suppression line: {lines:?}"
+    );
+    assert!(
+        lines.last().is_some_and(|line| line.contains("suppressed")),
+        "{lines:?}"
+    );
+    opted_in.feed(&record(&format!("state=overflow2:app={CLAUDE_APP}")));
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(
+        lines.len(),
+        MAX_JOURNALED_UNMAPPED_TUPLES + 1,
+        "the suppression line is written once: {lines:?}"
     );
 }
