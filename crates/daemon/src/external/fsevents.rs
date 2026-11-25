@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
 use super::watch::{RootRegistration, WatchBackend, WatchEvent};
-use super::{is_absent_error, is_jsonl_path};
+use super::{is_absent_error, may_be_transcript};
 
 /// Cause reported when the `FSEvents` watcher cannot be created.
 pub(super) const OPEN_FAILED_CAUSE: &str = "fsevents_open_failed";
@@ -197,8 +197,8 @@ fn classify(kind: EventKind, path: &Path) -> Hint {
         EventKind::Modify(ModifyKind::Name(_)) | EventKind::Create(_) | EventKind::Remove(_) => {
             match fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.is_dir() => Hint::Tree,
-                Ok(_) if is_jsonl_path(path) => Hint::File,
-                Err(_) if is_jsonl_path(path) => Hint::Both,
+                Ok(_) if may_be_transcript(path) => Hint::File,
+                Err(_) if may_be_transcript(path) => Hint::Both,
                 Ok(_) | Err(_) => Hint::Tree,
             }
         }

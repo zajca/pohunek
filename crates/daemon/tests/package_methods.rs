@@ -1239,6 +1239,53 @@ async fn a_transcript_root_of_its_own_installs_only_with_its_feature_and_valid()
     servers.stop().await;
 }
 
+const CLINE_SESSION_FEATURE: &str = "\"transcripts-cline-session-v1\"";
+
+#[tokio::test]
+async fn the_cline_session_parser_installs_only_with_its_feature() {
+    let servers = spawn_servers("pkg-cline-session").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let tables = head_paths_transcripts("cline-session-v1", "");
+
+    // The parser id is refused without `requires`.
+    let gated = [("parser", descriptor_requiring("", &tables))];
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &gated,
+        "runtime_feature_unsupported",
+    )
+    .await;
+    // The fixed layout of the parser takes no key paths.
+    let head_paths = [(
+        "head-paths",
+        descriptor_requiring(
+            &format!("{CLINE_SESSION_FEATURE}, {HEAD_PATHS_FEATURE}"),
+            &head_paths_transcripts("cline-session-v1", "id_path = [\"session_id\"]\n"),
+        ),
+    )];
+    assert_install_codes(
+        &mut local,
+        &servers.plugins,
+        &head_paths,
+        "package_descriptor_invalid",
+    )
+    .await;
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let document = descriptor_requiring(CLINE_SESSION_FEATURE, &tables);
+    let (_digest, result) =
+        install_descriptor(&mut local, &servers.plugins, "accepted", &document, false).await;
+    result.unwrap_or_else(|error| panic!("the parser installs with its feature: {error:?}"));
+
+    drop(local);
+    servers.stop().await;
+}
+
 const HEAD_PATHS_FEATURE: &str = "\"transcripts-head-paths-v1\"";
 
 /// A `[transcripts]` table below the config home with the given extra keys.

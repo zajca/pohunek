@@ -85,6 +85,17 @@ fn prepare_arming_probe(root: &Path) -> PathBuf {
 /// next periodic pass, so a scenario that changes the tree right after start
 /// first waits here for proof that live events arrive.
 async fn arm(index: &TranscriptIndex, sessions: &ExternalSessions, probe: &Path) {
+    arm_with(index, sessions, probe, &record(ARMING_SESSION)).await;
+}
+
+/// [`arm`] with `content` as the probe, for a root whose parser reads another
+/// transcript shape.
+async fn arm_with(
+    index: &TranscriptIndex,
+    sessions: &ExternalSessions,
+    probe: &Path,
+    content: &str,
+) {
     let indexed = || {
         index
             .inner
@@ -97,7 +108,7 @@ async fn arm(index: &TranscriptIndex, sessions: &ExternalSessions, probe: &Path)
     let arming = async {
         loop {
             let notified = sessions.inner.rescan.notified();
-            fs::write(probe, record(ARMING_SESSION)).expect("write arming probe");
+            fs::write(probe, content).expect("write arming probe");
             if indexed() {
                 return;
             }
@@ -879,4 +890,156 @@ async fn a_transcript_below_the_depth_bound_is_never_indexed() {
     assert!(!indexed(&root.join("a/b/deep-before.jsonl")));
     assert!(!indexed(&deep));
     sessions.shutdown();
+}
+
+/// A Cline session manifest captured from Cline 3.0.74, with the session and
+/// the workspace filled in.
+fn cline_manifest(session: &str, workspace: &str) -> String {
+    include_str!("../../tests/fixtures/cline/session-manifest.json")
+        .replace("@SESSION@", session)
+        .replace("@WORKSPACE@", workspace)
+        .replace("@PROMPT@", "first turn")
+}
+
+/// Writes `content` as `<session>/<file>` below `root` and returns its path.
+fn write_cline_file(root: &Path, session: &str, file: &str, content: &str) -> PathBuf {
+    let path = root.join(session).join(file);
+    fs::create_dir_all(path.parent().expect("session directory")).expect("session directory");
+    fs::write(&path, content).expect("write the manifest");
+    path
+}
+
+#[tokio::test]
+async fn a_cline_manifest_written_while_watching_is_indexed_by_a_live_event() {
+    let base = pohunek_test_support::tempdir().expect("fixture base");
+    let root = base.path().join("data/sessions");
+    let probe = root.join(format!("{ARMING_SESSION}/{ARMING_SESSION}.json"));
+    fs::create_dir_all(probe.parent().expect("probe directory")).expect("probe directory");
+    let sessions = ExternalSessions::new();
+    let roots = vec![TranscriptRoot {
+        parser: TranscriptParser::from_id("cline-session-v1").expect("the Cline parser"),
+        head_paths: HeadPaths::default(),
+        agent_base: RuntimeRef::from_wire("cline"),
+        path: root.clone(),
+        private: false,
+        max_depth: None,
+    }];
+    let (index, _handle) = start_transcript_index(&roots, &sessions).await;
+    arm_with(
+        &index,
+        &sessions,
+        &probe,
+        &cline_manifest(ARMING_SESSION, "/work"),
+    )
+    .await;
+    let indexed = |path: &Path| index.inner.lock().expect("index").contains_key(path);
+
+    // Files no session owns, written first; the manifest written last is
+    // indexed only after the events before it have been handled.
+    let session = "1793924186893_abc12";
+    let foreign = write_cline_file(
+        &root,
+        "1793924186893_foreign",
+        "1793924186893_foreign.json",
+        &cline_manifest("1793924186893_other", "/work"),
+    );
+    let messages = write_cline_file(
+        &root,
+        session,
+        &format!("{session}.messages.json"),
+        &cline_manifest(session, "/work"),
+    );
+    let subagent = write_cline_file(
+        &root,
+        session,
+        "helper__000001.messages.json",
+        &cline_manifest(session, "/work"),
+    );
+    let manifest = write_cline_file(
+        &root,
+        session,
+        &format!("{session}.json"),
+        &cline_manifest(session, "/work"),
+    );
+    let wait = async {
+        while !indexed(&manifest) {
+            sessions.inner.rescan.notified().await;
+        }
+    };
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, wait)
+        .await
+        .expect("the manifest is indexed by a live event");
+
+    assert!(!indexed(&foreign));
+    assert!(!indexed(&messages));
+    assert!(!indexed(&subagent));
+    sessions.shutdown();
+}
+
+/// Session directories of the large Cline store scenario: more than the
+/// backend-wide directory budget of one walk.
+const CLINE_STORE_SESSIONS: usize = 8300;
+
+#[tokio::test]
+async fn a_cline_store_over_the_directory_budget_keeps_its_newest_sessions_live() {
+    let base = pohunek_test_support::tempdir().expect("fixture base");
+    let root = base.path().join("data/sessions");
+    let id = |number: usize| format!("1793924186893_{number:05}");
+    for number in 0..CLINE_STORE_SESSIONS {
+        fs::create_dir_all(root.join(id(number))).expect("session directory");
+    }
+    let probe = root.join(format!("{ARMING_SESSION}/{ARMING_SESSION}.json"));
+    fs::create_dir_all(probe.parent().expect("probe directory")).expect("probe directory");
+    let sessions = ExternalSessions::new();
+    let roots = vec![TranscriptRoot {
+        parser: TranscriptParser::from_id("cline-session-v1").expect("the Cline parser"),
+        head_paths: HeadPaths::default(),
+        agent_base: RuntimeRef::from_wire("cline"),
+        path: root.clone(),
+        private: false,
+        max_depth: None,
+    }];
+    let (index, _handle) = start_transcript_index(&roots, &sessions).await;
+    arm_with(
+        &index,
+        &sessions,
+        &probe,
+        &cline_manifest(ARMING_SESSION, "/work"),
+    )
+    .await;
+
+    // The highest generated id is among the newest session directories, which
+    // hold a watch although the store outgrew the walk's directory budget.
+    let newest = id(CLINE_STORE_SESSIONS - 1);
+    let manifest = write_cline_file(
+        &root,
+        &newest,
+        &format!("{newest}.json"),
+        &cline_manifest(&newest, "/work"),
+    );
+    let wait = async {
+        while !index.inner.lock().expect("index").contains_key(&manifest) {
+            sessions.inner.rescan.notified().await;
+        }
+    };
+    tokio::time::timeout(LIVE_EVENT_TIMEOUT, wait)
+        .await
+        .expect("the newest session is indexed by a live event");
+    sessions.shutdown();
+}
+
+#[tokio::test]
+async fn a_json_file_named_after_its_directory_is_no_transcript_below_a_jsonl_root() {
+    let live = Live::start(|_base, root| fs::create_dir_all(root.join("p")).expect("root")).await;
+
+    // The file has the shape of a Cline manifest and the content a `.jsonl`
+    // head parser reads; only the `.jsonl` written after it is a transcript.
+    let json = live.root.join("p/p.json");
+    fs::write(&json, record("not-a-transcript")).expect("write the json file");
+    let transcript = live.root.join("p/s.jsonl");
+    write_transcript(&transcript, "transcript");
+    live.wait_for_session(&transcript, "transcript").await;
+
+    assert!(!live.is_indexed(&json));
+    live.sessions.shutdown();
 }

@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "session_id": "@SESSION@",
+  "source": "cli",
+  "started_at": "2026-11-06T00:16:24.606Z",
+  "exit_code": null,
+  "status": "idle",
+  "interactive": true,
+  "provider": "openai-compatible",
+  "model": "stub-model",
+  "cwd": "@WORKSPACE@",
+  "workspace_root": "@WORKSPACE@",
+  "team_name": "team-00001",
+  "enable_tools": true,
+  "enable_spawn": true,
+  "enable_teams": true,
+  "prompt": "@PROMPT@",
+  "metadata": {
+    "sessionHistoryOrigin": {
+      "mode": "user",
+      "version": "3.0.74"
+    },
+    "git": {
+      "branch": "main"
+    },
+    "checkpoint": {
+      "latest": {
+        "ref": "0000000000000000000000000000000000000001",
+        "createdAt": 1793924186893,
+        "runCount": 1,
+        "kind": "commit"
+      },
+      "history": [
+        {
+          "ref": "0000000000000000000000000000000000000001",
+          "createdAt": 1793924186893,
+          "runCount": 1,
+          "kind": "commit"
+        }
+      ]
+    },
+    "title": "first turn",
+    "totalCost": 0,
+    "aggregatedAgentsCost": 0,
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "totalCost": 0
+    },
+    "aggregateUsage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "totalCost": 0
+    }
+  },
+  "messages_path": "@WORKSPACE@/.cline/data/sessions/@SESSION@/@SESSION@.messages.json"
+}

@@ -22,7 +22,7 @@ use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 
 use super::watch::{RootRegistration, WalkBound, WatchBackend, WatchEvent};
-use super::{is_absent_error, is_jsonl_path, MAX_WALK_DIRECTORIES, MAX_WALK_ENTRIES};
+use super::{is_absent_error, may_be_transcript, MAX_WALK_DIRECTORIES, MAX_WALK_ENTRIES};
 
 /// Cause reported when the inotify instance cannot be created.
 pub(super) const OPEN_FAILED_CAUSE: &str = "inotify_open_failed";
@@ -119,7 +119,7 @@ struct Discovery {
 impl Discovery {
     /// Records `path` when it is a transcript, within the discovery bound.
     fn note(&mut self, path: PathBuf) {
-        if !is_jsonl_path(&path) {
+        if !may_be_transcript(&path) {
             return;
         }
         if self.paths.len() < MAX_DISCOVERED_TRANSCRIPTS {
@@ -263,7 +263,7 @@ impl InotifyBackend {
             if event.mask & libc::IN_ISDIR != 0 {
                 if event.mask & DIR_ADDED_MASK != 0 {
                     out.push(WatchEvent::NewDirectory(path.clone()));
-                    if is_jsonl_path(&path) {
+                    if may_be_transcript(&path) {
                         // A directory taking over a transcript's name must drop the candidate.
                         out.push(WatchEvent::Changed(path));
                     }
@@ -379,6 +379,12 @@ impl InotifyBackend {
                         >= MAX_WALK_DIRECTORIES
                     {
                         failures.record(limit_error("watched directory limit reached"));
+                        if share_root.is_some() {
+                            // The listing is newest name first: the directories
+                            // collected so far are the newest and are still
+                            // registered.
+                            break;
+                        }
                         break 'walk;
                     }
                     subdirectories.push(entry.path);

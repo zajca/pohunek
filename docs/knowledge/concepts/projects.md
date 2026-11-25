@@ -36,7 +36,8 @@ repository, and `registered` says whether a project record exists.
 both with `--sources pohunek,history`), and naming it is the consent to do so. The privacy contract:
 
 - Only the locations the installed runtime packages declare (the `[transcripts]`
-  table of the runtime descriptor) are opened, and only `jsonl-head-v1` files.
+  table of the runtime descriptor) are opened, and only `jsonl-head-v1` files
+  (a runtime whose parser is `muse-session-v1` or `cline-session-v1` is not read).
 - From each file only the head is read, and only two values are kept: the
   working directory of the first record that names one, and the file's
   modification time. Message bodies are never interpreted, kept or logged.

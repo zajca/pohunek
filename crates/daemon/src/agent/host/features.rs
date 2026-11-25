@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::detect::Manifest;
 
 use super::definition::{DefinitionError, MAX_LABEL_BYTES};
-use super::transcripts::MUSE_SESSION_PARSER_ID;
+use super::transcripts::{CLINE_SESSION_PARSER_ID, MUSE_SESSION_PARSER_ID};
 
 /// Maximum number of entries in a descriptor's `requires`.
 pub(super) const MAX_REQUIRES: usize = 16;
@@ -196,6 +196,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "package-setup-v1",
         since: "0.45.0",
     },
+    RuntimeFeature {
+        id: "transcripts-cline-session-v1",
+        since: "0.45.0",
+    },
 ];
 
 /// The ids of [`RUNTIME_FEATURES`], in registry order: what `host.inspect`
@@ -299,6 +303,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "agent-skill-v1",
         rule: GateRule::Key("agent_skill"),
+    },
+    FeatureGate {
+        feature: "transcripts-cline-session-v1",
+        rule: GateRule::Value("transcripts.parser", CLINE_SESSION_PARSER_ID),
     },
 ];
 

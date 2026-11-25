@@ -1316,7 +1316,8 @@ parser = "jsonl-head-v1"
 dir = "sessions"
 ```
 
-`parser` is a closed set compiled into core (`jsonl-head-v1`: the first session
+`parser` is a closed set compiled into core (`muse-session-v1` and
+`cline-session-v1` have sections below; `jsonl-head-v1`: the first session
 id, transcript path and absolute working directory in the first 32 records or
 64 KiB, skipping a line that is not JSON or not UTF-8, with `session_id` before `sessionId`, `conversation_id` and
 `conversationId`). `dir` follows the `[config_home]` `default` rule (relative,
@@ -1388,6 +1389,24 @@ with `strategy = "hook"` and an id-kind reference and without `name_match`,
 `agent_native_reference_missing` when no regular `<reference>/<file_name>`
 exists there; no symlink is followed. The declaration is not stored with a
 session, so the stored shape of an assigned reference is unchanged.
+
+#### Cline session manifests
+
+With the runtime feature `transcripts-cline-session-v1` (listed in `requires`) a
+descriptor names `parser = "cline-session-v1"` and a `dir` below `[config_home]`
+(`data/sessions` for Cline); the parser adds no key. It reads only a file at
+`<id>/<id>.json` below `dir`: one JSON object of at most 64 KiB whose
+`session_id` equals the `<id>` directory name and holds no `__` (a subagent id),
+and whose `cwd`, when absolute, is the working directory. `*.messages.json` files
+are never opened; a larger, malformed or non-object manifest is not a session. A
+pass visits the highest directory names first, which is age order for the ids
+Cline generates (`<13-digit millisecond time>_<5 characters>`), so the newest
+sessions are indexed when a store outgrows the per-pass entry bound. A foreground
+agent in a shell session is attributed through it. A profile that sets only
+`CLINE_DATA_DIR` moves the store out of reach of `[config_home]` and is not
+followed, and the `project.candidates` history source lists no Cline session. The
+parser id without the feature is `runtime_feature_unsupported`; with
+`id_path` or `cwd_path` it is `descriptor_invalid`.
 
 ### Hook schemas
 
