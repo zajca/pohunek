@@ -466,9 +466,12 @@ open and the records stay authoritative
   one sighting per screen and the session loop logs it at info under
   `session.program_status.limit_screen`: the matched marker, the held record in
   canonical form, its age and staleness, the latest unmapped 7501 tokens and the
-  published activity. Claude's real limit screen has not been captured yet; the
-  marker list and the journal line are how the next real hit leaves evidence
-  (#2101). The journal changes no activity, attention or input readiness.
+  published activity. The unmapped journal that feeds it is written only for an
+  opted-in runtime and once per distinct `(reason, state, kind, app)` tuple, so
+  repeated records do not flood the log. Claude's real limit screen has not been
+  captured yet; the marker list and the journal line are how the next real hit
+  leaves evidence (#2101). The journal changes no activity, attention or input
+  readiness.
 - With the probe answered Claude sets the plain title `Claude Code` in
   every state (the session name when the session is named, see
   [Session name](#session-name)), and the manifest reads no state from a title.

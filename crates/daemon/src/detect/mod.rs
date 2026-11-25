@@ -557,7 +557,7 @@ pub struct Detector {
 impl Detector {
     #[must_use]
     pub fn new(rows: u16, cols: u16, started_at: Instant, config: DetectorConfig) -> Self {
-        Self {
+        let mut detector = Self {
             osc: OscParser::new(),
             screen: ScreenTracker::new(rows, cols),
             state: StateMachine::new(started_at, config.detection),
@@ -590,7 +590,18 @@ impl Detector {
             latch_evaluations: 0,
             #[cfg(test)]
             latch_sightings: 0,
-        }
+        };
+        detector
+            .osc
+            .set_journal_unmapped(detector.program_status_opt_in());
+        detector
+    }
+
+    /// Whether the active manifest opted in to `[program_status]`.
+    fn program_status_opt_in(&self) -> bool {
+        self.manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.program_status().is_some())
     }
 
     /// Ends the initial-input wait. Ordered startup observation stops with it
@@ -623,11 +634,7 @@ impl Detector {
         let mut applied_osc_evidence = false;
         // Without the opt-in a 7501 report is no event, so the screen is fed in
         // the same segments as for any other output.
-        if self
-            .manifest
-            .as_ref()
-            .is_none_or(|manifest| manifest.program_status().is_none())
-        {
+        if !self.program_status_opt_in() {
             osc_events.retain(|(item, _end)| !matches!(item, OscEvidence::ProgramStatus(_)));
         }
 
@@ -1233,6 +1240,7 @@ impl Detector {
         self.context_dirty = true;
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
+        self.osc.set_journal_unmapped(self.program_status_opt_in());
         self.input_readiness = config.input_readiness;
         self.launch_name = config.launch_name;
         self.runtime_version = config.runtime_version;

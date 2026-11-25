@@ -28,6 +28,30 @@ const COLUMNS: u16 = 100;
 const STEP: Duration = Duration::from_millis(10);
 /// Virtual time the debounce needs to confirm an idle or blocked candidate.
 const SETTLE_STEP: Duration = Duration::from_millis(100);
+
+/// A log writer the journal scenario can read back.
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// Settling ticks after which every debounced candidate has published.
 const SETTLE_TICKS: u32 = 12;
 /// The `app` the Claude test manifest opts in with.
@@ -1920,5 +1944,71 @@ fn a_runtime_without_program_status_has_no_usage_limit_sighting() {
     assert!(
         harness.detector.take_usage_limit_sighting().is_none(),
         "the diagnostic needs the program-status opt-in"
+    );
+}
+
+/// The lines a detector journaled for an unmapped 7501 record.
+fn unmapped_journal_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains("session.program_status.unmapped"))
+        .collect()
+}
+
+/// Reads the log the scenario captured.
+fn journal_text(log: &CapturedLog) -> String {
+    String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned()
+}
+
+/// The unmapped journal needs the manifest's opt-in and carries one line per
+/// distinct tuple: a program that repeats one unmapped record cannot flood the
+/// log (#2101 review).
+#[test]
+fn the_unmapped_journal_is_opted_in_and_deduped() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let log = CapturedLog::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    )
+    .expect("no other subscriber is installed in this test process");
+
+    let rejected = record(&format!("state=limit:app={CLAUDE_APP}:msg=c2VjcmV0"));
+
+    // Without the opt-in the payload is no diagnostic and is not journaled.
+    let mut plain = Harness::claude_without_opt_in();
+    plain.feed(&rejected);
+    assert!(
+        unmapped_journal_lines(&journal_text(&log)).is_empty(),
+        "a runtime without [program_status] journals no unmapped record"
+    );
+
+    // Three identical payloads carry one line.
+    let mut opted_in = Harness::claude();
+    for _ in 0..3 {
+        opted_in.feed(&rejected);
+    }
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(lines.len(), 1, "one line per distinct tuple: {lines:?}");
+    assert!(lines[0].contains("reason=\"rejected\""), "{}", lines[0]);
+    assert!(lines[0].contains("state=\"limit\""), "{}", lines[0]);
+
+    // A different tuple is one more line.
+    opted_in.feed(&record(&format!(
+        "state=blocked:app={CLAUDE_APP}:kind=limit"
+    )));
+    let journaled = journal_text(&log);
+    let lines = unmapped_journal_lines(&journaled);
+    assert_eq!(lines.len(), 2, "a new tuple is journaled: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("reason=\"unknown_kind\"")),
+        "{lines:?}"
     );
 }

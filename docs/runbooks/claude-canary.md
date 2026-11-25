@@ -272,7 +272,9 @@ line carries the matched marker, the held OSC 7501 record in canonical form,
 its age and staleness, the latest unmapped record's tokens (`state`, `kind`,
 `app`, whether it carried a message or a title) and the published activity;
 screen and message text never reach the log. A record the daemon cannot map is
-journaled at info under `session.program_status.unmapped`.
+journaled at info under `session.program_status.unmapped`, once per distinct
+`(reason, state, kind, app)` tuple and only for a runtime that opted in to
+program status.
 
 After a real limit hit, collect the evidence for #2101 from those two targets,
 not from a canary run: the capture command has no usage-limit scenario. Record

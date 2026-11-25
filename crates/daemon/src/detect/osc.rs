@@ -11,7 +11,7 @@ const PERCENT_HEX_DIGITS: usize = 2;
 const HEX_HIGH_NIBBLE_SHIFT: u8 = 4;
 const HEX_ALPHA_OFFSET: u8 = 10;
 
-/// The debug-journal target of a 7501 record the detector cannot map.
+/// The info-journal target of a 7501 record the detector cannot map.
 const UNMAPPED_PROGRAM_STATUS_TARGET: &str = "session.program_status.unmapped";
 
 /// Longest payload token the journal echoes.
@@ -202,6 +202,19 @@ pub struct UnmappedProgramStatus {
     pub has_title: bool,
 }
 
+impl UnmappedProgramStatus {
+    /// Whether two payloads journal the same bounded tuple.
+    ///
+    /// The presence of `msg` and `title` is not part of the tuple: a program
+    /// that adds or drops text on the same record must not get a fresh line.
+    fn same_journal_tuple(&self, other: &Self) -> bool {
+        self.reason == other.reason
+            && self.state == other.state
+            && self.kind == other.kind
+            && self.app == other.app
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OscParser {
     state: State,
@@ -210,6 +223,12 @@ pub struct OscParser {
     /// The latest 7501 payload the parser could not map, kept until a mapped
     /// root record replaces it or the evidence is cleared.
     last_unmapped: Option<UnmappedProgramStatus>,
+    /// Whether the active manifest opted in to `[program_status]`. Only then is
+    /// an unmapped payload journaled; the detector sets this from the manifest.
+    journal_unmapped: bool,
+    /// The latest tuple journaled, so a program that repeats one unmapped
+    /// record cannot flood the log.
+    last_journaled_unmapped: Option<UnmappedProgramStatus>,
 }
 
 impl OscParser {
@@ -266,11 +285,23 @@ impl OscParser {
         self.payload.clear();
     }
 
+    /// Enables or disables the unmapped 7501 journal.
+    ///
+    /// The detector sets this from the active manifest: a runtime without a
+    /// `[program_status]` table reads no 7501 evidence, so an unmapped payload
+    /// is no diagnostic and must not reach the log. A reconfigure re-evaluates
+    /// it. The journal itself stays per session, so a manifest that opts back
+    /// in keeps the already-journaled tuples suppressed.
+    pub fn set_journal_unmapped(&mut self, enabled: bool) {
+        self.journal_unmapped = enabled;
+    }
+
     /// Drops the latest unmapped 7501 payload.
     ///
     /// A resync or a manifest reconfigure discards the session's program-status
     /// evidence, so the diagnostic must not attribute the old payload to a
-    /// later screen.
+    /// later screen. The journal dedupe state survives: the same tuple was
+    /// already journaled in this session.
     pub fn clear_unmapped(&mut self) {
         self.last_unmapped = None;
     }
@@ -283,6 +314,37 @@ impl OscParser {
     #[must_use]
     pub fn last_unmapped(&self) -> Option<&UnmappedProgramStatus> {
         self.last_unmapped.as_ref()
+    }
+
+    /// Journals an unmapped payload the manifest opted in to read.
+    ///
+    /// The line is INFO, not debug: the daemon's default filter is `info`, so a
+    /// debug-only journal would leave the evidence a real hit is meant to
+    /// collect nowhere. The record is bounded, and the journal carries one line
+    /// per distinct `(reason, state, kind, app)` tuple per session: a program
+    /// that prints the same unmapped record in a loop cannot flood the log.
+    fn journal_unmapped_record(&mut self, unmapped: &UnmappedProgramStatus) {
+        if !self.journal_unmapped {
+            return;
+        }
+        if self
+            .last_journaled_unmapped
+            .as_ref()
+            .is_some_and(|last| last.same_journal_tuple(unmapped))
+        {
+            return;
+        }
+        tracing::info!(
+            target: UNMAPPED_PROGRAM_STATUS_TARGET,
+            reason = unmapped.reason,
+            state = unmapped.state.as_str(),
+            kind = unmapped.kind.as_str(),
+            app = unmapped.app.as_str(),
+            has_msg = unmapped.has_msg,
+            has_title = unmapped.has_title,
+            "unmapped program-status record"
+        );
+        self.last_journaled_unmapped = Some(unmapped.clone());
     }
 
     fn advance_ground(&mut self, byte: u8) {
@@ -418,7 +480,10 @@ impl OscParser {
             b"99" => classify_osc99(&self.payload),
             command if command == PROGRAM_STATUS => {
                 let report = parse_program_status(&self.payload);
-                let unmapped = journal_unmapped_program_status(&self.payload, report.as_ref());
+                let unmapped = unmapped_program_status(&self.payload, report.as_ref());
+                if let Some(unmapped) = unmapped.as_ref() {
+                    self.journal_unmapped_record(unmapped);
+                }
                 match (&report, unmapped) {
                     (_, Some(unmapped)) => self.last_unmapped = Some(unmapped),
                     (Some(ProgramStatusReport::Record(_)), None) => self.last_unmapped = None,
@@ -514,20 +579,16 @@ fn bounded_token(token: Option<&[u8]>) -> String {
         .collect()
 }
 
-/// Journals a 7501 record the detector cannot map, never the text it carries.
+/// Reads a 7501 record the detector cannot map, never the text it carries.
 ///
 /// A record is unmapped when the parser rejects the payload whole
 /// (`reason = "rejected"`) or when the payload names a `kind` the grammar does
-/// not know, which the parser drops (`reason = "unknown_kind"`). The journal
+/// not know, which the parser drops (`reason = "unknown_kind"`). The result
 /// carries the bounded `state`, `kind` and `app` tokens and the presence of
 /// `msg` and `title`: their text is untrusted and is never logged. The report
-/// is only read, never changed.
-///
-/// The line is INFO, not debug: the daemon's default filter is `info`, so a
-/// debug-only journal would leave the evidence a real hit is meant to collect
-/// nowhere. The record is bounded and arrives on a state change, so it cannot
-/// flood the log.
-fn journal_unmapped_program_status(
+/// is only read, never changed. The detector journals the result through
+/// [`OscParser::journal_unmapped_record`].
+fn unmapped_program_status(
     payload: &[u8],
     report: Option<&ProgramStatusReport>,
 ) -> Option<UnmappedProgramStatus> {
@@ -540,25 +601,14 @@ fn journal_unmapped_program_status(
         }
         "unknown_kind"
     };
-    let unmapped = UnmappedProgramStatus {
+    Some(UnmappedProgramStatus {
         reason,
         state: bounded_token(tokens.state),
         kind: bounded_token(tokens.kind),
         app: bounded_token(tokens.app),
         has_msg: tokens.has_msg,
         has_title: tokens.has_title,
-    };
-    tracing::info!(
-        target: UNMAPPED_PROGRAM_STATUS_TARGET,
-        reason = unmapped.reason,
-        state = unmapped.state.as_str(),
-        kind = unmapped.kind.as_str(),
-        app = unmapped.app.as_str(),
-        has_msg = unmapped.has_msg,
-        has_title = unmapped.has_title,
-        "unmapped program-status record"
-    );
-    Some(unmapped)
+    })
 }
 
 fn parse_file_url_cwd(payload: &[u8]) -> Option<String> {

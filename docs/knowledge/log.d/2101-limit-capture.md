@@ -8,7 +8,10 @@
   changes no activity, attention or input readiness, and no screen or message
   text is logged.
 - A record the daemon cannot map is journaled at info, not debug, so the
-  evidence reaches the daemon's default `info` filter. See
+  evidence reaches the daemon's default `info` filter. The journal runs only
+  when the runtime opted in to program status and carries one line per distinct
+  `(reason, state, kind, app)` tuple per session, so a program that repeats one
+  record cannot flood the log. See
   [Program status](guides/claude-package.md#program-status-osc-7501); the
   canary runbook (`docs/runbooks/claude-canary.md`, "Usage-limit evidence")
   says how to collect the evidence of a real hit.

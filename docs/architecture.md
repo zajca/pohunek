@@ -1252,7 +1252,10 @@ the screen rules stay the fallback.
   its `state`, `kind` and `app` tokens only; the text of `msg`, `title` and
   `progress` is never logged. The line is info rather than debug because the
   daemon's default filter is `info`: a debug-only journal would leave the
-  evidence of a newer agent's record nowhere.
+  evidence of a newer agent's record nowhere. It is written only when the
+  manifest opted in to `[program_status]`, and carries one line per distinct
+  `(reason, state, kind, app)` tuple per session, so a program that repeats one
+  unmapped record cannot flood the log.
 - **Usage-limit capture.** A provider usage limit cannot be triggered on
   demand, so the daemon journals what the screen shows when it happens. When
   the visible screen names a usage limit (the detector's bounded marker list,
@@ -1262,6 +1265,7 @@ the screen rules stay the fallback.
   `session.program_status.limit_screen` with the matched marker, the held root
   record in canonical form (`app=..:state=..[:kind=..]`), its age and
   staleness, the latest unmapped payload's tokens, and the published activity.
+  The unmapped journal is deduped per session as above.
   The sighting changes no activity, attention or input readiness; the screen
   text and every `msg`/`title` value stay out of the log. The evidence of a real
   limit hit is therefore the journal line plus the record it names (#2101).
