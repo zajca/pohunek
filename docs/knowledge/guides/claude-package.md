@@ -344,17 +344,19 @@ profiles](../concepts/agent-profiles.md#resuming-a-profile-backed-session)).
 Whether Claude enables synchronized output by itself when the terminal answers
 a mode 2026 query is not verified here.
 
-## One Claude subscription per session
+## Writing your own account wrapper
 
-An owner with two Claude subscriptions (for example a work seat and a personal
-plan) can pick which one a session runs on and still share one `~/.claude`: one
-memory, one set of settings, skills, plugins and history, and every transcript in
-`~/.claude/projects`. The pattern is the neutral one in [choosing a credential
+[One Claude subscription per session](#one-claude-subscription-per-session)
+describes the account tool the package ships. This section is the pattern under
+it, for an owner who writes the profile and the wrapper by hand. Two Claude
+subscriptions (for example a work seat and a personal plan) can each back a
+session and still share one `~/.claude`: one memory, one set of settings, skills,
+plugins and history, and every transcript in `~/.claude/projects`. The pattern is
+the neutral one in [choosing a credential
 with a launch option](../concepts/agent-profiles.md#choosing-a-credential-with-a-launch-option):
-a launch option `account` selects a token file that a wrapper program reads. It
-needs no Pohunek code and no change to this package. The profile and the wrapper
-are the owner's to create; Pohunek never creates them, runs `claude setup-token`
-or `/login`, or reads a token file.
+a launch option `account` selects a token file that a wrapper program reads. A
+hand-written setup needs no Pohunek code; Pohunek never creates the profile or
+the wrapper for it, runs `claude setup-token` or `/login`, or reads a token file.
 
 **Which account to pick.** Choose the account by whose work the session is, for
 example work repositories on the work seat and private ones on the personal plan.
