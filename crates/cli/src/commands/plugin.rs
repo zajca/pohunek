@@ -31,6 +31,7 @@ use protocol::{
 use crate::client::Client;
 use crate::commands::plugin_index::{self, PackageRef, Resolved};
 use crate::commands::plugin_profile::{self, ProfileAction};
+use crate::commands::plugin_run::{self, render_setup_details, RunArgs};
 use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -188,6 +189,13 @@ pub(crate) enum Action {
         #[command(subcommand)]
         action: ProfileAction,
     },
+
+    /// Run a setup entry a package declares, on this terminal.
+    ///
+    /// The program runs with your terminal and a fixed environment, and its
+    /// exit status becomes this command's. Arguments after the setup name are
+    /// passed to the program literally.
+    Run(RunArgs),
 }
 
 impl Action {
@@ -202,6 +210,7 @@ impl Action {
             | Self::Disable { json, .. }
             | Self::Doctor { json, .. } => *json,
             Self::Profile { action } => action.wants_json(),
+            Self::Run(_) => false,
             Self::Install(args) => args.json,
             Self::Link(args) => args.json,
             Self::Update(args) => args.json,
@@ -716,6 +725,10 @@ pub(crate) enum Error {
     #[error("the local daemon is too old for `plugin profile create --preset-of`")]
     ProfileCreatePresetUnsupported,
 
+    /// The daemon predates the `program` field of `package.create_profile`.
+    #[error("the local daemon is too old for `plugin profile create --program`")]
+    ProfileCreateProgramUnsupported,
+
     /// The daemon predates `package.remove_profile`.
     #[error("the local daemon is too old for `plugin profile rm`")]
     ProfileRemoveUnsupported,
@@ -814,6 +827,7 @@ impl Error {
             Self::ProfileCreateUnsupported => "profile_create_unsupported",
             Self::ProfileCreateOptionsUnsupported => "profile_create_options_unsupported",
             Self::ProfileCreatePresetUnsupported => "profile_create_preset_unsupported",
+            Self::ProfileCreateProgramUnsupported => "profile_create_program_unsupported",
             Self::ProfileRemoveUnsupported => "profile_remove_unsupported",
             Self::OptionsFile { .. } => "profile_options_file_invalid",
             Self::FoldInput { .. } => "fold_input_invalid",
@@ -922,6 +936,7 @@ impl Error {
             | Self::ProfileCreateUnsupported
             | Self::ProfileCreateOptionsUnsupported
             | Self::ProfileCreatePresetUnsupported
+            | Self::ProfileCreateProgramUnsupported
             | Self::ProfileRemoveUnsupported => {
                 "run `pohunek service upgrade`, then repeat the command"
             }
@@ -1116,6 +1131,7 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
         Action::Uninstall(args) => run_uninstall(&args).await?,
         Action::Index { sub } => run_index(sub).await?,
         Action::Profile { action } => plugin_profile::run(action).await?,
+        Action::Run(args) => return plugin_run::run(&args).await,
         Action::Doctor { package, json } => {
             let mut client = connect().await?;
             let result = client
@@ -2155,6 +2171,7 @@ fn render_inspect(result: &PackageInspectResult) -> String {
         }
     }
     render_command_details(&mut output, &result.commands);
+    render_setup_details(&mut output, &result.setup);
     output
 }
 
@@ -2206,6 +2223,7 @@ fn render_install_review(preview: &PackageInstallResult, enable: bool, selected:
         }
     }
     render_command_details(&mut output, &preview.commands);
+    render_setup_details(&mut output, &preview.setup);
     let _ = writeln!(output, "Enabled:     {} after install", yes_no(enable));
     let _ = writeln!(output, "Selected:    {} after install", yes_no(selected));
     if !selected {
@@ -2728,6 +2746,7 @@ mod tests {
             package: info("acme.pi", "1.0.0", DIGEST_A, false),
             runtime: Some(runtime("Pi\u{1b}[31m red")),
             commands: Vec::new(),
+            setup: Vec::new(),
             reloaded: false,
         };
         let text = render_install_review(&preview, true, false);
@@ -2782,6 +2801,7 @@ mod tests {
             package: blocked.clone(),
             runtime: Some(declared.clone()),
             commands: Vec::new(),
+            setup: Vec::new(),
             commands_only: false,
         });
         assert!(inspect.contains("Selection:   blocked"), "{inspect}");
@@ -2797,6 +2817,7 @@ mod tests {
                 package: blocked.clone(),
                 runtime: Some(declared.clone()),
                 commands: Vec::new(),
+                setup: Vec::new(),
                 reloaded: true,
             },
             Ingest::Install { enable: true },
@@ -2816,6 +2837,7 @@ mod tests {
                 package: blocked,
                 runtime: Some(declared),
                 commands: Vec::new(),
+                setup: Vec::new(),
                 reloaded: false,
             },
             true,
@@ -2889,6 +2911,7 @@ mod tests {
                     package: fresh.clone(),
                     runtime: Some(runtime("Pi")),
                     commands: Vec::new(),
+                    setup: Vec::new(),
                     reloaded: false,
                 },
                 true,

@@ -78,7 +78,7 @@ this table and prints a note per check):
 | `docs` | `cargo xtask docs check` | — |
 | `rust` | `cargo xtask affected` (`cargo ta`), `cargo t -p <crate>` | — |
 | `sdk` | `bun install --frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, `bun test sdk/ts/scripts` | `SDK workspace (macOS arm64)`, off macOS |
-| `scripts` | `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` (one file: `-p test_<name>.py`) | — |
+| `scripts` | `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` (one file: `-p test_<name>.py`); `test_claude_accounts.py` runs the Linux-only shell scenario `scripts/tests/claude-accounts-scenario.sh` against the Claude package's `claude-accounts` and its wrapper | — |
 | `macos-lint` | `scripts/darwin-check` | `platform contracts (arm64)` |
 | `native` | `cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins`, then on Linux `POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1 --skip privileged_` for each `<suite>` of `-p pohunek-platform --test systemd --`, `-p pohunek-daemon --test systemd_durable_worker --`, `-p pohunek-cli --test all -- service_systemd::`, `-p pohunek-cli --test all -- setup_host_native::`, `-p pohunek-cli --test all -- setup_host::`, `-p pohunek-daemon --test supervised_lifecycle --`, `-p pohunek-cli --test all -- service_upgrade::`, then `POHUNEK_SYSTEMD_E2E=1 cargo test -p pohunek-cli --test all -- --test-threads 1 service_config_migration::` (no `--ignored`: its tests run in every lane, and here they get the real bus); on macOS `cargo test --locked -p` each of `pohunek-platform`, `pohunek-daemon`, `pohunek-cli` | the other OS's suites, as a `ci-only` row: `platform contracts (arm64)` or `real systemd supervision` |
 

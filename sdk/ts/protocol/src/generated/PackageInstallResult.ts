@@ -4,6 +4,7 @@ import type { CommandInfo } from "./CommandInfo";
 import type { PackageInfo } from "./PackageInfo";
 import type { PackageInstallStatus } from "./PackageInstallStatus";
 import type { PackageRuntimeInfo } from "./PackageRuntimeInfo";
+import type { SetupInfo } from "./SetupInfo";
 
 /**
  * Result of `package.install` and `package.link`.
@@ -27,6 +28,11 @@ export type PackageInstallResult = {
    * exposure; absent when it exports none.
    */
   commands?: Array<CommandInfo>;
+  /**
+   * The setup entries the descriptor exports, with their program,
+   * arguments and description; absent when it exports none.
+   */
+  setup?: Array<SetupInfo>;
   /**
    * Whether the daemon rebuilt its runtime registry after the change.
    */

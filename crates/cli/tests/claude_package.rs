@@ -99,7 +99,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "2.2.0";
+const PACKAGE_VERSION: &str = "2.3.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -606,8 +606,13 @@ fn the_package_directory_builds_reproducibly_with_only_its_two_files() {
         .collect();
     assert_eq!(
         paths,
-        ["detect.toml", "runtime.toml"],
-        "the archive holds only descriptor and manifest; the hook reporter stays core-owned and evidence lives in compat/claude"
+        [
+            "bin/claude-account-wrapper.sh",
+            "bin/claude-accounts",
+            "detect.toml",
+            "runtime.toml"
+        ],
+        "the archive holds the descriptor, the manifest and the account setup scripts; the hook reporter stays core-owned and evidence lives in compat/claude"
     );
 }
 
@@ -819,10 +824,16 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     assert_eq!(agent_skill["dir"].as_str(), Some("skills"));
     assert_eq!(
         package["requires"].as_array().map(Vec::len),
-        Some(5),
-        "the descriptor requires exactly the naming, placement, program-status gate, agent skill and staleness features"
+        Some(6),
+        "the descriptor requires exactly the naming, placement, program-status gate, agent skill, staleness and setup features"
     );
     package.remove("requires");
+    // The account setup entry exists only in the package.
+    let setup = package.remove("setup").expect("a [setup] table");
+    assert_eq!(
+        setup["accounts"]["program"].as_str(),
+        Some("bin/claude-accounts")
+    );
     // `ready` is the one key the package declares that v0.34.2 does not: the
     // built-in Claude descriptor relied on the bracketed-paste enable signal.
     let input = package

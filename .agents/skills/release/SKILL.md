@@ -290,6 +290,25 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    digest. Without this release, `pohunek assistant` answers
    `assistant_package_missing` on every host.
 
+9b. **Admit the assistant to the official plugin index.** Each release needs
+    two index pull requests in this order, because the core-range admission
+    stage refuses a range that excludes `CORE_TAG` (see
+    [Admission through the index](../../docs/knowledge/guides/plugin-repositories.md#admission-through-the-index)):
+
+    1. A pull request moving `CORE_TAG` of `pohunekd/pohunek-plugin-index`
+       to `vX.Y.Z`. Owner GO to merge; the merge publishes, because the sign
+       job signs on merge.
+    2. After it merges, a pull request adding
+       `official/pohunek.context.assistant/X.Y.Z.toml` with
+       `kind = "context"`, the release URL, the `SHA256SUMS` digest, both
+       platforms, `core = ">=X.Y.0, <X.(Y+1).0"` and `[source]` with
+       `built_with = "vX.Y.Z"`. Owner GO to merge.
+    3. Verify that the next signed `official-index-v2.json` lists the entry
+       (and that `official-index-v1.json` does not: schema 1 carries runtime
+       entries only).
+    4. The X.com single post for a plugin release (step 8) waits for that
+       listing: it is drafted only after the entry is signed.
+
 10. **Downstream updates (required).** Other repositories build on, pin or
     show the core release. For each consumer the release coordinator tells its
     owner (the repository's maintainer or agent session) the version, the
@@ -304,6 +323,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
     | `pohunekd/pohunek-companion-android` | The pin (`pohunek_protocol_tag` in `app/src/main/res/values/config.xml`, `POHUNEK_VERSION` and the sha256 args in `container/Containerfile`, the tag in `docs/architecture.md`) moves when the release changes `PROTOCOL_VERSION` or `MIN_PROTOCOL_VERSION`, or when the app needs a feature of it; then an app release. | The app release names core vX.Y.Z, or the coordinator records why the pin stays. |
     | `pohunekd/omarchy` | No pin: `tools/verified-download.bash` installs the newest core release. Check that what the widget reads (`pohunek session list --json`) stays compatible; change and release only when it does not. | The check result is recorded; a needed change is released. |
     | `pohunekd/plugin-assistant` | Step 9. | Its release vX.Y.Z is published and the digest is in the core notes. |
+    | `pohunekd/pohunek-plugin-index` | Step 9b: the `CORE_TAG` PR, then the `pohunek.context.assistant/X.Y.Z` entry PR. | The signed `official-index-v2.json` lists the assistant entry. |
     | Hosts that run pohunek for other services (the `pohunekd/autoreview` review hosts) | Their operator gets the version and whether the protocol window requires an upgrade; upgrade on their schedule. | The operator acknowledged. |
     | pohunek.dev | `follow-release` moves the `pohunek` pin in `releases.config.json` and records the post (step 8); a manual run is `gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek`. | The site shows vX.Y.Z with the post, and each downstream release above once it is out. |
 

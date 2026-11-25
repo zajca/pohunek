@@ -1,0 +1,479 @@
+#!/bin/sh
+# Owner setup of Claude subscriptions for Pohunek sessions. Runs through
+# `pohunek plugin run pohunek.runtime.claude accounts <args>` in a plain
+# terminal, so its argv is `add <name> [--login] [--replace]`, `list`,
+# `check-logs` or `version`.
+#
+# A token never enters argv, a log or a Pohunek file other than the 0600
+# account file: `claude setup-token` runs on the terminal and its output is
+# pasted at a hidden prompt, never captured.
+
+set -eu
+umask 077
+LC_ALL=C
+export LC_ALL
+
+# Account names end up in file names, profile names and the TOML options file.
+NAME_MAX_BYTES=32
+# Name of the parent profile; a preset `claude-<name>` must never equal it.
+PARENT_PROFILE=claude-acct
+PRESET_PREFIX=claude-
+# Bounds of a `claude setup-token` value. The prefix is undocumented, so only
+# the length and the character set are checked.
+TOKEN_MIN_BYTES=40
+TOKEN_MAX_BYTES=512
+# First release that accepts setup-token tokens on machines with
+# forceLoginOrgUUID (Claude Code changelog 2.1.318).
+CLAUDE_MIN_VERSION=2.1.318
+# The Pohunek CLI on PATH; it reaches the daemon through XDG_RUNTIME_DIR, which
+# `plugin run` passes on.
+POHUNEK_BIN=pohunek
+CLEAR_SCREEN='\033[H\033[2J\033[3J'
+
+# The daemon refuses a parent profile with more choices than this, and every
+# account is one choice.
+MAX_ACCOUNTS=32
+# How long the pending-input drain waits for more pasted bytes, in tenths of a
+# second, and how many bytes it discards at most.
+DRAIN_WAIT_TENTHS=2
+DRAIN_MAX_BYTES=4096
+
+TMP_FILE=''
+OPTIONS_FILE=''
+STTY_SAVED=''
+# Set while `claude setup-token` output may be on screen.
+TOKEN_ON_SCREEN=0
+
+# Clears the screen and the scrollback once the token may have been shown.
+clear_token_screen() {
+    if [ "$TOKEN_ON_SCREEN" -eq 1 ]; then
+        printf "$CLEAR_SCREEN" >&2
+        TOKEN_ON_SCREEN=0
+    fi
+}
+
+cleanup() {
+    if [ -n "$STTY_SAVED" ]; then
+        stty "$STTY_SAVED" 2>/dev/null || :
+        STTY_SAVED=''
+    fi
+    clear_token_screen
+    if [ -n "$TMP_FILE" ]; then
+        rm -f -- "$TMP_FILE"
+    fi
+    if [ -n "$OPTIONS_FILE" ]; then
+        rm -f -- "$OPTIONS_FILE"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+fail() {
+    printf 'claude-accounts: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage: claude-accounts add <name> [--login] [--replace]
+       claude-accounts list
+       claude-accounts check-logs
+       claude-accounts version
+EOF
+    exit 2
+}
+
+# Resolves ACCOUNTS_DIR. XDG_CONFIG_HOME is used only when absolute, as the
+# XDG base directory specification requires.
+resolve_accounts_dir() {
+    : "${HOME:?HOME is not set}"
+    case ${XDG_CONFIG_HOME:-} in
+        /*) config_root=$XDG_CONFIG_HOME ;;
+        *) config_root=$HOME/.config ;;
+    esac
+    ACCOUNTS_DIR=$config_root/pohunek/claude-accounts
+    # The wrapper embeds these paths in single quotes, so only plain characters
+    # are accepted.
+    case $ACCOUNTS_DIR in
+        *[!A-Za-z0-9._/+@_-]*) fail "the accounts directory path holds characters this tool does not accept: $ACCOUNTS_DIR" ;;
+    esac
+    WRAPPER=$ACCOUNTS_DIR/claude-account
+}
+
+# Creates the accounts directory at 0700. A symbolic link or a directory owned
+# by another user is refused, and so is an existing directory with another mode.
+ensure_accounts_dir() {
+    parent=$config_root/pohunek
+    if [ -L "$parent" ]; then
+        fail "a symbolic link stands in the path of the accounts directory"
+    fi
+    if [ ! -e "$parent" ]; then
+        mkdir -p -- "$parent"
+    fi
+    if [ ! -e "$ACCOUNTS_DIR" ]; then
+        mkdir -m 700 -- "$ACCOUNTS_DIR"
+    fi
+    if [ -L "$ACCOUNTS_DIR" ] || [ ! -d "$ACCOUNTS_DIR" ]; then
+        fail "the accounts directory is not a real directory"
+    fi
+    if ! mode_matches d 700 "$ACCOUNTS_DIR"; then
+        fail "the accounts directory must be mode 0700 and owned by you"
+    fi
+}
+
+# Whether the path has the given find type, exact mode and the owner running
+# the tool; a symbolic link never matches because find does not follow it.
+mode_matches() {
+    [ -e "$3" ] || [ -L "$3" ] || return 1
+    [ -n "$(find "$3" -prune -type "$1" -perm "$2" -user "$(id -u)" -print 2>/dev/null)" ]
+}
+
+# Whether the value is a plausible account name: lower-case letters, digits
+# and dashes, at most NAME_MAX_BYTES bytes, and not the parent profile's name
+# with its prefix.
+valid_name() {
+    case $1 in
+        '' | -* | *[!a-z0-9-]*) return 1 ;;
+    esac
+    [ "${#1}" -le "$NAME_MAX_BYTES" ] || return 1
+    [ "$1" != acct ] || return 1
+    return 0
+}
+
+# Prints the version number of the claude binary on PATH, or nothing.
+claude_version() {
+    claude --version 2>/dev/null | awk 'NR == 1 { print $1; exit }'
+}
+
+# Succeeds when dotted version $1 is at least $2 (three numeric parts).
+version_at_least() {
+    awk -v have="$1" -v want="$2" 'BEGIN {
+        n = split(have, h, "."); split(want, w, ".")
+        for (i = 1; i <= 3; i++) {
+            if (h[i] + 0 > w[i] + 0) exit 0
+            if (h[i] + 0 < w[i] + 0) exit 1
+        }
+        exit 0
+    }'
+}
+
+# Warns when the installed claude predates the forceLoginOrgUUID fix. Never fails:
+# the owner may still use an account the check does not concern.
+check_claude_version() {
+    have=$(claude_version || :)
+    if [ -z "$have" ]; then
+        printf 'claude-accounts: warning: could not read the claude version\n' >&2
+        return 0
+    fi
+    if ! version_at_least "$have" "$CLAUDE_MIN_VERSION"; then
+        printf 'claude-accounts: warning: claude %s is below %s; a work seat with forceLoginOrgUUID refuses setup-token tokens\n' \
+            "$have" "$CLAUDE_MIN_VERSION" >&2
+    fi
+}
+
+# Lists the account names that have a token or a login marker, one per line.
+account_names() {
+    for file in "$ACCOUNTS_DIR"/*.token "$ACCOUNTS_DIR"/*.login; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        base=${file##*/}
+        printf '%s\n' "${base%.*}"
+    done | sort -u
+}
+
+# Writes the wrapper from the template next to this script. The wrapper keeps
+# the absolute path of the claude binary resolved now, and the wrapper name
+# never sits inside the package root, whose path changes with each digest.
+write_wrapper() {
+    claude_path=$(command -v claude || :)
+    case $claude_path in
+        /*) ;;
+        *) fail "claude is not on PATH as an absolute path" ;;
+    esac
+    case $claude_path in
+        *[!A-Za-z0-9._/+@_-]*) fail "the claude path holds characters this tool does not accept" ;;
+    esac
+    case $claude_path in
+        "$ACCOUNTS_DIR"/*) fail "claude resolves into the accounts directory" ;;
+    esac
+    template=$script_dir/claude-account-wrapper.sh
+    [ -f "$template" ] || fail "the wrapper template is missing from the package"
+    TMP_FILE=$(mktemp "$ACCOUNTS_DIR/.wrapper.XXXXXX")
+    {
+        printf '#!/bin/sh\n'
+        printf "ACCOUNTS_DIR='%s'\n" "$ACCOUNTS_DIR"
+        printf "CLAUDE_BIN='%s'\n" "$claude_path"
+        awk 'f { print } /^# BEGIN-TEMPLATE$/ { f = 1 }' "$template"
+    } > "$TMP_FILE"
+    chmod 755 -- "$TMP_FILE"
+    mv -f -- "$TMP_FILE" "$WRAPPER"
+    TMP_FILE=''
+}
+
+# Writes the [options.account] table: one choice per account, the stored login
+# first as the default when it exists.
+write_options() {
+    names=$(account_names)
+    default=''
+    for name in $names; do
+        if [ -e "$ACCOUNTS_DIR/$name.login" ]; then
+            default=$name
+        fi
+    done
+    if [ -z "$default" ]; then
+        default=$(printf '%s\n' "$names" | awk 'NR == 1')
+    fi
+    OPTIONS_FILE=$(mktemp "$ACCOUNTS_DIR/.options.XXXXXX")
+    {
+        printf '[options.account]\n'
+        printf 'label = "Account"\n'
+        printf 'default = "%s"\n' "$default"
+        for name in $names; do
+            printf 'choices.%s = { label = "%s", env = { CLAUDE_ACCOUNT = "%s" } }\n' "$name" "$name" "$name"
+        done
+    } > "$OPTIONS_FILE"
+}
+
+# Prints the file_digest of the named profile in a `plugin profile list --json
+# --all` document, or nothing. Entries hold no nested object, so splitting at
+# each closing brace leaves one entry per chunk.
+profile_listing_digest() {
+    printf '%s' "$1" | tr -d '\n' | tr '}' '\n' \
+        | grep -E "\"name\": *\"$2\"" \
+        | grep -o '"file_digest": *"sha256:[0-9a-f]*"' \
+        | cut -d '"' -f 4 \
+        | awk 'NR == 1'
+}
+
+# Succeeds when the listing names the profile.
+profile_listed() {
+    printf '%s' "$1" | tr -d '\n' | tr '}' '\n' | grep -q -E "\"name\": *\"$2\""
+}
+
+# Prints the listing entry of the named profile, or nothing.
+profile_entry() {
+    printf '%s' "$1" | tr -d '\n' | tr '}' '\n' | grep -E "\"name\": *\"$2\"" | awk 'NR == 1'
+}
+
+# Refuses, before any token is stored, a profile name this tool must not take
+# over: `claude-acct` must be a profile over the claude base, and `claude-<name>`
+# must be a preset of `claude-acct`. It also proves the daemon answers.
+preflight_profiles() {
+    listing=$("$POHUNEK_BIN" plugin profile list --json --all) \
+        || fail "the Pohunek daemon did not list the profiles"
+    if profile_listed "$listing" "$PARENT_PROFILE"; then
+        profile_entry "$listing" "$PARENT_PROFILE" | grep -q -E '"base": *"claude"' \
+            || fail "a profile named $PARENT_PROFILE exists and is not a Claude profile; this tool owns that name"
+    fi
+    preset=$PRESET_PREFIX$1
+    if profile_listed "$listing" "$preset"; then
+        profile_entry "$listing" "$preset" | grep -q -E "\"preset_of\": *\"$PARENT_PROFILE\"" \
+            || fail "a profile named $preset exists and is not a preset of $PARENT_PROFILE"
+    fi
+}
+
+# Writes the parent profile and one locked preset per account through the
+# daemon. The profile is replaced with the digest the listing reports, so a
+# digest change between the two calls is refused by the daemon, not overwritten.
+regenerate_profiles() {
+    write_wrapper
+    write_options
+    listing=$("$POHUNEK_BIN" plugin profile list --json --all)
+    if profile_listed "$listing" "$PARENT_PROFILE"; then
+        digest=$(profile_listing_digest "$listing" "$PARENT_PROFILE")
+        [ -n "$digest" ] || fail "the existing $PARENT_PROFILE profile reports no file digest"
+        "$POHUNEK_BIN" plugin profile create "$PARENT_PROFILE" --base claude \
+            --program "$WRAPPER" --options-file "$OPTIONS_FILE" --replace "$digest" >/dev/null
+    else
+        "$POHUNEK_BIN" plugin profile create "$PARENT_PROFILE" --base claude \
+            --program "$WRAPPER" --options-file "$OPTIONS_FILE" >/dev/null
+    fi
+    for name in $(account_names); do
+        preset=$PRESET_PREFIX$name
+        if profile_listed "$listing" "$preset"; then
+            continue
+        fi
+        "$POHUNEK_BIN" plugin profile create "$preset" --preset-of "$PARENT_PROFILE" \
+            --opt "account=$name" --locked >/dev/null
+    done
+}
+
+# Reads one line from the terminal with echo off. The value goes into
+# TOKEN_LINE only; the terminal's previous state is restored on every exit path
+# by cleanup.
+read_hidden_line() {
+    STTY_SAVED=$(stty -g)
+    stty -echo
+    printf 'Paste the token (input hidden), then press Enter: ' >&2
+    IFS= read -r TOKEN_LINE || :
+    # Bytes that followed the first line (a wrapped paste) are discarded here,
+    # so they never reach the owner's shell after this program exits.
+    stty -icanon min 0 time "$DRAIN_WAIT_TENTHS" 2>/dev/null || :
+    dd bs="$DRAIN_MAX_BYTES" count=1 of=/dev/null 2>/dev/null || :
+    stty "$STTY_SAVED"
+    STTY_SAVED=''
+    printf '\n' >&2
+}
+
+cmd_add() {
+    [ -z "${POHUNEK_SESSION_ID+x}" ] || fail "run this in a plain terminal: it refuses inside a Pohunek session"
+    [ -t 0 ] || fail "stdin must be a terminal"
+
+    login=0
+    replace=0
+    name=''
+    for arg in "$@"; do
+        case $arg in
+            --login) login=1 ;;
+            --replace) replace=1 ;;
+            --*) fail "unknown option: $arg" ;;
+            *)
+                [ -z "$name" ] || fail "one account name expected"
+                name=$arg
+                ;;
+        esac
+    done
+    [ -n "$name" ] || usage
+    valid_name "$name" || fail "the name must be lower-case letters, digits and dashes, at most $NAME_MAX_BYTES characters, and not acct"
+
+    resolve_accounts_dir
+    ensure_accounts_dir
+    check_claude_version
+
+    token_file=$ACCOUNTS_DIR/$name.token
+    login_file=$ACCOUNTS_DIR/$name.login
+    if [ -e "$token_file" ] || [ -L "$token_file" ] || [ -e "$login_file" ] || [ -L "$login_file" ]; then
+        [ "$replace" -eq 1 ] || fail "account $name exists; pass --replace to change it"
+    else
+        existing=$(account_names | awk 'END { print NR }')
+        [ "$existing" -lt "$MAX_ACCOUNTS" ] || fail "at most $MAX_ACCOUNTS accounts are supported"
+    fi
+    preflight_profiles "$name"
+
+    if [ "$login" -eq 1 ]; then
+        for other in "$ACCOUNTS_DIR"/*.login; do
+            [ -e "$other" ] || continue
+            [ "$other" = "$login_file" ] && continue
+            fail "another account already records the stored login; one stored login is one account"
+        done
+        TMP_FILE=$(mktemp "$ACCOUNTS_DIR/.login.XXXXXX")
+        mv -f -- "$TMP_FILE" "$login_file"
+        TMP_FILE=''
+    else
+        command -v claude >/dev/null 2>&1 || fail "claude is not on PATH"
+        printf 'Sign in to %s in the browser that opens; then copy the token that setup-token prints.\n' "$name" >&2
+        TOKEN_ON_SCREEN=1
+        claude setup-token || fail "claude setup-token did not finish"
+        read_hidden_line
+        token_len=${#TOKEN_LINE}
+        [ "$token_len" -ge "$TOKEN_MIN_BYTES" ] && [ "$token_len" -le "$TOKEN_MAX_BYTES" ] \
+            || fail "the pasted value has an unexpected length"
+        case $TOKEN_LINE in
+            *[![:graph:]]*) fail "the pasted value holds whitespace or control characters" ;;
+        esac
+
+        TMP_FILE=$(mktemp "$ACCOUNTS_DIR/.token.XXXXXX")
+        printf '%s\n' "$TOKEN_LINE" > "$TMP_FILE"
+        unset TOKEN_LINE
+        for other in "$ACCOUNTS_DIR"/*.token; do
+            [ -e "$other" ] || continue
+            [ "$other" = "$token_file" ] && continue
+            if cmp -s -- "$TMP_FILE" "$other"; then
+                fail "this token is already stored for another account"
+            fi
+        done
+        mv -f -- "$TMP_FILE" "$token_file"
+        TMP_FILE=''
+        clear_token_screen
+    fi
+
+    # Replacing an account of the other kind must not leave its old file behind.
+    if [ "$login" -eq 1 ]; then
+        [ ! -e "$token_file" ] && [ ! -L "$token_file" ] || rm -f -- "$token_file"
+    else
+        [ ! -e "$login_file" ] && [ ! -L "$login_file" ] || rm -f -- "$login_file"
+    fi
+
+    regenerate_profiles
+    printf 'Account %s saved. Start a session with: pohunek session new --agent claude-%s\n' "$name" "$name" >&2
+}
+
+cmd_list() {
+    resolve_accounts_dir
+    if [ ! -d "$ACCOUNTS_DIR" ]; then
+        printf 'no accounts\n'
+        return 0
+    fi
+    names=$(account_names)
+    [ -n "$names" ] || { printf 'no accounts\n'; return 0; }
+    for name in $names; do
+        if [ -e "$ACCOUNTS_DIR/$name.login" ]; then
+            kind=login
+            path=$ACCOUNTS_DIR/$name.login
+        else
+            kind=token
+            path=$ACCOUNTS_DIR/$name.token
+        fi
+        if mode_matches f 600 "$path"; then
+            state=ok
+        else
+            state=bad-mode-or-owner
+        fi
+        printf '%s %s %s\n' "$name" "$kind" "$state"
+    done
+}
+
+cmd_check_logs() {
+    [ -z "${POHUNEK_SESSION_ID+x}" ] || fail "run this in a plain terminal: it refuses inside a Pohunek session"
+    resolve_accounts_dir
+    state_root=${XDG_STATE_HOME:-}
+    case $state_root in
+        /*) ;;
+        *) state_root=$HOME/.local/state ;;
+    esac
+    # The daemon log, the per-session logs (which hold the hook trace) and the
+    # worker state all live under this directory.
+    scan_root=$state_root/pohunek
+    found=''
+    for token in "$ACCOUNTS_DIR"/*.token; do
+        [ -e "$token" ] || continue
+        [ -d "$scan_root" ] || continue
+        matches=$(find "$scan_root" -type f -exec grep -l -F -f "$token" {} + 2>/dev/null || :)
+        if [ -n "$matches" ]; then
+            found=$found$matches
+            found=$found'
+'
+        fi
+    done
+    names_found=$(printf '%s' "$found" | awk 'NF' | sort -u)
+    count=$(printf '%s' "$names_found" | awk 'NF' | awk 'END { print NR }')
+    printf '%s files contain a stored token\n' "$count"
+    [ -z "$names_found" ] || printf '%s\n' "$names_found"
+}
+
+cmd_version() {
+    have=$(claude_version || :)
+    [ -n "$have" ] || fail "could not read the claude version"
+    printf 'claude %s\n' "$have"
+    check_claude_version
+}
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+
+case ${1:-} in
+    add)
+        shift
+        cmd_add "$@"
+        ;;
+    list)
+        cmd_list
+        ;;
+    check-logs)
+        cmd_check_logs
+        ;;
+    version)
+        cmd_version
+        ;;
+    *)
+        usage
+        ;;
+esac

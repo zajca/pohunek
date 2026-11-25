@@ -32,6 +32,17 @@ alongside the profile environment. They are not persisted, so a resume of
 a profile that declares `secret_env` slots is refused with `secret_env_missing`.
 The slot names come from the host profile, never from the wire.
 
+A subscription token of a Claude account is a secret the package keeps in an
+owner file under the accounts directory (mode 0600 in a 0700 directory), never in
+a profile `[env]` or a log. The launch wrapper places it in the environment
+of the Claude process it execs, never in argv; Claude's own subprocesses (Bash
+commands, hooks, stdio MCP servers) inherit it unless
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is set, so the agent of that session can read
+it. And `plugin run` passes setup
+programs an allowlisted environment without any `POHUNEK_*` or credential-shaped
+variable, so a setup program cannot see another tool's credential. The owner
+checks the state directories with the package's `check-logs` command.
+
 The assistant snapshot is allowlist-built. It may include filenames, existence
 status, parse status, selected action names, structured command output, and
 warnings. It must not collect process environment variables, profile env values,

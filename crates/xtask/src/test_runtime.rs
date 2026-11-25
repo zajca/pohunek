@@ -204,42 +204,45 @@ fn build_downgrade(
         path: copy.clone(),
         source: error,
     })?;
-    let listed = fs::read_dir(source).map_err(|error| XtaskError::Io {
-        path: source.to_path_buf(),
-        source: error,
-    })?;
-    for entry in listed {
-        let entry = entry.map_err(|error| XtaskError::Io {
-            path: source.to_path_buf(),
-            source: error,
-        })?;
-        let path = entry.path();
-        if !path.is_file() {
-            return Err(XtaskError::Usage(format!(
-                "the package source `{}` holds a non-file entry",
-                source.display()
-            )));
-        }
-        let target = copy.join(entry.file_name());
-        let text = fs::read_to_string(&path).map_err(|error| XtaskError::Io {
-            path: path.clone(),
-            source: error,
-        })?;
-        let text = if entry.file_name() == DESCRIPTOR_FILE {
-            downgrade_descriptor(&text, &path)?
-        } else {
-            text
-        };
-        fs::write(&target, text).map_err(|error| XtaskError::Io {
-            path: target.clone(),
-            source: error,
-        })?;
-    }
+    copy_package_tree(source, &copy, true)?;
     runtime_package::build(&copy, archive)?;
     let bytes = read_input(archive, Limits::DEFAULT.max_compressed_bytes)?;
     let verified = read_archive(&bytes, &Limits::DEFAULT).map_err(XtaskError::Package)?;
     let identity = archive_identity(&verified, archive)?;
     throwaway_trust::package_entry(identity, verified.digest().clone())
+}
+
+/// Copies the package files below `from` into `to`, keeping the directory
+/// layout and each file's mode; the top-level descriptor (`top`) is rewritten
+/// to the downgrade version.
+fn copy_package_tree(from: &Path, to: &Path, top: bool) -> Result<(), XtaskError> {
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| XtaskError::Io { path, source }
+    };
+    for entry in fs::read_dir(from).map_err(io(from))? {
+        let entry = entry.map_err(io(from))?;
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            fs::create_dir(&target).map_err(io(&target))?;
+            copy_package_tree(&path, &target, false)?;
+        } else if path.is_file() {
+            if top && entry.file_name() == DESCRIPTOR_FILE {
+                let text = fs::read_to_string(&path).map_err(io(&path))?;
+                let text = downgrade_descriptor(&text, &path)?;
+                fs::write(&target, text).map_err(io(&target))?;
+            } else {
+                fs::copy(&path, &target).map_err(io(&target))?;
+            }
+        } else {
+            return Err(XtaskError::Usage(format!(
+                "the package source `{}` holds an entry that is neither a file nor a directory",
+                from.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The descriptor `text` with its one top-level package version set to

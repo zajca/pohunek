@@ -578,47 +578,67 @@ fn check_session_command(host: &mut Host, argv: &[&str]) -> Result<(), Error> {
     }
     Ok(())
 }
-/// `session list --json`, then requires a non-empty `session screen`.
+/// Polls `session list --json` and `session screen --json` until the detector
+/// has left `unknown` and the screen holds at least one visible line, within
+/// `timeout`. A runtime that emits terminal-setup control bytes (such as
+/// alt-screen or OSC queries) before painting its first frame leaves `unknown`
+/// while `visible_lines` is still empty, so the screen check polls under the
+/// same deadline instead of failing on the first empty read.
 fn wait_for_screen(
     host: &mut Host,
     session: &str,
     timeout: Duration,
 ) -> Result<(AgentActivity, usize), Error> {
     let deadline = std::time::Instant::now() + timeout;
-    let activity = loop {
-        let output = host
-            .cli(&["session", "list", "--json"])
-            .map_err(Error::Usage)?;
-        let listed: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_error| refuse("`pohunek session list`: stdout is not one JSON document"))?;
-        let activity = listed["ok"]
-            .as_array()
-            .map_or(&[][..], Vec::as_slice)
-            .iter()
-            .find(|info| info["id"] == session)
-            .and_then(|info| info["activity"].as_str())
-            .unwrap_or("unknown");
-        match activity {
-            "working" => break AgentActivity::Working,
-            "blocked" => break AgentActivity::Blocked,
-            "idle" => break AgentActivity::Idle,
-            _ => {}
+    let mut saw_activity = false;
+    loop {
+        if let Some(activity) = read_session_activity(host, session)? {
+            saw_activity = true;
+            let lines = read_screen_lines(host, session)?;
+            if lines > 0 {
+                return Ok((activity, lines));
+            }
         }
         if std::time::Instant::now() >= deadline {
+            if saw_activity {
+                return Err(refuse("the session screen stayed empty"));
+            }
             return Err(refuse(format!(
                 "the detector stayed `unknown` for {timeout:?} after start"
             )));
         }
         std::thread::sleep(SMOKE_POLL_INTERVAL);
-    };
+    }
+}
+
+/// Reads the current non-`unknown` activity of `session` from `session list --json`.
+fn read_session_activity(host: &mut Host, session: &str) -> Result<Option<AgentActivity>, Error> {
+    let output = host
+        .cli(&["session", "list", "--json"])
+        .map_err(Error::Usage)?;
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_error| refuse("`pohunek session list`: stdout is not one JSON document"))?;
+    let activity = listed["ok"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .find(|info| info["id"] == session)
+        .and_then(|info| info["activity"].as_str())
+        .unwrap_or("unknown");
+    Ok(match activity {
+        "working" => Some(AgentActivity::Working),
+        "blocked" => Some(AgentActivity::Blocked),
+        "idle" => Some(AgentActivity::Idle),
+        _ => None,
+    })
+}
+
+/// Reads the visible line count of `session` from `session screen --json`.
+fn read_screen_lines(host: &mut Host, session: &str) -> Result<usize, Error> {
     let output = host
         .cli(&["session", "screen", session, "--json"])
         .map_err(Error::Usage)?;
     let screen: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|_error| refuse("`pohunek session screen`: stdout is not one JSON document"))?;
-    let lines = screen["ok"]["visible_lines"].as_array().map_or(0, Vec::len);
-    if lines == 0 {
-        return Err(refuse("the session screen stayed empty"));
-    }
-    Ok((activity, lines))
+    Ok(screen["ok"]["visible_lines"].as_array().map_or(0, Vec::len))
 }

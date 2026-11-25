@@ -23,6 +23,7 @@ fn create(base: &str) -> PackageCreateProfileParams {
         profile: PROFILE.to_owned(),
         base: RuntimeId::parse(base).expect("runtime id"),
         home: None,
+        program: None,
         args: Vec::new(),
         secret_env: Vec::new(),
         options_toml: None,

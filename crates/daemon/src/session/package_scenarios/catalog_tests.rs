@@ -612,3 +612,50 @@ async fn trust_state_is_persisted_before_a_package_that_then_fails_to_install() 
     assert_eq!(state(&fixture).high_water(), Some(7), "recorded first");
     assert!(!fixture.root(&rival.digest).exists());
 }
+
+/// A signed catalog installs an official package that exports a setup entry
+/// without an opt-in, and still refuses an official package that exports a
+/// command: no consent step shows a command.
+#[tokio::test]
+async fn an_official_setup_entry_installs_and_an_official_command_does_not() {
+    let key = signing_key("root");
+    let fixture = Fixture::with_anchor("catalog-setup", anchor(&[&key], Vec::new()));
+    let with_setup = Package::build_with_export(
+        PACKAGE,
+        "1.0.0",
+        RUNTIME,
+        "\"package-setup-v1\"",
+        "\n[setup.accounts]\nprogram = \"bin/fleet-state\"\nargs = []\ndescription = \"Show the fleet state\"\n",
+    );
+    let document = signed_by(&key, default_catalog(&with_setup, 3));
+
+    let installed = fixture
+        .registry
+        .packages()
+        .package_install(catalog_install(&fixture, &with_setup, &document, false))
+        .await
+        .expect("an official setup entry installs without the opt-in");
+    assert_eq!(installed.package.origin, PackageOrigin::Official);
+    assert_eq!(installed.setup.len(), 1, "the install lists the entry");
+    assert_eq!(installed.setup[0].name.as_str(), "accounts");
+
+    let commands = Fixture::with_anchor("catalog-command", anchor(&[&key], Vec::new()));
+    let with_command = Package::build_with_commands(
+        PACKAGE,
+        "2.0.0",
+        RUNTIME,
+        INERT_PROGRAM,
+        super::test_fixture::HOST_STATE_COMMAND,
+    );
+    let document = signed_by(
+        &key,
+        catalog(1, vec![entry(&with_command, PACKAGE, RUNTIME, "2.0.0")]),
+    );
+    let refused = commands
+        .registry
+        .packages()
+        .package_install(catalog_install(&commands, &with_command, &document, false))
+        .await
+        .expect_err("an official command is refused");
+    assert_eq!(refused, PackageErrorKind::Untrusted);
+}

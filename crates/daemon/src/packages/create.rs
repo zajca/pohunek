@@ -46,6 +46,20 @@ const OPTIONS_KEY: &str = "options";
 /// Longest accepted home path in bytes; the usual `PATH_MAX`.
 const HOME_MAX_BYTES: usize = 4096;
 
+/// Longest accepted launch program path in bytes; the usual `PATH_MAX`.
+const PROGRAM_MAX_BYTES: usize = 4096;
+
+/// The permission bits that make a file executable by someone.
+const EXECUTABLE_BITS: u32 = 0o111;
+
+/// The permission bits of group and other that let someone else change the
+/// program, so a program that has any of them is refused.
+const GROUP_OR_OTHER_WRITE_BITS: u32 = 0o022;
+
+/// The sticky bit of a directory: only the owner of an entry can rename or
+/// remove it, so a shared directory with it cannot swap an owner-only program.
+const STICKY_BIT: u32 = 0o1000;
+
 impl PackageService {
     /// Creates the host agent profile `params.profile`.
     ///
@@ -103,16 +117,17 @@ pub(crate) fn file_digest(bytes: &[u8]) -> ProfileDigest {
         .unwrap_or_else(|_invalid| unreachable!("a SHA-256 digest is 64 lowercase hex digits"))
 }
 
-/// Whether `home` is an absolute path of plain components.
+/// Whether `path` is an absolute path of plain components no longer than
+/// `max_bytes`.
 ///
 /// Refused: a relative path, a `~` tilde prefix on any component, `.` and `..`
 /// components, empty components, control characters and an over-long path.
-fn home_is_plain(home: &str) -> bool {
-    let Some(relative) = home.strip_prefix('/') else {
+fn is_plain_absolute_path(path: &str, max_bytes: usize) -> bool {
+    let Some(relative) = path.strip_prefix('/') else {
         return false;
     };
-    home.len() <= HOME_MAX_BYTES
-        && !home.chars().any(char::is_control)
+    path.len() <= max_bytes
+        && !path.chars().any(char::is_control)
         && relative
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('~'))
@@ -125,10 +140,75 @@ fn home_entry(
 ) -> Result<(String, String), PackageError> {
     let declared =
         config_home.ok_or_else(|| PackageError::from(PackageErrorKind::ProfileHomeUnsupported))?;
-    if declared.subdir().is_some() || !home_is_plain(home) {
+    if declared.subdir().is_some() || !is_plain_absolute_path(home, HOME_MAX_BYTES) {
         return Err(PackageError::from(PackageErrorKind::ProfileHomeInvalid));
     }
     Ok((declared.env().to_owned(), home.to_owned()))
+}
+
+/// The launch program to write, after the path and file checks.
+///
+/// The program is an absolute path of plain components that names a regular
+/// file, not a symbolic link, which is executable, owned by the effective user
+/// or by root, and writable by nobody but its owner. A profile that names such a
+/// file runs what the owner named, and nothing that another user can rewrite.
+fn checked_program(name: &str, program: Option<&str>) -> Result<Option<String>, PackageError> {
+    let Some(program) = program else {
+        return Ok(None);
+    };
+    if credential_literal_problem(program).is_some() {
+        warn!(%name, "the program of a new profile looks like a credential");
+        return Err(PackageError::from(
+            PackageErrorKind::ProfileCredentialLiteral,
+        ));
+    }
+    if !is_plain_absolute_path(program, PROGRAM_MAX_BYTES) || !is_trusted_program_file(program) {
+        warn!(%name, "the program of a new profile is not a trusted executable file");
+        return Err(PackageError::from(PackageErrorKind::ProfileProgramInvalid));
+    }
+    Ok(Some(program.to_owned()))
+}
+
+/// Whether `program` is a regular executable file owned by the effective user
+/// or by root, with no group or other write bit. The entry itself is read
+/// without following a symbolic link, so a link is never a trusted program.
+fn is_trusted_program_file(program: &str) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(meta) = std::fs::symlink_metadata(program) else {
+        return false;
+    };
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    // SAFETY: `geteuid` is always safe — it reads the calling process's effective
+    // uid and cannot fail.
+    #[expect(unsafe_code, reason = "libc::geteuid FFI; SAFETY documented above")]
+    let euid = unsafe { libc::geteuid() };
+    let mode = meta.permissions().mode();
+    let file_trusted = (meta.uid() == euid || meta.uid() == 0)
+        && mode & EXECUTABLE_BITS != 0
+        && mode & GROUP_OR_OTHER_WRITE_BITS == 0;
+    file_trusted
+        && std::path::Path::new(program)
+            .ancestors()
+            .skip(1)
+            .all(|directory| is_trusted_program_directory(directory, euid))
+}
+
+/// Whether `directory` is owned by `euid` or root and cannot be rewritten by
+/// anyone else: no group or other write bit, unless the sticky bit stops
+/// another user from renaming the entries of an owner-only file's directory.
+fn is_trusted_program_directory(directory: &std::path::Path, euid: u32) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(meta) = std::fs::metadata(directory) else {
+        return false;
+    };
+    let mode = meta.permissions().mode();
+    meta.is_dir()
+        && (meta.uid() == euid || meta.uid() == 0)
+        && (mode & GROUP_OR_OTHER_WRITE_BITS == 0 || mode & STICKY_BIT != 0)
 }
 
 /// Validates, composes and publishes the profile under the lifecycle authority
@@ -164,6 +244,7 @@ fn create_profile(
         None => None,
     };
     let home = checked_home(params, definition.as_deref(), name)?;
+    let program = checked_program(name, params.program.as_deref())?;
     let options = params
         .options_toml
         .as_deref()
@@ -174,6 +255,7 @@ fn create_profile(
         base: params.base.clone(),
         pin: pin.clone(),
         home,
+        program,
         args: params.args.clone(),
         secret_env: params.secret_env.clone(),
         options,

@@ -624,7 +624,7 @@ fn every_command_error_kind_exits_with_its_own_status() {
             output.status.code().expect("an exit status")
         });
         assert!(
-            (40..UNRECOGNIZED_STATUS).contains(&status),
+            (40..=54).contains(&status) && status != UNRECOGNIZED_STATUS,
             "{}: status {status} is outside the command block",
             kind.code()
         );

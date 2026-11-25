@@ -106,6 +106,8 @@ mod plugin_profile_fold;
 mod plugin_profile_list_audience;
 #[path = "plugin_profile_rm.rs"]
 mod plugin_profile_rm;
+#[path = "plugin_run.rs"]
+mod plugin_run;
 #[path = "prompt_link.rs"]
 mod prompt_link;
 #[path = "prompt_render.rs"]

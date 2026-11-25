@@ -124,6 +124,7 @@ The features this core implements:
 | `agent-skill-v1` | 0.42.0 | `[agent_skill]` |
 | `prompt-arg-dash-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the dash rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
 | `prompt-arg-word-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the bare-word rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
+| `package-setup-v1` | 0.45.0 | `[setup.<name>]` (see [Declaring package setup entries](#declaring-package-setup-entries)) |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -922,7 +923,11 @@ repeating the command; the CLI never retries an install on its own.
   index and revocation marks before the install, looks the archive digest up
   before decompressing, and refuses the runtime ids `shell`, `codex`, `claude`,
   `hermes` and `pi` (`package_runtime_not_claimable`) and any package that
-  declares commands (`package_untrusted`). A host without the channel file
+  declares commands (`package_untrusted`). The signed entry carries only the
+  package id, kind, `runtime_id`, version, digest, URL, platforms and core
+  range; the source repository, `repo_id`, tag, commit, `built_with`,
+  `runtime_api` and required features are admission-only (`IndexEntry`,
+  `crates/package/src/plugin_index.rs:150`). A host without the channel file
   refuses it (`official_trust_unavailable`) and `pohunek doctor` reports the
   `plugin_index_channel` check as `warn`; catalog installs are unaffected.
 - `pohunek plugin install --index <file>` sends a local signed index to the
@@ -948,7 +953,13 @@ repeating the command; the CLI never retries an install on its own.
   The by-id install reads the daemon's stored copy when it is younger than 24h,
   refreshes once when it is older, and with `--index-url` always fetches from that
   URL and ignores the stored copy; `--index-url` with a different URL is a
-  transport replacement, not a trust root — the daemon still verifies it.
+  transport replacement, not a trust root — the daemon still verifies it. A
+  mirror is available only through `--index-url`; there is no configured
+  mirror. The official URLs the CLI fetches by default are compiled in
+  (`OFFICIAL_INDEX_URL`, `OFFICIAL_INDEX_URL_V2`,
+  `crates/cli/src/commands/plugin_index.rs:32`, `:52`), and `--index-url`
+  only swaps that fetch address. Both are the accepted design (see the
+  [accepted index design](plugin-repositories.md#accepted-index-design)).
   `pohunek plugin update <package> <archive> --index <file>` applies the same
   checks and refuses an index older than the stored one
   (`package_index_rollback`), an index that omits the archive's digest
@@ -1045,6 +1056,68 @@ expose = "peers"              # "local" (default) or "peers"
 - A runtime-only table (`[integration]`, `[launch_env]`, `[naming]`,
   `[placement]`, `[config_home]`, `[transcripts]`) next to commands without the runtime group is
   `descriptor_invalid`.
+
+## Declaring package setup entries
+
+A descriptor can export setup entries: interactive programs of the package that
+the owner runs from a terminal with `pohunek plugin run <package> <setup>`, for
+example a sign-in flow. A setup entry is a package file the owner runs, not an
+installer: the daemon never runs it, and nothing runs it unless the owner
+invokes `plugin run`. Install, update and session start never run a setup
+entry, and a setup entry cannot change an integration's hook assets, so a
+package still cannot ship an installer through it.
+
+```toml
+requires = ["package-setup-v1"]
+
+[setup.accounts]
+program = "bin/accounts"          # a package file the manifest marks executable
+args = ["--store", "default"]     # fixed literals, no placeholders
+description = "Add and list the accounts of this package"
+```
+
+- `requires = ["package-setup-v1"]` is mandatory. A core without the feature
+  refuses the archive with `runtime_feature_unsupported`; a `[setup]` table
+  without the entry is refused the same way.
+- A setup entry is valid only beside a runtime group. A package that exports
+  setup entries and no runtime is refused with `package_descriptor_invalid`.
+- The entry name follows the command name grammar, and a package exports at most
+  8 setup entries.
+- `program` is a normalized package-relative path that names a file of the
+  package whose manifest entry carries the executable bit, with the same rule as
+  a command's `program`.
+- `args` holds at most 64 arguments of 1 to 1024 bytes without control
+  characters, passed literally before the owner's own arguments.
+- `description` is 1 to 200 bytes without control characters. The install review
+  and `plugin inspect` show it, with `args` in debug form.
+- Install: a setup entry of a package installed with `--sha256` or `link` (local
+  authority) needs the same `accept_commands` opt-in as a command, so the client
+  must show it for consent, and the refusal is `package_commands_client_unsupported`
+  even for a dry run. An official package installed from the catalog or the
+  plugin index exports its setup entries without the opt-in, because its digest
+  is signed. An official `[commands]` table is still refused with `package_untrusted`.
+- `package.setup_resolve` returns the verified program path, the package root,
+  the digest and the fixed arguments of the selected, enabled version. It is
+  served on the local socket only, to the owner; a session's caller is refused
+  by the rights check, and a remote or relayed connection is refused with
+  `command_setup_not_local`. Resolution reports `command_package_not_installed`,
+  `command_not_selected`, `command_setup_not_declared`, `command_package_disabled`
+  and `command_unavailable`. Each resolution writes one INFO line, `package setup
+  resolved` or `package setup refused`, with the package, version, digest, entry
+  name and outcome.
+- `pohunek plugin run` does the rest on the owner's terminal: it refuses unless
+  stdin and stderr are terminals, and refuses inside a pohunek session (a guard
+  against accidents, not a boundary). It starts the program with a clear
+  environment that holds only an allowlist of the caller's variables (`HOME`,
+  `PATH`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `TZ`, `TMPDIR`, `DISPLAY`,
+  `WAYLAND_DISPLAY`, `BROWSER`, `DBUS_SESSION_BUS_ADDRESS`, and the `LC_*` and
+  `XDG_*` names), without any `POHUNEK_*` or credential-shaped name, and adds
+  `POHUNEK_SETUP_PACKAGE`, `POHUNEK_SETUP_PACKAGE_ROOT` and
+  `POHUNEK_SETUP_DIGEST`. The owner passes at most 16 arguments of at most 256
+  bytes, without control characters, after the entry's fixed ones. The exit
+  status of the program is the command's exit status (128 plus the signal number
+  when a signal ends it). A nested `pohunek` call finds the same local daemon
+  through `XDG_RUNTIME_DIR`, which the allowlist keeps.
 
 ## Declaring a context package
 

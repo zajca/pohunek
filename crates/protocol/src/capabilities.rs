@@ -304,6 +304,20 @@ pub struct HostCapabilities {
     /// wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub package_install_commands_supported: bool,
+    /// Whether the daemon serves `package.setup_resolve` and lists setup
+    /// entries in the package install and inspect results.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`;
+    /// `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub package_setup_supported: bool,
+    /// Whether `package.create_profile` accepts `program`.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; its
+    /// params are strict and would reject `program`, so a client sends the
+    /// field only when this is `true`. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub package_create_profile_program_supported: bool,
     /// Whether the daemon holds a plugin index channel beside its trust
     /// anchor and accepts `package.install` with `PackageTrust::Index`.
     ///

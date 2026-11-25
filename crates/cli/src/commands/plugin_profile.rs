@@ -207,6 +207,16 @@ pub(crate) struct CreateArgs {
     /// `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
     #[arg(long, value_name = "ABS_PATH")]
     home: Option<String>,
+    /// Absolute path of the launch program, written as `program`, in place of
+    /// the base runtime's program. The daemon accepts only a regular executable
+    /// file that only you or root can write.
+    #[arg(
+        long,
+        value_name = "ABS_PATH",
+        value_parser = parse_program,
+        conflicts_with = "preset_of"
+    )]
+    program: Option<String>,
     /// Launch argument appended to the program; repeat for several. A value
     /// that looks like a credential is refused.
     #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
@@ -224,7 +234,7 @@ pub(crate) struct CreateArgs {
         long,
         value_name = "PARENT",
         value_parser = parse_profile_name,
-        conflicts_with_all = ["base", "home", "args", "secret_env", "options_file"]
+        conflicts_with_all = ["base", "home", "program", "args", "secret_env", "options_file"]
     )]
     preset_of: Option<String>,
     /// A choice the preset selects, as `OPTION=CHOICE`; repeat for several
@@ -267,6 +277,29 @@ pub(crate) struct RmArgs {
 
 fn parse_base(value: &str) -> Result<RuntimeId, String> {
     RuntimeId::parse(value).map_err(|_malformed| format!("`{value}` is not a runtime id"))
+}
+
+/// Longest `--program` path the CLI accepts, in bytes.
+///
+/// Matches `PATH_MAX` on Linux, the longest path a kernel exec accepts; the
+/// daemon enforces the same bound on the composed profile.
+const MAX_PROGRAM_PATH_BYTES: usize = 4096;
+
+/// Shape check of `--program`: an absolute path without control characters.
+///
+/// Only the shape is checked here. The daemon decides whether the file is a
+/// regular executable that only the owner or root can write.
+fn parse_program(value: &str) -> Result<String, String> {
+    if !Path::new(value).is_absolute() {
+        return Err("expected an absolute path".to_owned());
+    }
+    if value.len() > MAX_PROGRAM_PATH_BYTES {
+        return Err(format!("expected at most {MAX_PROGRAM_PATH_BYTES} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err("expected no control characters".to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 fn parse_profile_digest(value: &str) -> Result<ProfileDigest, String> {
@@ -1231,6 +1264,11 @@ async fn run_create(args: &CreateArgs) -> Result<(), CliError> {
     if options_toml.is_some() && !capabilities.package_create_profile_options_supported {
         return Err(Error::ProfileCreateOptionsUnsupported.into());
     }
+    // An older daemon refuses the unknown `program` field, so the capability
+    // check reports it before anything is sent.
+    if args.program.is_some() && !capabilities.package_create_profile_program_supported {
+        return Err(Error::ProfileCreateProgramUnsupported.into());
+    }
     let Some(base) = args.base.clone() else {
         unreachable!("clap requires --base unless --preset-of is given")
     };
@@ -1242,6 +1280,7 @@ async fn run_create(args: &CreateArgs) -> Result<(), CliError> {
             args: args.args.clone(),
             secret_env: args.secret_env.clone(),
             options_toml,
+            program: args.program.clone(),
             replace: args.replace.clone(),
             dry_run: args.dry_run,
         })

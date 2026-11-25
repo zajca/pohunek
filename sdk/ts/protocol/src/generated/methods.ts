@@ -112,6 +112,8 @@ import type {
   SessionWaitResult,
   SessionWaitTurnParams,
   SessionWaitTurnResult,
+  SetupResolveParams,
+  SetupResolveResult,
   WorktreeRemoveParams,
   WorktreeRemoveResult,
 } from "./index";
@@ -142,6 +144,7 @@ export interface Methods {
   "package.remove_profile": { params: PackageRemoveProfileParams; output: PackageRemoveProfileResult };
   "package.select": { params: PackageSelectParams; output: PackageChangeResult };
   "package.set_enabled": { params: PackageSetEnabledParams; output: PackageChangeResult };
+  "package.setup_resolve": { params: SetupResolveParams; output: SetupResolveResult };
   "package.uninstall": { params: PackageUninstallParams; output: PackageUninstallResult };
   "plugin.index.apply": { params: PluginIndexApplyParams; output: PluginIndexApplyResult };
   "project.action": { params: ProjectActionParams; output: ProjectActionResult };
@@ -210,6 +213,7 @@ export const METHOD_NAMES = [
   "package.remove_profile",
   "package.select",
   "package.set_enabled",
+  "package.setup_resolve",
   "package.uninstall",
   "plugin.index.apply",
   "project.action",

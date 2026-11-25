@@ -612,6 +612,9 @@ async fn handle_negotiated(
         method::PACKAGE_REMOVE_PROFILE => {
             package::handle_package_remove_profile(request, state).await
         }
+        method::PACKAGE_SETUP_RESOLVE => {
+            package::handle_package_setup_resolve(request, state).await
+        }
         method::PLUGIN_INDEX_APPLY => package::handle_plugin_index_apply(request, state).await,
         method::COMMAND_RUN => command::handle_command_run(request, state).await,
         method::HOST_INSPECT => {
@@ -803,6 +806,7 @@ fn owner_only_method(name: &str) -> bool {
             | method::PACKAGE_CREATE_PROFILE
             | method::PACKAGE_CREATE_PRESET
             | method::PACKAGE_REMOVE_PROFILE
+            | method::PACKAGE_SETUP_RESOLVE
     )
 }
 

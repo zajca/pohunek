@@ -45,6 +45,7 @@ use super::definition::{
     RuntimeDefinition, MAX_DEFINITION_BYTES,
 };
 use super::features::FeatureTables;
+use super::setup::setup_of;
 use crate::detect::Manifest;
 
 /// Package-relative path of the runtime descriptor inside every runtime
@@ -979,13 +980,14 @@ fn parse_descriptor(
                 |name| detection_manifest(files, name),
             )?;
             let commands = commands_of(&document, executable)?;
+            let setup = setup_of(&document, executable)?;
             let BindingProvenance::Package { package, .. } = &definition.binding().provenance
             else {
                 return Err(DefinitionError::Malformed { line: None });
             };
             let identity = package.clone();
-            Ok(PackageDescriptor::with_commands(
-                identity, definition, commands,
+            Ok(PackageDescriptor::with_exports(
+                identity, definition, commands, setup,
             ))
         }
     }

@@ -278,9 +278,10 @@ fn host_inspect_carries_the_runtime_report() {
 }
 
 /// Row 5 of #1659 D3: an old client decodes the new daemon's `host.inspect`
-/// unchanged. The answer adds the two optional keys to what an N-1 answer
-/// can hold and nothing else, and the old client ignores keys it does not
-/// know (`HostCapabilities` has no `deny_unknown_fields`).
+/// unchanged. The answer adds only optional keys to what an N-1 answer can
+/// hold: the runtime contract pair, and the two capability flags of the
+/// package setup entries and `plugin profile create --program`. The old client
+/// ignores keys it does not know (`HostCapabilities` has no `deny_unknown_fields`).
 #[test]
 fn host_inspect_adds_only_the_two_optional_keys() {
     let daemon = Daemon::start();
@@ -301,7 +302,15 @@ fn host_inspect_adds_only_the_two_optional_keys() {
         .map(String::as_str)
         .collect();
     let added: Vec<&str> = new_keys.difference(&old_keys).copied().collect();
-    assert_eq!(added, ["runtime_api", "runtime_features"]);
+    assert_eq!(
+        added,
+        [
+            "package_create_profile_program_supported",
+            "package_setup_supported",
+            "runtime_api",
+            "runtime_features",
+        ]
+    );
 
     // The new client decodes the N-1 answer and writes it back unchanged.
     let decoded: protocol::HostCapabilities =

@@ -1233,6 +1233,27 @@ impl Client {
             .map_err(command_unsupported)
     }
 
+    /// Resolve one setup entry of a package to its verified program path.
+    ///
+    /// The daemon only resolves the entry; the caller runs the program. The
+    /// method is local-only, so a remote daemon answers `command_setup_not_local`.
+    /// A daemon that does not implement the method maps the same way as
+    /// [`Self::command_run`]: `command_unsupported` for the current protocol
+    /// version, `daemon/version_mismatch` for another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails or the daemon reports a
+    /// `command_*` error.
+    pub async fn package_setup_resolve(
+        &mut self,
+        params: protocol::SetupResolveParams,
+    ) -> Result<protocol::SetupResolveResult, ClientError> {
+        self.call_direct::<protocol::method::PackageSetupResolve>(params)
+            .await
+            .map_err(command_unsupported)
+    }
+
     /// Wait for a session predicate on a dedicated bounded connection.
     pub async fn session_wait(
         &mut self,
@@ -2059,8 +2080,8 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
         .max(configured)
 }
 
-/// The error a daemon that lacks `command.run` produces, as the typed
-/// `command_unsupported`.
+/// The error a daemon that lacks `command.run` or `package.setup_resolve`
+/// produces, as the typed `command_unsupported`.
 ///
 /// A daemon of the current protocol version that predates the method answers
 /// `method_not_found`; the mapping also covers a connection frozen below the
@@ -2081,7 +2102,8 @@ fn command_unsupported(error: ClientError) -> ClientError {
             }
         }
         ClientError::DaemonProtocolTooOld { host, method, .. }
-            if method == protocol::method::COMMAND_RUN =>
+            if method == protocol::method::COMMAND_RUN
+                || method == protocol::method::PACKAGE_SETUP_RESOLVE =>
         {
             match host {
                 Some(host) => ClientError::RemoteProtocol {

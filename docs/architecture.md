@@ -1905,7 +1905,11 @@ Trust boundary:
   text, `details` appears only on `command_failed`, and the program's output
   reaches the reply on success and no log. Residual: a program that calls
   `setsid()` or double-forks escapes the group kill and lives until the daemon's
-  unit stops.
+  unit stops. Setup entries are never run by the daemon: `package.setup_resolve`
+  (owner-only, local-only) returns the verified program and its fixed arguments,
+  and `pohunek plugin run` starts the program on the owner's terminal with an
+  allowlisted environment, under the owner's account like any command the owner
+  runs by hand.
 - **Local lifecycle only.** `package.*` methods are served on the local control
   socket only (`crates/daemon/src/api/handler/package.rs`, error
   `local_only_method`), and the CLI refuses a remote `--host`
@@ -2451,7 +2455,7 @@ that remain are cheap, free-by-default, or inherited:
   `session_adopt_refused`. The package methods that write profile files
   (`package.create_profile`, `package.create_preset`,
   `package.remove_profile`, `package.bind_profile`) are owner only in the same
-  way. A session holds the `[rights]` its profile had at launch or resume,
+  way, and so is `package.setup_resolve`. A session holds the `[rights]` its profile had at launch or resume,
   narrowed by the file as it reads now, so an edit never widens a running
   session. An `owner_equivalent` profile keeps its own `spawn_profiles` list.
   `[rights]` is read from the owner-private profile file, never from a

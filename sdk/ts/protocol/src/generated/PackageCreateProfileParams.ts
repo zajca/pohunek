@@ -41,6 +41,13 @@ export type PackageCreateProfileParams = {
    */
   options_toml?: string;
   /**
+   * Absolute path of the launch program, written as `program`. The daemon
+   * accepts only a plain absolute path of a regular executable file that
+   * only the owner or root can write. Send it only when the daemon reports
+   * `package_create_profile_program_supported`.
+   */
+  program?: string;
+  /**
    * The digest of the existing profile file this call replaces. Required
    * when the name exists; refused when it does not.
    */

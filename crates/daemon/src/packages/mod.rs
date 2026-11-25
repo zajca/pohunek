@@ -55,12 +55,13 @@ use package::{
     VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES, MAX_INDEX_BYTES,
 };
 use protocol::{
-    CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
-    PackageFindingKind, PackageId, PackageIdentity, PackageInfo, PackageInspectResult,
-    PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
-    PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
+    CommandErrorKind, CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind,
+    PackageFinding, PackageFindingKind, PackageId, PackageIdentity, PackageInfo,
+    PackageInspectResult, PackageInstallParams, PackageInstallResult, PackageInstallStatus,
+    PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
     PackageSelectionBlock, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
     PackageUninstallResult, PluginIndexApplyParams, PluginIndexApplyResult, ProtocolError,
+    SetupInfo, SetupResolveParams, SetupResolveResult,
 };
 use tracing::warn;
 
@@ -96,6 +97,9 @@ struct Prepared {
     /// The commands the descriptor also exports; empty for a plain runtime
     /// package.
     commands: Vec<CommandInfo>,
+    /// The setup entries the descriptor exports; empty for a plain runtime
+    /// package.
+    setup: Vec<SetupInfo>,
     identity: PackageIdentity,
     authority: Authority,
     source: RecordSource,
@@ -154,6 +158,8 @@ struct Inspected {
     runtime: Option<PackageRuntimeInfo>,
     /// The commands the loaded descriptor exports.
     commands: Vec<CommandInfo>,
+    /// The setup entries the loaded descriptor exports.
+    setup: Vec<SetupInfo>,
     /// Whether the descriptor loaded and exports commands only.
     commands_only: bool,
 }
@@ -269,6 +275,29 @@ impl PackageService {
         .await
     }
 
+    /// Resolves one setup entry of the selected package to its verified
+    /// program. The program is not run here.
+    ///
+    /// # Errors
+    ///
+    /// The [`CommandErrorKind`] of the first failed check, see
+    /// [`crate::package_setup::resolve`].
+    pub async fn package_setup_resolve(
+        &self,
+        params: SetupResolveParams,
+    ) -> Result<SetupResolveResult, CommandErrorKind> {
+        let store = self
+            .authority
+            .context()
+            .map_err(|_kind| CommandErrorKind::Unavailable)?
+            .store;
+        tokio::task::spawn_blocking(move || {
+            crate::package_setup::resolve(&store, &params.package, &params.setup)
+        })
+        .await
+        .map_err(|_join| CommandErrorKind::Unavailable)?
+    }
+
     /// Describes one installed package.
     ///
     /// # Errors
@@ -291,6 +320,7 @@ impl PackageService {
                 package: inspected.info,
                 runtime: inspected.runtime,
                 commands: inspected.commands,
+                setup: inspected.setup,
                 commands_only: inspected.commands_only,
             })
         })
@@ -871,11 +901,13 @@ fn inspect_record(
 ) -> Inspected {
     let digest = record.digest();
     let mut commands = Vec::new();
+    let mut setup = Vec::new();
     let mut commands_only = false;
     let (runtime, fault, selection_blocked) =
         match context.store.read_descriptor(digest, record.identity()) {
             Ok(descriptor) => {
                 commands = descriptor.commands().to_vec();
+                setup = descriptor.setup().to_vec();
                 commands_only = descriptor.runtime().is_none();
                 match descriptor.runtime() {
                     Some(definition) => {
@@ -924,6 +956,7 @@ fn inspect_record(
         },
         runtime,
         commands,
+        setup,
         commands_only,
     }
 }
@@ -1119,19 +1152,25 @@ fn reload_and_describe(
     })
 }
 
-/// Refuses a package that declares commands unless the request opted in.
+/// Refuses a package that declares commands, or setup entries outside the
+/// official trust paths, unless the request opted in.
 ///
 /// A client that does not send `accept_commands` cannot show a command's
 /// program, arguments and exposure for consent, and an older client drops the
-/// `commands` of the result without a trace. The check runs on the validated
-/// archive before any write, so a dry run is refused too.
+/// `commands` of the result without a trace. A setup entry of an official
+/// package needs no opt-in: the signed catalog or index binds its digest and
+/// nothing runs it except an explicit `plugin run`. The check runs on the
+/// validated archive before any write, so a dry run is refused too.
 fn require_commands_opt_in(candidate: &Candidate, accept: bool) -> Result<(), PackageErrorKind> {
     let declares = match candidate {
-        Candidate::Runtime(prepared) => !prepared.commands.is_empty(),
+        Candidate::Runtime(prepared) => {
+            !prepared.commands.is_empty()
+                || (!prepared.setup.is_empty() && prepared.authority == Authority::Local)
+        }
         Candidate::Commands(prepared) => !prepared.commands.is_empty(),
     };
     if declares && !accept {
-        warn!("a package that declares commands was refused: the request did not opt in");
+        warn!("a package that declares commands or setup entries was refused: the request did not opt in");
         return Err(PackageErrorKind::CommandsClientUnsupported);
     }
     Ok(())
@@ -1207,10 +1246,11 @@ fn prepare_local(
     let bytes = read_archive_file(path, &limits)?;
     let (digest, descriptor) = read_authorized(&bytes, pinned, &limits)?;
     let identity = descriptor.identity().clone();
-    let (definition, commands) = descriptor.into_parts();
+    let (definition, commands, setup) = descriptor.into_parts();
     let Some(definition) = definition else {
         // The archive was read against `pinned`, so the exact-digest trust is
-        // already satisfied; there is no runtime id to check.
+        // already satisfied; there is no runtime id to check. A descriptor
+        // without a runtime carries no setup entries.
         return Ok(Candidate::Commands(Box::new(CommandsPrepared {
             bytes,
             digest,
@@ -1236,6 +1276,7 @@ fn prepare_local(
         digest,
         definition,
         commands,
+        setup,
         identity,
         authority: Authority::Local,
         source: RecordSource::ExplicitDigest,
@@ -1271,7 +1312,7 @@ fn prepare_official(
     trust::require_listed(&verified, &raw)?;
     let (digest, descriptor) = read_authorized(&bytes, &raw, &limits)?;
     let identity = descriptor.identity().clone();
-    let (definition, commands) = descriptor.into_parts();
+    let (definition, commands, setup) = descriptor.into_parts();
     // The catalog authorizes a package for the runtime it serves, so a package
     // that exports commands only cannot be catalog-authorized.
     let Some(definition) = definition else {
@@ -1282,7 +1323,8 @@ fn prepare_official(
     };
     // The release install paths (`ensure`, `setup host`) have no consent step
     // that shows a command, so an official package declaring commands is not
-    // installable until they do.
+    // installable until they do. Setup entries stay installable: nothing runs
+    // them outside an explicit `plugin run`.
     if !commands.is_empty() {
         warn!("an official package that declares commands was refused: no consent step shows them");
         return Err(PackageErrorKind::Untrusted);
@@ -1300,6 +1342,7 @@ fn prepare_official(
         digest,
         definition,
         commands,
+        setup,
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
@@ -1354,7 +1397,7 @@ fn prepare_indexed(
     trust::require_indexed(&verified, &raw)?;
     let (digest, descriptor) = read_authorized(&bytes, &raw, &limits)?;
     let identity = descriptor.identity().clone();
-    let (definition, commands) = descriptor.into_parts();
+    let (definition, commands, setup) = descriptor.into_parts();
     let Some(definition) = definition else {
         if !commands.is_empty() {
             warn!(
@@ -1399,6 +1442,7 @@ fn prepare_indexed(
         digest,
         definition,
         commands,
+        setup,
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
@@ -1445,7 +1489,7 @@ fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, Pa
         rejection_kind(&rejection)
     })?;
     let identity = descriptor.identity().clone();
-    let (definition, commands) = descriptor.into_parts();
+    let (definition, commands, setup) = descriptor.into_parts();
     let Some(definition) = definition else {
         return Ok(Candidate::Commands(Box::new(CommandsPrepared {
             bytes,
@@ -1464,6 +1508,7 @@ fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, Pa
         digest,
         definition,
         commands,
+        setup,
         identity,
         authority: Authority::Local,
         source: RecordSource::Link,
@@ -1495,6 +1540,7 @@ struct Install {
     /// The runtime the descriptor declares, when it exports one.
     runtime: Option<PackageRuntimeInfo>,
     commands: Vec<CommandInfo>,
+    setup: Vec<SetupInfo>,
 }
 
 /// Installs a checked archive by what its descriptor exports.
@@ -1520,6 +1566,7 @@ fn commit_candidate(
                 integration: Integration::Known(None),
                 runtime: None,
                 commands: prepared.commands,
+                setup: Vec::new(),
             },
             plan,
             retained,
@@ -1547,6 +1594,7 @@ fn commit_install(
             runtime: Some(runtime_info(&prepared.definition)),
             integration: declared_by(&prepared.definition),
             commands: prepared.commands,
+            setup: prepared.setup,
             bytes: prepared.bytes,
             digest: prepared.digest,
             identity: prepared.identity,
@@ -1607,6 +1655,7 @@ fn install_package(
         integration,
         runtime,
         commands,
+        setup,
     } = install;
     let now = unix_now().map_err(PackageError::from)?;
     // A package whose integration is incompatible with a retained version is
@@ -1641,6 +1690,7 @@ fn install_package(
             },
             runtime,
             commands,
+            setup,
             reloaded: false,
         });
     }
@@ -1721,6 +1771,7 @@ fn install_package(
         package: inspected.info,
         runtime,
         commands,
+        setup,
         reloaded: true,
     })
 }

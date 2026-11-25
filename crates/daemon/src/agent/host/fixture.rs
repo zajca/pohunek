@@ -281,24 +281,55 @@ fn probeless_descriptor(official: &OfficialPackage) -> String {
 /// Panics unless a descriptor whose probe is dropped declares exactly one
 /// `version_probe` line, which would be a defect of the fixture or of the
 /// package.
-fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
+fn official_entries(official: &OfficialPackage) -> Vec<package::ArchiveEntry> {
     let descriptor = if official.keeps_probe {
         official.descriptor.to_owned()
     } else {
         probeless_descriptor(official)
     };
-    [
+    let mut entries = setup_stand_ins(&descriptor);
+    entries.insert(
+        0,
         package::ArchiveEntry {
             path: super::RUNTIME_DESCRIPTOR_PATH.to_owned(),
             contents: descriptor.into_bytes(),
             executable: false,
         },
+    );
+    entries.insert(
+        1,
         package::ArchiveEntry {
             path: "detect.toml".to_owned(),
             contents: official.detect.as_bytes().to_vec(),
             executable: false,
         },
-    ]
+    );
+    entries
+}
+
+/// Contents of the stand-in a setup program of an official fixture package is
+/// built from. A fixture package is never launched, so the file only has to
+/// exist as an executable the descriptor can name.
+const STAND_IN_PROGRAM: &[u8] = b"#!/bin/sh\n";
+
+/// One executable stand-in for each `[setup.<name>]` program `descriptor`
+/// names, so the synthesized archive holds every file the descriptor lists.
+pub(crate) fn setup_stand_ins(descriptor: &str) -> Vec<package::ArchiveEntry> {
+    let Ok(table) = toml::from_str::<toml::Table>(descriptor) else {
+        return Vec::new();
+    };
+    let Some(setup) = table.get("setup").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    setup
+        .values()
+        .filter_map(|entry| entry.get("program").and_then(toml::Value::as_str))
+        .map(|program| package::ArchiveEntry {
+            path: program.to_owned(),
+            contents: STAND_IN_PROGRAM.to_vec(),
+            executable: true,
+        })
+        .collect()
 }
 
 /// The archive entries of the official package of `runtime` as
@@ -308,7 +339,7 @@ fn official_entries(official: &OfficialPackage) -> [package::ArchiveEntry; 2] {
 /// # Panics
 ///
 /// Panics when `runtime` is not `codex`, `claude` or `hermes`.
-pub(crate) fn official_package_entries(runtime: &str) -> [package::ArchiveEntry; 2] {
+pub(crate) fn official_package_entries(runtime: &str) -> Vec<package::ArchiveEntry> {
     let official = OFFICIAL_PACKAGES
         .iter()
         .find(|official| official.runtime == runtime)
