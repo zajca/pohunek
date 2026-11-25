@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProfileDigest,
-    ProtocolError, RuntimeId, SessionId,
+    ProtocolError, RuntimeId, SessionId, SetupInfo,
 };
 
 /// How an installed package was authorized.
@@ -412,6 +412,11 @@ pub struct PackageInstallResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<CommandInfo>>", optional))]
     pub commands: Vec<CommandInfo>,
+    /// The setup entries the descriptor exports, with their program,
+    /// arguments and description; absent when it exports none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<SetupInfo>>", optional))]
+    pub setup: Vec<SetupInfo>,
     /// Whether the daemon rebuilt its runtime registry after the change.
     pub reloaded: bool,
 }
@@ -603,6 +608,13 @@ pub struct PackageCreateProfileParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub options_toml: Option<String>,
+    /// Absolute path of the launch program, written as `program`. The daemon
+    /// accepts only a plain absolute path of a regular executable file that
+    /// only the owner or root can write. Send it only when the daemon reports
+    /// `package_create_profile_program_supported`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub program: Option<String>,
     /// The digest of the existing profile file this call replaces. Required
     /// when the name exists; refused when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -782,6 +794,11 @@ pub struct PackageInspectResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<CommandInfo>>", optional))]
     pub commands: Vec<CommandInfo>,
+    /// The setup entries the descriptor exports; absent when it exports none
+    /// or cannot be loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<SetupInfo>>", optional))]
+    pub setup: Vec<SetupInfo>,
     /// Set when the descriptor loaded and exports no runtime (commands only,
     /// or a context directory), so a missing `runtime` is not a fault. A reply without it says nothing about the
     /// descriptor.
@@ -1006,6 +1023,10 @@ pub enum PackageErrorKind {
     ProfileHomeInvalid,
     /// The base runtime declares no config home, so it takes no `home`.
     ProfileHomeUnsupported,
+    /// The program is not an absolute path of plain components naming a
+    /// regular executable file that its owner or root owns and nobody else can
+    /// write, or it is a symbolic link; nothing was written.
+    ProfileProgramInvalid,
     /// The agents directory or one of its ancestors is a symbolic link or is
     /// not owner-private; nothing was written.
     ProfileDirUnsafe,
@@ -1084,6 +1105,7 @@ impl PackageErrorKind {
             Self::ProfileCredentialLiteral => "package_profile_credential_literal",
             Self::ProfileHomeInvalid => "package_profile_home_invalid",
             Self::ProfileHomeUnsupported => "package_profile_home_unsupported",
+            Self::ProfileProgramInvalid => "package_profile_program_invalid",
             Self::ProfileDirUnsafe => "package_profile_dir_unsafe",
             Self::ProfileBuiltin => "package_profile_builtin",
             Self::ProfilePackageRuntime => "package_profile_package_runtime",
@@ -1170,6 +1192,9 @@ impl PackageErrorKind {
             }
             Self::ProfileHomeUnsupported => {
                 "the base runtime declares no config home, so the profile takes no home"
+            }
+            Self::ProfileProgramInvalid => {
+                "the program must be an absolute executable file that only its owner or root can write, not a symbolic link"
             }
             Self::ProfileDirUnsafe => {
                 "the agents directory or one of its ancestors is a symbolic link or not private to the owner"
@@ -1262,6 +1287,9 @@ impl PackageErrorKind {
                 "pass an absolute path without `~`, `.` or `..` components"
             }
             Self::ProfileHomeUnsupported => "create the profile without `--home`",
+            Self::ProfileProgramInvalid => {
+                "pass the absolute path of the executable itself, not a link, and make it writable by you only"
+            }
             Self::ProfileDirUnsafe => {
                 "make the agents directory a real directory owned by you and writable by you only"
             }
@@ -1426,6 +1454,7 @@ mod tests {
             PackageErrorKind::ProfileCredentialLiteral,
             PackageErrorKind::ProfileHomeInvalid,
             PackageErrorKind::ProfileHomeUnsupported,
+            PackageErrorKind::ProfileProgramInvalid,
             PackageErrorKind::ProfileDirUnsafe,
             PackageErrorKind::ProfileBuiltin,
             PackageErrorKind::ProfilePackageRuntime,

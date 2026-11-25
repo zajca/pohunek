@@ -192,6 +192,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "prompt-arg-word-paste-v1",
         since: "0.44.0",
     },
+    RuntimeFeature {
+        id: "package-setup-v1",
+        since: "0.45.0",
+    },
 ];
 
 /// The ids of [`RUNTIME_FEATURES`], in registry order: what `host.inspect`
@@ -256,6 +260,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "package-context-v1",
         rule: GateRule::Key("context"),
+    },
+    FeatureGate {
+        feature: "package-setup-v1",
+        rule: GateRule::Key("setup"),
     },
     FeatureGate {
         feature: "input-refuse-while-blocked-v1",

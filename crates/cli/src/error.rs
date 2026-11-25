@@ -394,6 +394,10 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Plugin(#[from] crate::commands::plugin::Error),
 
+    /// A `pohunek plugin run` was refused before its program started.
+    #[error(transparent)]
+    PluginRun(#[from] crate::commands::plugin_run::Error),
+
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -784,6 +788,12 @@ impl CliError {
                 error.to_string(),
                 Some(error.hint().into_owned()),
             ),
+            CliError::PluginRun(error) => ProtocolError::new(
+                ErrorClass::Configuration,
+                error.code(),
+                error.to_string(),
+                Some(error.hint().to_owned()),
+            ),
             CliError::Spawn(msg) => ProtocolError::new(
                 ErrorClass::Daemon,
                 "daemon_spawn_failed",
@@ -1028,7 +1038,7 @@ const CLI_USAGE_EXIT_CODE: u8 = 2;
 /// Process exit statuses of `pohunek host command run`, one per `command_*`
 /// error class.
 ///
-/// The block 40..=52 is distinct from the generic failure (`1`), the usage error
+/// The block 40..=54 is distinct from the generic failure (`1`), the usage error
 /// (`2`). A status never carries the
 /// program's own exit code: that travels in the `--json` error's
 /// `details.process_exit`.
@@ -1059,6 +1069,10 @@ pub(crate) mod command_exit {
     pub(crate) const UNAVAILABLE: u8 = 51;
     /// A `command_*` error code this build does not know, from a newer daemon.
     pub(crate) const UNRECOGNIZED: u8 = 52;
+    /// The selected version declares no setup entry of that name.
+    pub(crate) const SETUP_NOT_DECLARED: u8 = 53;
+    /// The setup entry was asked for over the overlay or a relay path.
+    pub(crate) const SETUP_NOT_LOCAL: u8 = 54;
 }
 
 /// The exit status of a `command.run` error, or `None` for any other error.
@@ -1098,6 +1112,8 @@ fn command_kind_status(kind: protocol::CommandErrorKind) -> u8 {
         Kind::OutputTooLarge => command_exit::OUTPUT_TOO_LARGE,
         Kind::OutputNotUtf8 => command_exit::OUTPUT_NOT_UTF8,
         Kind::Unavailable => command_exit::UNAVAILABLE,
+        Kind::SetupNotDeclared => command_exit::SETUP_NOT_DECLARED,
+        Kind::SetupNotLocal => command_exit::SETUP_NOT_LOCAL,
         _ => command_exit::UNRECOGNIZED,
     }
 }
@@ -1163,6 +1179,7 @@ fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
 pub(crate) fn failure_exit_code(error: &CliError) -> ExitCode {
     match error {
         CliError::Plugin(plugin) if plugin.is_usage() => ExitCode::from(CLI_USAGE_EXIT_CODE),
+        CliError::PluginRun(run) if run.is_usage() => ExitCode::from(CLI_USAGE_EXIT_CODE),
         CliError::SetupHooksUnknown { .. } | CliError::DuplicateAgentOption { .. } => {
             ExitCode::from(CLI_USAGE_EXIT_CODE)
         }

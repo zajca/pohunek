@@ -10,10 +10,11 @@
 // Rust guideline compliant 2026-10-04
 
 use protocol::{
-    PackageBindProfileParams, PackageCreatePresetParams, PackageCreateProfileParams,
-    PackageDoctorParams, PackageErrorKind, PackageInspectParams, PackageInstallParams,
-    PackageLinkParams, PackageRemoveProfileParams, PackageSelectParams, PackageSetEnabledParams,
-    PackageUninstallParams, PluginIndexApplyParams, ProtocolError, Request, Response,
+    CommandErrorKind, PackageBindProfileParams, PackageCreatePresetParams,
+    PackageCreateProfileParams, PackageDoctorParams, PackageErrorKind, PackageInspectParams,
+    PackageInstallParams, PackageLinkParams, PackageRemoveProfileParams, PackageSelectParams,
+    PackageSetEnabledParams, PackageUninstallParams, PluginIndexApplyParams, ProtocolError,
+    Request, Response, SetupResolveParams,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
@@ -232,6 +233,33 @@ pub(super) async fn handle_package_create_profile(
                 .package_create_profile(params)
                 .await,
         ),
+        Err(error) => error_value(request, error),
+    }
+}
+
+/// `package.setup_resolve`: refused with `command_setup_not_local` on any
+/// transport but the local socket, because a setup entry is run only on the
+/// owner's terminal of the host itself.
+pub(super) async fn handle_package_setup_resolve(
+    request: &Request,
+    state: &DaemonState,
+) -> Response {
+    if state.transport != ControlTransport::Local {
+        return error_value(
+            request,
+            ProtocolError::from(CommandErrorKind::SetupNotLocal),
+        );
+    }
+    match parse_params::<SetupResolveParams>(request) {
+        Ok(params) => match state
+            .sessions
+            .packages()
+            .package_setup_resolve(params)
+            .await
+        {
+            Ok(result) => ok_value(request, &result),
+            Err(kind) => error_value(request, ProtocolError::from(kind)),
+        },
         Err(error) => error_value(request, error),
     }
 }

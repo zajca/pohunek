@@ -635,7 +635,11 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/credential.rs` — the daemon's path to the credential-literal detector of `crates/package/src/credential.rs`.
 - `crates/daemon/src/agent/profile/compose.rs` — composes the text of a new profile.
-- `crates/daemon/src/packages/create.rs` — `package.create_profile` (with `options_toml`) and `package.create_preset`.
+- `crates/daemon/src/packages/create.rs` — `package.create_profile` (with `options_toml` and `program`) and `package.create_preset`.
+- `crates/daemon/src/package_setup/mod.rs` — `package.setup_resolve`: the verified program and fixed arguments of a setup entry; the daemon never runs it.
+- `crates/daemon/src/agent/host/setup.rs` — the `[setup.<name>]` descriptor table (`package-setup-v1`).
+- `crates/protocol/src/setup.rs` — `SetupInfo`, `SetupResolveParams` and `SetupResolveResult`.
+- `crates/cli/src/commands/plugin_run.rs` — `pohunek plugin run`: the terminal and environment rules, the argument bounds and the exit status of a setup program.
 - `crates/daemon/src/packages/remove.rs` — `package.remove_profile`: the refusals and the inode-bound removal of a profile file.
 - `crates/daemon/src/session/profile_use.rs` — which profiles running sessions use, and the create re-check under the launch guard.
 - `crates/daemon/src/agent/host/`
@@ -707,6 +711,9 @@ Runtime package archive format:
 - `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `codex`, its integration and an unpinned `base = "codex"` profile refused with the install hint until the package is installed), and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume argv, `semver-line-v1` version probe).
+- `runtime-packages/claude/bin/claude-accounts` — the Claude account tool (`add`, `list`, `check-logs`, `version`), run by `pohunek plugin run pohunek.runtime.claude accounts`.
+- `runtime-packages/claude/bin/claude-account-wrapper.sh` — the launch wrapper template the tool writes as `claude-account` in the accounts directory.
+- `scripts/tests/claude-accounts-scenario.sh` — the Linux scenario of the account tool and wrapper, run by `scripts/tests/test_claude_accounts.py`.
 - `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the v0.34.2 built-in one plus the #613 rules (running-turn footer, wrapped selection forms, first-run and trust dialogs, the npm `claude.exe` process); the daemon compiles no Claude in, so this package is the only source of `claude`.
 - `compat/claude/compatibility-lock.json` — pinned Claude Code release, native binary SHA-256 and supported range.
 - `compat/claude/screens/` — screens and terminal titles captured from a real Claude Code that the manifest test classifies.

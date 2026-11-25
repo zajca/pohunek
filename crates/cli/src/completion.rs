@@ -1067,8 +1067,8 @@ mod tests {
                 }
             }
         }
-        // inspect, update, select, enable, disable, uninstall, doctor.
-        assert_eq!(package_arguments, 7);
+        // inspect, update, select, enable, disable, uninstall, doctor, run.
+        assert_eq!(package_arguments, 8);
     }
 
     #[test]

@@ -552,7 +552,14 @@ fn copy_edited(source: &Path, target: &Path, edit: &dyn Fn(&str, String) -> Stri
         }
         let text = std::fs::read_to_string(&path).expect("a package file");
         let edited = edit(&name.to_string_lossy(), text);
-        std::fs::write(target.join(name), edited).expect("copy a package file");
+        let copied = target.join(name);
+        std::fs::write(&copied, edited).expect("copy a package file");
+        // The executable bit is part of the package: a setup program or a
+        // command the copy lost would fail the descriptor's program check.
+        let mode = std::fs::metadata(&path)
+            .expect("a package file's metadata")
+            .permissions();
+        std::fs::set_permissions(&copied, mode).expect("keep the package file's mode");
     }
 }
 

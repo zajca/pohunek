@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 use protocol::{
     CommandExposure, CommandInfo, CommandName, PackageId, PackageIdentity, PackageVersion,
+    SetupInfo,
 };
 use serde::Deserialize;
 use toml::{Table, Value};
@@ -44,6 +45,7 @@ pub struct PackageDescriptor {
     identity: PackageIdentity,
     runtime: Option<RuntimeDefinition>,
     commands: Vec<CommandInfo>,
+    setup: Vec<SetupInfo>,
     context_dir: Option<String>,
 }
 
@@ -80,23 +82,31 @@ impl PackageDescriptor {
         &self.commands
     }
 
-    /// Splits the descriptor into its runtime and commands.
+    /// The setup entries the package exports, in name order.
     #[must_use]
-    pub fn into_parts(self) -> (Option<RuntimeDefinition>, Vec<CommandInfo>) {
-        (self.runtime, self.commands)
+    pub fn setup(&self) -> &[SetupInfo] {
+        &self.setup
     }
 
-    /// A descriptor that exports `runtime` and `commands`.
+    /// Splits the descriptor into its runtime, commands and setup entries.
     #[must_use]
-    pub(super) fn with_commands(
+    pub fn into_parts(self) -> (Option<RuntimeDefinition>, Vec<CommandInfo>, Vec<SetupInfo>) {
+        (self.runtime, self.commands, self.setup)
+    }
+
+    /// A descriptor that exports `runtime`, `commands` and `setup`.
+    #[must_use]
+    pub(super) fn with_exports(
         identity: PackageIdentity,
         runtime: RuntimeDefinition,
         commands: Vec<CommandInfo>,
+        setup: Vec<SetupInfo>,
     ) -> Self {
         Self {
             identity,
             runtime: Some(runtime),
             commands,
+            setup,
             context_dir: None,
         }
     }
@@ -225,6 +235,12 @@ pub(super) fn classify(
                 "runtime, input, resume and native_reference are declared together or not at all",
         });
     }
+    if descriptor.contains_key("setup") {
+        return Err(DefinitionError::Field {
+            field: "setup",
+            reason: "needs a runtime: a package that exports only setup entries is not supported",
+        });
+    }
     if descriptor.contains_key("commands") {
         Ok(Exports::CommandsOnly)
     } else {
@@ -280,6 +296,7 @@ pub(super) fn parse_commands_only(
         identity,
         runtime: None,
         commands,
+        setup: Vec::new(),
         context_dir: None,
     })
 }
@@ -347,6 +364,7 @@ pub(super) fn parse_context_only(
         identity,
         runtime: None,
         commands: Vec::new(),
+        setup: Vec::new(),
         context_dir: Some(dir),
     })
 }

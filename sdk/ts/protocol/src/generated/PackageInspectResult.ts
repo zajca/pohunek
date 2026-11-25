@@ -3,6 +3,7 @@
 import type { CommandInfo } from "./CommandInfo";
 import type { PackageInfo } from "./PackageInfo";
 import type { PackageRuntimeInfo } from "./PackageRuntimeInfo";
+import type { SetupInfo } from "./SetupInfo";
 
 /**
  * Result of `package.inspect`.
@@ -22,6 +23,11 @@ export type PackageInspectResult = {
    * exposure; absent when the descriptor exports none or cannot be loaded.
    */
   commands?: Array<CommandInfo>;
+  /**
+   * The setup entries the descriptor exports; absent when it exports none
+   * or cannot be loaded.
+   */
+  setup?: Array<SetupInfo>;
   /**
    * Set when the descriptor loaded and exports no runtime (commands only,
    * or a context directory), so a missing `runtime` is not a fault. A reply without it says nothing about the

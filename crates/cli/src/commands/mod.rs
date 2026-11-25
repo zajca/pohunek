@@ -23,6 +23,7 @@ pub(crate) mod notifications;
 pub(crate) mod plugin;
 pub(crate) mod plugin_index;
 pub(crate) mod plugin_profile;
+pub(crate) mod plugin_run;
 pub(crate) mod profile_bind;
 pub(crate) mod profile_fold;
 pub(crate) mod project;

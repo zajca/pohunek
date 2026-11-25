@@ -37,8 +37,8 @@ use crate::{
     SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
     SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, SetupResolveParams,
+    SetupResolveResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -717,4 +717,14 @@ method_table!(
     CommandRunResult,
     "CommandRunParams",
     "CommandRunResult";
+
+    /// Resolve one setup entry of a package to a verified program path
+    /// (local-only); the CLI runs the program on the owner's terminal.
+    PackageSetupResolve,
+    PACKAGE_SETUP_RESOLVE,
+    "package.setup_resolve",
+    SetupResolveParams,
+    SetupResolveResult,
+    "SetupResolveParams",
+    "SetupResolveResult";
 );

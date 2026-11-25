@@ -1393,6 +1393,10 @@ struct RawDefinition {
     /// [`super::commands::commands_of`] against the package manifest.
     #[serde(default, rename = "commands")]
     _commands: Option<toml::Value>,
+    /// Setup entries the descriptor also exports; validated by
+    /// [`super::setup::setup_of`] against the package manifest.
+    #[serde(default, rename = "setup")]
+    _setup: Option<toml::Value>,
     runtime: RawRuntime,
     input: RawInput,
     resume: RawResume,

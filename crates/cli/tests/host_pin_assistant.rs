@@ -78,6 +78,8 @@ fn capabilities() -> HostCapabilities {
         package_install_index_context_supported: false,
         package_create_profile_supported: true,
         package_create_profile_options_supported: true,
+        package_create_profile_program_supported: true,
+        package_setup_supported: true,
         package_create_preset_supported: true,
         package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
