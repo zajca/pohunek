@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
-    ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestError,
-    ProgramStatusConfig, MAX_JOURNALED_UNMAPPED_TUPLES,
+    ActivityTransition, DetectionConfig, Detector, DetectorConfig, LimitSighting, Manifest,
+    ManifestError, ProgramStatusConfig, MAX_JOURNALED_UNMAPPED_TUPLES, MAX_LIMIT_SIGHTINGS,
 };
 use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
@@ -337,6 +337,19 @@ fn usage_limit_screen() -> Vec<u8> {
     let text = read("crates/daemon/tests/fixtures/claude/usage-limit-screen.txt");
     let rows: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
     frame(None, &rows)
+}
+
+/// A synthetic usage-limit screen naming `phrase`.
+fn usage_limit_banner(phrase: &str) -> Vec<u8> {
+    let line = format!("  Claude {phrase}");
+    frame(
+        None,
+        &[
+            "Claude Code",
+            line.as_str(),
+            "  Your limit will reset at 5:00 PM.",
+        ],
+    )
 }
 
 /// An activity and the source that reported it.
@@ -1871,10 +1884,14 @@ fn a_usage_limit_screen_is_sighted_once_with_the_held_record() {
     harness.feed(&claude_record("working"));
     harness.feed(&usage_limit_screen());
 
-    let sighting = harness
+    let sighting = match harness
         .detector
         .take_usage_limit_sighting()
-        .expect("the usage-limit screen is sighted");
+        .expect("the usage-limit screen is sighted")
+    {
+        LimitSighting::Screen(sighting) => sighting,
+        LimitSighting::Suppressed { .. } => panic!("expected a screen sighting"),
+    };
     assert_eq!(sighting.marker, "usage limit reached");
     assert_eq!(sighting.record, "app=claude-code:state=working");
     assert!(
@@ -1907,6 +1924,58 @@ fn a_usage_limit_screen_is_sighted_once_with_the_held_record() {
     );
 }
 
+/// Alternating limit phrases are capped per detector: `MAX_LIMIT_SIGHTINGS`
+/// screens are journaled, the next one queues exactly one suppression line, and
+/// a lag resync or reconfigure keeps the budget spent (#2101 review).
+#[test]
+fn alternating_limit_screens_are_capped_with_one_suppression_line() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    let phrases = ["usage limit reached", "weekly limit"];
+    for index in 0..MAX_LIMIT_SIGHTINGS {
+        harness.feed(&usage_limit_banner(phrases[index % phrases.len()]));
+        let sighting = harness
+            .detector
+            .take_usage_limit_sighting()
+            .unwrap_or_else(|| panic!("sighting {index} is under the cap"));
+        assert!(
+            matches!(sighting, LimitSighting::Screen(_)),
+            "sighting {index}: {sighting:?}"
+        );
+    }
+
+    harness.feed(&usage_limit_banner(
+        phrases[MAX_LIMIT_SIGHTINGS % phrases.len()],
+    ));
+    assert_eq!(
+        harness.detector.take_usage_limit_sighting(),
+        Some(LimitSighting::Suppressed {
+            sightings: MAX_LIMIT_SIGHTINGS
+        }),
+        "one suppression line after the cap"
+    );
+
+    harness.detector.resync_after_lag();
+    harness.feed(&usage_limit_banner("usage limit resets"));
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a lag resync does not start a second budget"
+    );
+
+    harness.detector.reconfigure(
+        harness.now,
+        config(
+            &opted_in_source("claude", CLAUDE_APP, true),
+            InputReadiness::ScreenIdle,
+        ),
+    );
+    harness.feed(&usage_limit_banner("5-hour limit"));
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a reconfigure does not start a second budget"
+    );
+}
+
 /// A limit screen names the unmapped 7501 record too, because an unknown
 /// `kind` is exactly what the passive capture is meant to learn.
 #[test]
@@ -1918,10 +1987,14 @@ fn a_usage_limit_screen_names_the_unmapped_record_too() {
     )));
     harness.feed(&usage_limit_screen());
 
-    let sighting = harness
+    let sighting = match harness
         .detector
         .take_usage_limit_sighting()
-        .expect("the usage-limit screen is sighted");
+        .expect("the usage-limit screen is sighted")
+    {
+        LimitSighting::Screen(sighting) => sighting,
+        LimitSighting::Suppressed { .. } => panic!("expected a screen sighting"),
+    };
     assert_eq!(
         sighting.record, "app=claude-code:state=blocked",
         "the unknown kind is dropped from the held record"

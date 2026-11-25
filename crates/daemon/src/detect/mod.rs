@@ -30,6 +30,7 @@ pub use osc::{
     OscEvidence, OscParser, ProgressReport, ProgressState, UnmappedProgramStatus,
     MAX_JOURNALED_UNMAPPED_TUPLES,
 };
+pub use usage_limit::MAX_LIMIT_SIGHTINGS;
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
 use package::version_probe::ProbeVersion;
@@ -149,6 +150,19 @@ pub enum StalenessChange {
     Ended {
         /// Why the fallback ended.
         reason: StalenessEnd,
+    },
+}
+
+/// What the session loop journals after a usage-limit screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitSighting {
+    /// A screen named a usage limit, with the OSC 7501 evidence held then.
+    Screen(LimitScreenSighting),
+    /// The detector reached [`MAX_LIMIT_SIGHTINGS`]; this is the one line
+    /// saying later screens are not journaled.
+    Suppressed {
+        /// The cap that produced this line.
+        sightings: usize,
     },
 }
 
@@ -526,7 +540,13 @@ pub struct Detector {
     /// the limit.
     usage_limit_marker: Option<&'static str>,
     /// The latest usage-limit sighting, for the session loop to journal.
-    usage_limit_sighting: Option<LimitScreenSighting>,
+    usage_limit_sighting: Option<LimitSighting>,
+    /// Usage-limit screens this detector journaled. The count survives
+    /// reconfiguration and lag resync: the cap is per detector, not per
+    /// latch, so a re-armed screen cannot start a second budget.
+    limit_sightings: usize,
+    /// Whether the one suppression line after the cap was queued.
+    limit_sightings_capped: bool,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
     /// Whether terminal context or the active manifest changed since the last
@@ -582,6 +602,8 @@ impl Detector {
             staleness_change: None,
             usage_limit_marker: None,
             usage_limit_sighting: None,
+            limit_sightings: 0,
+            limit_sightings_capped: false,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
             context_dirty: true,
@@ -758,12 +780,14 @@ impl Detector {
         transitions
     }
 
-    /// Records one usage-limit sighting per screen, never per redraw.
+    /// Records one usage-limit sighting per screen, never per redraw, up to
+    /// [`MAX_LIMIT_SIGHTINGS`] per detector.
     ///
     /// The diagnostic applies only to a runtime whose manifest opted in to
     /// program-status evidence: it names the record held at that moment, which
     /// is the 7501 evidence #2101 is missing. A screen that stopped naming the
-    /// limit re-arms the journal for the next hit.
+    /// limit re-arms the latch for the next hit; the cap suppresses the line
+    /// once the budget is spent.
     fn observe_usage_limit_screen(&mut self, now: Instant, text: Option<&str>) {
         if self
             .manifest
@@ -784,7 +808,17 @@ impl Detector {
             return;
         }
         self.usage_limit_marker = Some(marker);
-        self.usage_limit_sighting = Some(LimitScreenSighting {
+        if self.limit_sightings >= MAX_LIMIT_SIGHTINGS {
+            if !self.limit_sightings_capped {
+                self.limit_sightings_capped = true;
+                self.usage_limit_sighting = Some(LimitSighting::Suppressed {
+                    sightings: MAX_LIMIT_SIGHTINGS,
+                });
+            }
+            return;
+        }
+        self.limit_sightings += 1;
+        self.usage_limit_sighting = Some(LimitSighting::Screen(LimitScreenSighting {
             marker,
             record: self
                 .program_status
@@ -797,11 +831,11 @@ impl Detector {
             stale: self.stale.is_some(),
             unmapped: self.osc.last_unmapped().cloned(),
             activity: self.state.published_activity(),
-        });
+        }));
     }
 
     /// Takes the latest usage-limit sighting, if one is pending.
-    pub fn take_usage_limit_sighting(&mut self) -> Option<LimitScreenSighting> {
+    pub fn take_usage_limit_sighting(&mut self) -> Option<LimitSighting> {
         self.usage_limit_sighting.take()
     }
 

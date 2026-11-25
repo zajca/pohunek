@@ -141,10 +141,24 @@ fn log_staleness_change(id: &SessionId, change: Option<crate::detect::StalenessC
 /// cannot be triggered on demand (#2101). It carries the marker, the canonical
 /// held record, the record's age and staleness, the latest unmapped 7501 tokens
 /// and the published activity. Fields a sighting does not have render empty
-/// (`record`, the `unmapped_*` tokens) or `0` (`record_age_ms`).
-fn log_usage_limit_sighting(id: &SessionId, sighting: Option<crate::detect::LimitScreenSighting>) {
+/// (`record`, the `unmapped_*` tokens) or `0` (`record_age_ms`). After
+/// `MAX_LIMIT_SIGHTINGS` lines the detector queues one suppression line, and
+/// that is the last line the session writes for the cap.
+fn log_usage_limit_sighting(id: &SessionId, sighting: Option<crate::detect::LimitSighting>) {
     let Some(sighting) = sighting else {
         return;
+    };
+    let sighting = match sighting {
+        crate::detect::LimitSighting::Screen(sighting) => sighting,
+        crate::detect::LimitSighting::Suppressed { sightings } => {
+            tracing::info!(
+                target: "session.program_status.limit_screen",
+                session = %id.0,
+                sightings,
+                "further usage-limit screen sightings suppressed"
+            );
+            return;
+        }
     };
     let record_age_ms = sighting
         .record_age

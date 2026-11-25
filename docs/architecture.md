@@ -1261,7 +1261,9 @@ the screen rules stay the fallback.
   demand, so the daemon journals what the screen shows when it happens. When
   the visible screen names a usage limit (the detector's bounded marker list,
   matched ASCII case-insensitively) and a manifest opted in to program-status
-  evidence, the detector records one sighting per screen, not one per redraw.
+  evidence, the detector records one sighting per screen, not one per redraw,
+  and journals at most a bounded number of sightings per detector before one
+  `further usage-limit screen sightings suppressed` line.
   The session loop logs it at info under
   `session.program_status.limit_screen` with the matched marker, the held root
   record in canonical form (`app=..:state=..[:kind=..]`), its age and

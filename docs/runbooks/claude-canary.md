@@ -267,7 +267,10 @@ the table: a limit cannot be triggered on demand, so it is captured passively
 The daemon journals a usage-limit screen instead of a scenario capturing it.
 When the visible screen names a usage limit, the detector records one sighting
 and the session loop writes an info line under
-`session.program_status.limit_screen` to `~/.local/state/pohunek/logs/`. The
+`session.program_status.limit_screen` to `~/.local/state/pohunek/logs/`, at
+most a bounded number of sightings per detector; after the cap it writes one
+`further usage-limit screen sightings suppressed` line and no further sighting.
+The
 line carries the matched marker, the held OSC 7501 record in canonical form,
 its age and staleness, the latest unmapped record's tokens (`state`, `kind`,
 `app`, whether it carried a message or a title) and the published activity;
