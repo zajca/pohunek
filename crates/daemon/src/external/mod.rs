@@ -32,6 +32,7 @@ use crate::integration::{ConfigHomes, LaunchHome};
 use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
 
+mod cline;
 #[cfg(target_os = "macos")]
 mod fsevents;
 pub(crate) mod history;
@@ -585,7 +586,7 @@ impl TranscriptIndex {
         let gone = transcript_is_gone(path);
         // A change event beyond the root's depth bound (a backend that watches
         // the whole tree reports one) indexes nothing.
-        let ignored = gone || owner.is_beyond_depth(path);
+        let ignored = gone || owner.is_beyond_depth(path) || !owner.parser.reads(path);
         let signature = if ignored {
             None
         } else {
@@ -775,17 +776,7 @@ impl TranscriptIndex {
                     }
                 };
                 if file_type.is_dir() {
-                    // A nested provider root, however it is spelled, is scanned as
-                    // its own root so its transcripts carry its own agent kind.
-                    let resolved =
-                        root_canonical.join(path.strip_prefix(&root.path).unwrap_or(&path));
-                    if canonical
-                        .iter()
-                        .zip(all_roots)
-                        .any(|(other_canonical, other)| {
-                            *other_canonical == resolved && other.path != root.path
-                        })
-                    {
+                    if is_nested_provider_root(root, all_roots, canonical, &root_canonical, &path) {
                         continue;
                     }
                     if root.depth_limit().is_some_and(|max| depth >= max) {
@@ -793,11 +784,16 @@ impl TranscriptIndex {
                     }
                     if directories_left == 0 {
                         incomplete = true;
+                        if newest_first {
+                            // The listing is newest name first: what it already
+                            // collected is walked, and the older names are left.
+                            break;
+                        }
                         break 'walk;
                     }
                     directories_left -= 1;
                     subdirectories.push(path);
-                } else if is_jsonl_path(&path) {
+                } else if root.parser.reads(&path) {
                     if !self.is_unchanged(&path, root) {
                         if transcripts_left == 0 {
                             incomplete = true;
@@ -844,6 +840,24 @@ impl TranscriptIndex {
             .get(path)
             .is_some_and(|entry| entry.signature == signature && *entry.owner == *owner)
     }
+}
+
+/// Whether the directory `path` below `root` is another root of `all_roots`,
+/// however it is spelled (`canonical` holds the canonical path of each root,
+/// `root_canonical` that of `root`). A nested provider root is scanned as its
+/// own root so its transcripts carry its own agent kind.
+fn is_nested_provider_root(
+    root: &TranscriptRoot,
+    all_roots: &[TranscriptRoot],
+    canonical: &[PathBuf],
+    root_canonical: &Path,
+    path: &Path,
+) -> bool {
+    let resolved = root_canonical.join(path.strip_prefix(&root.path).unwrap_or(path));
+    canonical
+        .iter()
+        .zip(all_roots)
+        .any(|(other_canonical, other)| *other_canonical == resolved && other.path != root.path)
 }
 
 /// Whether an indexed transcript no longer exists as a regular file.
@@ -1490,6 +1504,7 @@ fn parse_transcript(
     match parser {
         TranscriptParser::JsonlHeadV1 => parse_jsonl_head(agent_base, head_paths, path),
         TranscriptParser::MuseSessionV1 => muse::parse_session(agent_base, root, path),
+        TranscriptParser::ClineSessionV1 => cline::parse_session(agent_base, root, path),
     }
 }
 
@@ -1643,6 +1658,13 @@ fn is_jsonl_path(path: &Path) -> bool {
     path.extension().and_then(OsStr::to_str) == Some(JSONL_EXTENSION)
 }
 
+/// Whether some compiled parser reads `path`. A file watcher, which knows no
+/// root, passes such a path on as a hint; the root that owns it decides with
+/// its own parser.
+fn may_be_transcript(path: &Path) -> bool {
+    TranscriptParser::any_reads(path)
+}
+
 type MutexError<T> = std::sync::PoisonError<T>;
 
 #[cfg(test)]
@@ -1735,6 +1757,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod cline_tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod launch_roots_tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

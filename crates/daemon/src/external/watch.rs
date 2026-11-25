@@ -34,7 +34,7 @@ use tokio_util::time::DelayQueue;
 use tracing::{debug, info, warn};
 
 use super::{
-    canonical_roots, is_jsonl_path, owning_root, platform, TranscriptRoot, PRIVATE_PATH_LABEL,
+    canonical_roots, may_be_transcript, owning_root, platform, TranscriptRoot, PRIVATE_PATH_LABEL,
 };
 
 /// Debounce applied to the first hint for a transcript path before it is parsed.
@@ -607,7 +607,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
         match event {
             WatchEvent::Rescan => self.request_reconcile(),
             WatchEvent::TreeChanged(path) => {
-                if is_jsonl_path(&path) {
+                if may_be_transcript(&path) {
                     // A directory now (or no longer) at a transcript's path: the
                     // parse drops the candidate if the path is not a transcript.
                     self.schedule_parse(path.clone());
@@ -627,12 +627,15 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
     }
 
     fn schedule_parse(&mut self, path: PathBuf) {
-        if !is_jsonl_path(&path) {
+        if !may_be_transcript(&path) {
             return;
         }
         let Some(owner) = owning_root(&self.roots, &self.canonical, &path).cloned() else {
             return;
         };
+        if !owner.parser.reads(&path) {
+            return;
+        }
         if let Some(state) = self.paths.get_mut(&path) {
             if let Phase::InFlight { dirty } = &mut state.phase {
                 *dirty = true;

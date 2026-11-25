@@ -43,6 +43,9 @@
 
 // Rust guideline compliant 2026-10-12
 
+use std::ffi::OsStr;
+use std::path::Path;
+
 use super::config_home::ConfigHome;
 use super::definition::DefinitionError;
 use crate::agent::{is_plain_relative_path, MAX_EXISTENCE_PATH_COMPONENTS};
@@ -54,6 +57,13 @@ pub const JSONL_HEAD_V1_PARSER_ID: &str = "jsonl-head-v1";
 /// Id of the parser that reads the session identity and working directory of
 /// a Muse Code session log, `<root>/YYYY/MM/DD/<uuid>/session.jsonl`.
 pub const MUSE_SESSION_PARSER_ID: &str = "muse-session-v1";
+
+/// Id of the parser that reads the session identity and working directory of
+/// a Cline session manifest, `<root>/<id>/<id>.json`.
+pub const CLINE_SESSION_PARSER_ID: &str = "cline-session-v1";
+
+/// Extension of a Cline session manifest.
+const CLINE_MANIFEST_EXTENSION: &str = ".json";
 
 /// Most directory levels a `[transcripts] max_depth` may descend.
 pub const MAX_TRANSCRIPT_DEPTH: u8 = 6;
@@ -164,15 +174,25 @@ pub enum TranscriptParser {
     /// `payload.record.workspace_root`. Only a log at exactly
     /// `YYYY/MM/DD/<uuid>/session.jsonl` below the root is a session.
     MuseSessionV1,
+    /// Reads a pretty-printed JSON session manifest at exactly
+    /// `<id>/<id>.json` below the root, within the same bounded head: the
+    /// whole manifest must fit the bound. Takes the session id from
+    /// `session_id`, which must equal the directory name and carry no `__`
+    /// (subagent ids), and the absolute working directory from `cwd`.
+    ClineSessionV1,
 }
 
 impl TranscriptParser {
+    /// Every compiled parser.
+    pub const ALL: [Self; 3] = [Self::JsonlHeadV1, Self::MuseSessionV1, Self::ClineSessionV1];
+
     /// The compiled parser named `id`, if core provides one.
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
         match id {
             JSONL_HEAD_V1_PARSER_ID => Some(Self::JsonlHeadV1),
             MUSE_SESSION_PARSER_ID => Some(Self::MuseSessionV1),
+            CLINE_SESSION_PARSER_ID => Some(Self::ClineSessionV1),
             _ => None,
         }
     }
@@ -183,19 +203,54 @@ impl TranscriptParser {
         match self {
             Self::JsonlHeadV1 => JSONL_HEAD_V1_PARSER_ID,
             Self::MuseSessionV1 => MUSE_SESSION_PARSER_ID,
+            Self::ClineSessionV1 => CLINE_SESSION_PARSER_ID,
         }
     }
 
-    /// The depth of the session directories below the root when the tree is
-    /// sharded by date, so a walk that ends at a bound must have visited the
-    /// newest directories first and only the newest session directories hold
-    /// a watch.
+    /// The depth of the session directories below the root when the tree
+    /// lists its sessions by name, newest name first, so a walk that ends at a
+    /// bound must have visited the newest directories first and only the
+    /// newest session directories hold a watch. A Muse tree is sharded by date
+    /// and a Cline tree holds one directory per session id, whose generated
+    /// ids start with their creation time in milliseconds.
     #[must_use]
     pub fn dated_depth(self) -> Option<u8> {
         match self {
             Self::MuseSessionV1 => Some(4),
+            Self::ClineSessionV1 => Some(1),
             Self::JsonlHeadV1 => None,
         }
+    }
+
+    /// Whether this parser reads the file at `path`, judged by the file name
+    /// and its directory alone: a `.jsonl` file for the JSON Lines parsers,
+    /// `<id>.json` inside the directory `<id>` for Cline, whose
+    /// `<id>.messages.json` and subagent files are never read.
+    #[must_use]
+    pub fn reads(self, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            return false;
+        };
+        match self {
+            Self::JsonlHeadV1 | Self::MuseSessionV1 => name
+                .strip_suffix(".jsonl")
+                .is_some_and(|stem| !stem.is_empty()),
+            Self::ClineSessionV1 => {
+                let directory = path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(OsStr::to_str);
+                name.strip_suffix(CLINE_MANIFEST_EXTENSION)
+                    .is_some_and(|stem| !stem.is_empty() && Some(stem) == directory)
+            }
+        }
+    }
+
+    /// Whether any compiled parser reads the file at `path`: the hint a file
+    /// watcher, which knows no root, passes on to the root that owns it.
+    #[must_use]
+    pub fn any_reads(path: &Path) -> bool {
+        Self::ALL.iter().any(|parser| parser.reads(path))
     }
 }
 

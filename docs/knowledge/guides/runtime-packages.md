@@ -125,6 +125,7 @@ The features this core implements:
 | `prompt-arg-dash-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the dash rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
 | `prompt-arg-word-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the bare-word rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
 | `package-setup-v1` | 0.45.0 | `[setup.<name>]` (see [Declaring package setup entries](#declaring-package-setup-entries)) |
+| `transcripts-cline-session-v1` | 0.45.0 | `[transcripts] parser = "cline-session-v1"` (see [Cline session manifests](#cline-session-manifests)) |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -516,7 +517,8 @@ parser = "jsonl-head-v1"   # compiled parser core provides
 dir = "sessions"           # transcript tree below [config_home]
 ```
 
-`parser` names a parser compiled into core: `jsonl-head-v1`, or `muse-session-v1` (below). It
+`parser` names a parser compiled into core: `jsonl-head-v1`, `muse-session-v1` or
+`cline-session-v1` (both below). It
 reads at most the first 32 records (64 KiB) of each `*.jsonl` file (a line that
 is not JSON, invalid UTF-8 included, is skipped and never fails the file) and takes the
 first `session_id`, `sessionId`, `conversation_id` or `conversationId` (in that
@@ -629,6 +631,44 @@ regular `<dir_name>/<file_name>` there. The scan never follows a symlink, goes
 through the highest names first and is bounded like the other existence checks.
 `dir_name` must be `{reference}`; it is not accepted with `strategy =
 "assigned"`, `name_match`, `store_env`, `store_max_depth` or `relocating_*`.
+
+### Cline session manifests
+
+Cline keeps one directory per session, `<id>/<id>.json`, below `data/sessions`
+of its config home. A descriptor reads it with the existing `dir` key and the
+feature `transcripts-cline-session-v1` (listed in `requires`); the parser adds no
+descriptor key:
+
+```toml
+requires = ["transcripts-cline-session-v1"]
+
+[config_home]
+env = "CLINE_DIR"
+default = ".cline"
+
+[transcripts]
+parser = "cline-session-v1"
+dir = "data/sessions"
+```
+
+`cline-session-v1` reads a file at exactly `<id>/<id>.json` below `dir`: one
+pretty-printed JSON object that must fit within 64 KiB (a larger manifest, a
+non-object and invalid JSON are not sessions). Its `session_id` must equal the
+`<id>` directory name, and an id with `__` (a subagent) is never a session. The
+working directory is `cwd`, used only when absolute. `<id>.messages.json` and the
+`<agent>.messages.json` files of subagents are never opened. The walk lists the
+highest directory names first, so a store that outgrows the per-pass entry bound
+has its newest sessions indexed; that equals age order only for ids Cline
+generates (`<13-digit millisecond time>_<5 characters>`), not for the UUIDs Pohunek
+assigns with `--id`, which the observer finds through the periodic pass. A foreground
+`cline` started in a shell is attributed through this root. The parser id is refused
+without the feature (`runtime_feature_unsupported`) and takes no `id_path` or `cwd_path`
+(`descriptor_invalid`).
+
+The root follows `[config_home]` (`CLINE_DIR`). A profile that sets only
+`CLINE_DATA_DIR` moves the store without moving the config home, so its
+sessions are not followed. The `project.candidates` history source reads
+`jsonl-head-v1` files only and lists no Cline session.
 
 ## Hook schemas and integration handlers
 

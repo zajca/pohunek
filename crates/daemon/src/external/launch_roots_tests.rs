@@ -1686,6 +1686,211 @@ async fn a_workspace_that_is_not_absolute_leaves_the_log_without_a_working_direc
     watched.sessions.shutdown();
 }
 
+/// Feature that lets a descriptor read Cline session manifests.
+const CLINE_FEATURE: &str = "transcripts-cline-session-v1";
+
+/// A `[transcripts]` table for the session store below a Cline config home.
+const CLINE_TABLE: &str =
+    "\n[transcripts]\nparser = \"cline-session-v1\"\ndir = \"data/sessions\"\n";
+
+/// The descriptor of [`ACME_RUNTIME`] keeping its session manifests below
+/// `data/sessions` of its config home.
+fn cline_descriptor() -> String {
+    acme_descriptor(CLINE_TABLE).replace(
+        "runtime_api = 1\n",
+        &format!("runtime_api = 1\nrequires = [\"{CLINE_FEATURE}\"]\n"),
+    )
+}
+
+/// The captured Cline 3.0.74 session manifest with its session, workspace and
+/// prompt filled in.
+fn cline_manifest(session: &str, workspace: &str, prompt: &str) -> String {
+    include_str!("../../tests/fixtures/cline/session-manifest.json")
+        .replace("@SESSION@", session)
+        .replace("@WORKSPACE@", workspace)
+        .replace("@PROMPT@", prompt)
+}
+
+/// Writes `content` as `<directory>/<file>` below `tree` and returns its path.
+fn write_manifest(tree: &Path, directory: &str, file: &str, content: &str) -> PathBuf {
+    let path = tree.join(directory).join(file);
+    fs::create_dir_all(path.parent().expect("session directory")).expect("session directory");
+    fs::write(&path, content).expect("write the manifest");
+    path
+}
+
+/// A session id Cline generates, and one Pohunek assigns with `--id`.
+const GENERATED_SESSION: &str = "1793924186893_abc12";
+const ASSIGNED_SESSION: &str = "c0ffee00-0000-4000-8000-000000000001";
+
+#[tokio::test]
+async fn a_foreground_cline_is_attributed_by_its_session_manifest() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &cline_descriptor()));
+    let acme = RuntimeRef::from_wire(ACME_RUNTIME);
+    let tree = rig.home().join(".acme/data/sessions");
+    let generated = write_manifest(
+        &tree,
+        GENERATED_SESSION,
+        &format!("{GENERATED_SESSION}.json"),
+        &cline_manifest(GENERATED_SESSION, "/work", "first turn"),
+    );
+    let assigned = write_manifest(
+        &tree,
+        ASSIGNED_SESSION,
+        &format!("{ASSIGNED_SESSION}.json"),
+        &cline_manifest(ASSIGNED_SESSION, "/other", "first turn"),
+    );
+    // The messages files beside a manifest are no session.
+    write_manifest(
+        &tree,
+        ASSIGNED_SESSION,
+        &format!("{ASSIGNED_SESSION}.messages.json"),
+        &cline_manifest(ASSIGNED_SESSION, "/work", "first turn"),
+    );
+
+    let mut expected = official_roots(&rig);
+    expected.insert(root(&acme, tree));
+    assert_eq!(pairs(&rig.roots()), expected);
+
+    let watched = Watched::start(&rig).await;
+    watched
+        .wait_for_session(&generated, GENERATED_SESSION)
+        .await;
+    watched.wait_for_session(&assigned, ASSIGNED_SESSION).await;
+    // A foreground `cline` of a shell is told from its working directory.
+    let candidate = watched
+        .index
+        .best_match(&acme, Path::new("/work"), &fact())
+        .expect("the manifest names the working directory");
+    assert_eq!(
+        candidate.native_session_id.as_deref(),
+        Some(GENERATED_SESSION)
+    );
+    let candidate = watched
+        .index
+        .best_match(&acme, Path::new("/other"), &fact())
+        .expect("the assigned session names the working directory");
+    assert_eq!(
+        candidate.native_session_id.as_deref(),
+        Some(ASSIGNED_SESSION)
+    );
+    assert!(watched
+        .index
+        .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+        .is_none());
+    watched.sessions.shutdown();
+}
+
+#[tokio::test]
+async fn only_a_manifest_that_names_its_own_directory_is_a_cline_session() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &cline_descriptor()));
+    let tree = rig.home().join(".acme/data/sessions");
+    let good = GENERATED_SESSION;
+    let manifest = |session: &str| cline_manifest(session, "/work", "first turn");
+    let write = |directory: &str, file: &str, content: &str| {
+        write_manifest(&tree, directory, file, content);
+    };
+    write(good, &format!("{good}.json"), &manifest(good));
+
+    // The session id in the manifest must be the directory's.
+    write(
+        "1793924186894_dir01",
+        "1793924186894_dir01.json",
+        &manifest("1793924186894_other"),
+    );
+    // The file must be named after the directory.
+    write(
+        "1793924186895_file1",
+        "1793924186895_other.json",
+        &manifest("1793924186895_file1"),
+    );
+    write(
+        "1793924186896_main1",
+        "manifest.json",
+        &manifest("1793924186896_main1"),
+    );
+    // A subagent id, even in a manifest of its own directory.
+    let subagent = "1793924186897__sub01";
+    write(subagent, &format!("{subagent}.json"), &manifest(subagent));
+    // The messages files of a session and of its subagents.
+    for file in [
+        format!("{good}.messages.json"),
+        "agent_00000000-0000-4000-8000-000000000002.messages.json".to_owned(),
+        "helper__000001.messages.json".to_owned(),
+    ] {
+        write(good, &file, &manifest(good));
+    }
+    // A manifest nested deeper, and one directly below the root.
+    write(
+        &format!("{good}/nested/1793924186898_deep1"),
+        "1793924186898_deep1.json",
+        &manifest("1793924186898_deep1"),
+    );
+    write_manifest(
+        &tree,
+        ".",
+        "1793924186899_flat1.json",
+        &manifest("1793924186899_flat1"),
+    );
+    // Content that is not a manifest.
+    let broken = "1793924186900_bad01";
+    write(broken, &format!("{broken}.json"), "{\"session_id\": ");
+    let array = "1793924186901_arr01";
+    write(
+        array,
+        &format!("{array}.json"),
+        &format!("[{}]", manifest(array)),
+    );
+
+    assert_eq!(
+        indexed_sessions(&rig).await,
+        [(good.to_owned(), Some(PathBuf::from("/work")))].into()
+    );
+}
+
+#[tokio::test]
+async fn a_cline_manifest_is_read_within_the_byte_bound() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &cline_descriptor()));
+    let tree = rig.home().join(".acme/data/sessions");
+    // The manifest of a session whose prompt pads it to `len` bytes.
+    let padded = |session: &str, len: usize| {
+        let bare = cline_manifest(session, "/work", "").len();
+        cline_manifest(session, "/work", &"x".repeat(len - bare))
+    };
+    let at_limit = "1793924186893_limit";
+    let past_limit = "1793924186894_past1";
+    for (session, len) in [
+        (at_limit, super::TRANSCRIPT_SCAN_BYTE_LIMIT),
+        (past_limit, super::TRANSCRIPT_SCAN_BYTE_LIMIT + 1),
+    ] {
+        let content = padded(session, len);
+        assert_eq!(content.len(), len);
+        write_manifest(&tree, session, &format!("{session}.json"), &content);
+    }
+
+    assert_eq!(
+        indexed_sessions(&rig).await,
+        [(at_limit.to_owned(), Some(PathBuf::from("/work")))].into()
+    );
+}
+
+#[tokio::test]
+async fn a_cline_working_directory_that_is_not_absolute_is_not_taken() {
+    let rig = Rig::with_packages(|plugins| install_acme(plugins, &cline_descriptor()));
+    let tree = rig.home().join(".acme/data/sessions");
+    write_manifest(
+        &tree,
+        GENERATED_SESSION,
+        &format!("{GENERATED_SESSION}.json"),
+        &cline_manifest(GENERATED_SESSION, "work", "first turn"),
+    );
+
+    assert_eq!(
+        indexed_sessions(&rig).await,
+        [(GENERATED_SESSION.to_owned(), None)].into()
+    );
+}
+
 #[test]
 fn the_data_root_follows_the_environment_and_falls_back_to_the_home() {
     let moved = scoped_dir("pohunek-roots-data-moved");
