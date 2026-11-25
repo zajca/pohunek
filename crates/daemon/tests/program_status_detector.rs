@@ -304,6 +304,17 @@ fn captured(runtime: &str, name: &str) -> Vec<u8> {
     frame(title.as_deref(), &rows)
 }
 
+/// A synthetic usage-limit screen.
+///
+/// No real usage-limit capture exists (#2101), so this fixture is invented:
+/// it pins the diagnostic trigger and the evidence it carries, not Claude's
+/// real limit layout.
+fn usage_limit_screen() -> Vec<u8> {
+    let text = read("crates/daemon/tests/fixtures/claude/usage-limit-screen.txt");
+    let rows: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+    frame(None, &rows)
+}
+
 /// An activity and the source that reported it.
 type Observed = Option<(AgentActivity, StateSource)>;
 
@@ -1824,5 +1835,90 @@ fn stale_after_ms_rejects_zero_and_an_hour_plus_a_millisecond() {
         parsed.program_status().expect("opted in").stale_after(),
         Some(Duration::from_secs(30)),
         "the window is kept as a duration"
+    );
+}
+
+/// A usage-limit screen is sighted once with the record held at that moment,
+/// and only a screen that stopped naming the limit re-arms the sighting.
+#[test]
+fn a_usage_limit_screen_is_sighted_once_with_the_held_record() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&claude_record("working"));
+    harness.feed(&usage_limit_screen());
+
+    let sighting = harness
+        .detector
+        .take_usage_limit_sighting()
+        .expect("the usage-limit screen is sighted");
+    assert_eq!(sighting.marker, "usage limit reached");
+    assert_eq!(sighting.record, "app=claude-code:state=working");
+    assert!(
+        sighting.record_age.is_some_and(|age| age > Duration::ZERO),
+        "the held record names its age"
+    );
+    assert!(!sighting.stale, "a fresh record is not stale");
+    assert_eq!(sighting.activity, WORKING.map(|(activity, _)| activity));
+    assert!(sighting.unmapped.is_none(), "the record mapped");
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a sighting is taken once"
+    );
+
+    // A redraw that keeps the limit text is no second sighting.
+    let mut redraw = usage_limit_screen();
+    redraw.extend_from_slice(b"\r\n  resets in 4h 59m");
+    harness.feed(&redraw);
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a redraw of the same limit screen is no sighting"
+    );
+
+    // A screen that stopped naming the limit re-arms the journal.
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&usage_limit_screen());
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_some(),
+        "the next hit is sighted again"
+    );
+}
+
+/// A limit screen names the unmapped 7501 record too, because an unknown
+/// `kind` is exactly what the passive capture is meant to learn.
+#[test]
+fn a_usage_limit_screen_names_the_unmapped_record_too() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&record(&format!(
+        "state=blocked:app={CLAUDE_APP}:kind=limit"
+    )));
+    harness.feed(&usage_limit_screen());
+
+    let sighting = harness
+        .detector
+        .take_usage_limit_sighting()
+        .expect("the usage-limit screen is sighted");
+    assert_eq!(
+        sighting.record, "app=claude-code:state=blocked",
+        "the unknown kind is dropped from the held record"
+    );
+    let unmapped = sighting.unmapped.expect("the unmapped payload is kept");
+    assert_eq!(unmapped.reason, "unknown_kind");
+    assert_eq!(unmapped.state, "blocked");
+    assert_eq!(unmapped.kind, "limit");
+    assert_eq!(unmapped.app, CLAUDE_APP);
+    assert!(!unmapped.has_msg);
+    assert!(!unmapped.has_title);
+}
+
+/// A runtime without `[program_status]` reads no 7501 evidence, so a usage-limit
+/// screen is not sighted for it.
+#[test]
+fn a_runtime_without_program_status_has_no_usage_limit_sighting() {
+    let mut harness = Harness::claude_without_opt_in();
+    harness.feed(&usage_limit_screen());
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "the diagnostic needs the program-status opt-in"
     );
 }

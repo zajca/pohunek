@@ -461,6 +461,14 @@ open and the records stay authoritative
   `state=clear`, with any detector
   reconfiguration (a nested agent exiting, a package refresh) and with the
   runtime. Initial-input readiness ignores the record: the prompt box decides.
+- A usage limit cannot be triggered on demand, so the daemon journals it
+  passively. When the visible screen names a usage limit, the detector records
+  one sighting per screen and the session loop logs it at info under
+  `session.program_status.limit_screen`: the matched marker, the held record in
+  canonical form, its age and staleness, the latest unmapped 7501 tokens and the
+  published activity. Claude's real limit screen has not been captured yet; the
+  marker list and the journal line are how the next real hit leaves evidence
+  (#2101). The journal changes no activity, attention or input readiness.
 - With the probe answered Claude sets the plain title `Claude Code` in
   every state (the session name when the session is named, see
   [Session name](#session-name)), and the manifest reads no state from a title.

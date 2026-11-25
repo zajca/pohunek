@@ -178,11 +178,38 @@ fn parse_percent(digits: &[u8]) -> Option<u8> {
         .filter(|percent| *percent <= MAX_PROGRESS_PERCENT)
 }
 
+/// The bounded tokens of a 7501 payload the parser could not map.
+///
+/// It carries the tokens the grammar rejects or drops and the presence of
+/// `msg` and `title`, never their text. The detector attaches it to a
+/// usage-limit screen sighting so the next real limit hit names the record it
+/// could not read (#2101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmappedProgramStatus {
+    /// Why the payload is unmapped: `rejected` (the whole payload) or
+    /// `unknown_kind` (a `kind` the grammar does not know, which the parser
+    /// drops while the record still applies).
+    pub reason: &'static str,
+    /// The bounded `state` token, empty when the payload names none.
+    pub state: String,
+    /// The bounded `kind` token, empty when the payload names none.
+    pub kind: String,
+    /// The bounded `app` token, empty when the payload names none.
+    pub app: String,
+    /// Whether the payload carried a `msg` pair.
+    pub has_msg: bool,
+    /// Whether the payload carried a `title` pair.
+    pub has_title: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct OscParser {
     state: State,
     command: Vec<u8>,
     payload: Vec<u8>,
+    /// The latest 7501 payload the parser could not map, kept until a mapped
+    /// root record replaces it or the evidence is cleared.
+    last_unmapped: Option<UnmappedProgramStatus>,
 }
 
 impl OscParser {
@@ -237,6 +264,25 @@ impl OscParser {
         self.state = State::Ground;
         self.command.clear();
         self.payload.clear();
+    }
+
+    /// Drops the latest unmapped 7501 payload.
+    ///
+    /// A resync or a manifest reconfigure discards the session's program-status
+    /// evidence, so the diagnostic must not attribute the old payload to a
+    /// later screen.
+    pub fn clear_unmapped(&mut self) {
+        self.last_unmapped = None;
+    }
+
+    /// The latest 7501 payload the parser could not map.
+    ///
+    /// A mapped root record clears it; a child record or a root `clear` leaves
+    /// the latest unmapped token in place, so a record that arrives just before
+    /// a usage-limit screen is still named when the screen is seen.
+    #[must_use]
+    pub fn last_unmapped(&self) -> Option<&UnmappedProgramStatus> {
+        self.last_unmapped.as_ref()
     }
 
     fn advance_ground(&mut self, byte: u8) {
@@ -370,13 +416,19 @@ impl OscParser {
             b"9" => classify_osc9(&self.payload),
             b"777" => classify_osc777(&self.payload),
             b"99" => classify_osc99(&self.payload),
-            command if command == PROGRAM_STATUS => match parse_program_status(&self.payload) {
-                Some(ProgramStatusReport::Probe) => None,
-                report => {
-                    journal_unmapped_program_status(&self.payload, report.as_ref());
-                    report.map(OscEvidence::ProgramStatus)
+            command if command == PROGRAM_STATUS => {
+                let report = parse_program_status(&self.payload);
+                let unmapped = journal_unmapped_program_status(&self.payload, report.as_ref());
+                match (&report, unmapped) {
+                    (_, Some(unmapped)) => self.last_unmapped = Some(unmapped),
+                    (Some(ProgramStatusReport::Record(_)), None) => self.last_unmapped = None,
+                    _ => {}
                 }
-            },
+                match report {
+                    Some(ProgramStatusReport::Probe) => None,
+                    report => report.map(OscEvidence::ProgramStatus),
+                }
+            }
             _ => None,
         };
 
@@ -470,26 +522,43 @@ fn bounded_token(token: Option<&[u8]>) -> String {
 /// carries the bounded `state`, `kind` and `app` tokens and the presence of
 /// `msg` and `title`: their text is untrusted and is never logged. The report
 /// is only read, never changed.
-fn journal_unmapped_program_status(payload: &[u8], report: Option<&ProgramStatusReport>) {
+///
+/// The line is INFO, not debug: the daemon's default filter is `info`, so a
+/// debug-only journal would leave the evidence a real hit is meant to collect
+/// nowhere. The record is bounded and arrives on a state change, so it cannot
+/// flood the log.
+fn journal_unmapped_program_status(
+    payload: &[u8],
+    report: Option<&ProgramStatusReport>,
+) -> Option<UnmappedProgramStatus> {
     let tokens = JournalTokens::of(payload);
     let reason = if report.is_none() {
         "rejected"
     } else {
         if !tokens.kind_is_unknown() {
-            return;
+            return None;
         }
         "unknown_kind"
     };
-    tracing::debug!(
-        target: UNMAPPED_PROGRAM_STATUS_TARGET,
+    let unmapped = UnmappedProgramStatus {
         reason,
-        state = bounded_token(tokens.state),
-        kind = bounded_token(tokens.kind),
-        app = bounded_token(tokens.app),
-        has_msg = tokens.has_msg,
-        has_title = tokens.has_title,
+        state: bounded_token(tokens.state),
+        kind: bounded_token(tokens.kind),
+        app: bounded_token(tokens.app),
+        has_msg: tokens.has_msg,
+        has_title: tokens.has_title,
+    };
+    tracing::info!(
+        target: UNMAPPED_PROGRAM_STATUS_TARGET,
+        reason = unmapped.reason,
+        state = unmapped.state.as_str(),
+        kind = unmapped.kind.as_str(),
+        app = unmapped.app.as_str(),
+        has_msg = unmapped.has_msg,
+        has_title = unmapped.has_title,
         "unmapped program-status record"
     );
+    Some(unmapped)
 }
 
 fn parse_file_url_cwd(payload: &[u8]) -> Option<String> {
