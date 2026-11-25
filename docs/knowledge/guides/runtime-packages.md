@@ -737,7 +737,9 @@ counter. A package whose reference is `assigned` and that also declares an
 integration can report its conversation: a validated report replaces the
 assigned reference and labels it `reported` (a `/clear` or in-session resume is
 followed), while a package without an integration keeps its `assigned`
-reference.
+reference. The package's `[native_reference.existence]` check applies to the
+reported id as well: resume refuses with `agent_native_reference_missing` when
+the reported conversation's file is gone.
 
 The handler is compiled core code selected by the descriptor's
 `integration.handler`: `pohunek integration install`, `status`, `doctor`, and

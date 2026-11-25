@@ -957,7 +957,7 @@ async fn an_active_identity_that_is_not_the_launch_process_leaves_the_assigned_r
 }
 
 #[tokio::test]
-async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
+async fn recovery_checks_an_assigned_reference_and_a_reported_one() {
     let home = temp_dir("supersede-existence-home");
     let tag = "supersede-existence";
     let agents_dir = temp_agents_dir_with(
@@ -988,8 +988,9 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         .expect_err("an assigned reference needs its conversation");
     assert_eq!(refused.code, "agent_native_reference_missing");
 
-    // The agent reports another conversation; recovery trusts the agent's word
-    // and does not look for a file it never promised.
+    // The agent reports another conversation; the declared check applies to the
+    // reported id, so a conversation file that is gone is refused and nothing
+    // is launched.
     let second = Rig::with_agents(
         "supersede-existence-reported",
         crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
@@ -1001,18 +1002,47 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
     let report = public_report(&second, "conversation-without-file", |_| {}).await;
     assert!(second.registry.report_as_root(report).await.recorded);
     second.exit(&second.registry).await;
-    second
+    let refused = second
         .registry
         .resume(second.id())
         .await
-        .expect("a reported reference is recovered unchecked");
-    wait_for_file_contains(&second.marker, "--session\nconversation-without-file\n").await;
+        .expect_err("a reported reference needs its conversation");
+    assert_eq!(refused.code, "agent_native_reference_missing");
     assert_eq!(
-        second.launch_argv(1),
-        ["--no-daemon", "--session", "conversation-without-file"],
-        "a profile recovers with its own args and the resume template"
+        second.launches(),
+        1,
+        "nothing is launched into a missing conversation"
     );
     second.finish(&second.registry).await;
+
+    // The conversation file of the reported id exists: recovery launches with it.
+    let third = Rig::with_agents(
+        "supersede-existence-reported-file",
+        crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
+        first.config.agents_dir.clone(),
+        "bash-home",
+        false,
+    )
+    .await;
+    let sessions = home.join("sessions");
+    fs::create_dir_all(&sessions).expect("sessions directory");
+    fs::write(sessions.join("stamp_conversation-with-file.jsonl"), "{}\n")
+        .expect("the conversation file");
+    let report = public_report(&third, "conversation-with-file", |_| {}).await;
+    assert!(third.registry.report_as_root(report).await.recorded);
+    third.exit(&third.registry).await;
+    third
+        .registry
+        .resume(third.id())
+        .await
+        .expect("a reported reference with its conversation is recovered");
+    wait_for_file_contains(&third.marker, "--session\nconversation-with-file\n").await;
+    assert_eq!(
+        third.launch_argv(1),
+        ["--no-daemon", "--session", "conversation-with-file"],
+        "a profile recovers with its own args and the resume template"
+    );
+    third.finish(&third.registry).await;
 }
 
 #[tokio::test]

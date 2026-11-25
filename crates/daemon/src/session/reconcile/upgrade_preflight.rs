@@ -1063,8 +1063,10 @@ enum CheckIdentity {
 /// `definition` the upgrade serves.
 ///
 /// An assigned reference is frozen in its launch, so its check is the session's
-/// own. A reported reference reads the check of the running release's
-/// definition, which is provable identical only in two cases: a package pinned
+/// own. A reported id of an assigned runtime counts as unchanged, because a
+/// missing file there is already lost on the running release. Any other
+/// reported reference reads the check of the running
+/// release's definition, which is provable identical only in two cases: a package pinned
 /// to the session's digest, which content addressing fixes, or a built-in that
 /// the upgrade adopts from a v0.34.x store, whose check must equal the v0.34.2
 /// golden. Every other reported reference is unproven.
@@ -1077,6 +1079,13 @@ fn reported_check_identity(
         binding.native_reference_provenance,
         NativeReferenceProvenance::Reported
     ) {
+        return CheckIdentity::Unchanged;
+    }
+    // A running release that leaves a reported id of an assigned runtime
+    // unchecked only starts an empty conversation under it, so a missing file
+    // loses nothing the upgrade could keep: the verdict is the stored fact.
+    if binding_native_launch(binding, definition).is_some_and(|launch| launch.assigned().is_some())
+    {
         return CheckIdentity::Unchanged;
     }
     let pinned = match &binding.launch_binding {

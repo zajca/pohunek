@@ -3564,6 +3564,11 @@ impl DamagedHost {
         let release = host.env.root().join("release").join("runtime");
         catalog.write_release(&release, &[DAMAGED_BASE]);
         let profiles = private_dir(host.env.config_home().join("pohunek").join("agents"));
+        // The damaged bindings name a Pi conversation; the declared check
+        // applies to it, so its session file exists.
+        let sessions = host.env.home().join(".pi/agent/sessions");
+        fs::create_dir_all(&sessions).expect("pi sessions dir");
+        fs::write(sessions.join("stamp_native-fixture-2.jsonl"), b"{}\n").expect("pi session");
         Self {
             host,
             release,
@@ -3846,6 +3851,39 @@ async fn the_preflight_repair_writes_nothing() {
 
     assert_eq!(report.stopped_sessions.len(), 2, "{report:?}");
     assert_eq!(damaged.host.snapshot(), before);
+}
+
+#[tokio::test]
+async fn a_reported_id_of_an_assigned_runtime_without_its_file_is_already_lost_on_every_preflight()
+{
+    let damaged = DamagedHost::new().await;
+    fs::remove_file(
+        damaged
+            .host
+            .env
+            .home()
+            .join(".pi/agent/sessions/stamp_native-fixture-2.jsonl"),
+    )
+    .expect("remove the conversation");
+    damaged
+        .host
+        .write_store(&[damaged_line("s-1", DAMAGED_BASE)]);
+
+    // The running release only starts an empty conversation under the id, so
+    // the verdict is the stored fact, and a later upgrade over the same store
+    // reaches it again without a flag.
+    for upgrade in 1..=2 {
+        let report = damaged.report();
+        assert_eq!(
+            stopped_verdict_of(&report, "s-1"),
+            (
+                &Verdict::AlreadyNotResumable,
+                "agent_native_reference_missing"
+            ),
+            "upgrade {upgrade}: {:?}",
+            report.stopped_sessions
+        );
+    }
 }
 
 #[tokio::test]

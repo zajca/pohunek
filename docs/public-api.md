@@ -1740,9 +1740,9 @@ relocating_settings = [                          # optional; refused at launch
   claim, or a claim from another runtime never replaces a reference, and
   an assigned value never replaces a reported one: relaunches, daemon restarts
   and rebinding start from the stored reported reference. Resume then
-  launches with the reported reference. The existence check runs only for an
-  `assigned` reference, so a reported one is recovered unchecked, as the agent
-  vouched for it. A `hook` runtime uses the same generation, verified launch
+  launches with the reported reference. The existence check of an `assigned`
+  runtime applies to its reported id as well, so a reported conversation whose
+  file is gone is refused with `agent_native_reference_missing`. A `hook` runtime uses the same generation, verified launch
   process, provider, frozen kind and sequence checks for the worker's journaled
   native reference, so an in-agent conversation switch can replace its first
   immutable launch claim. A package without an integration cannot send a report, so its
@@ -3605,7 +3605,7 @@ assigns) keeps its check across the upgrade only when the preflight can show it 
 content addressing fixes, or a built-in that the upgrade adopts from a 0.34.0 to 0.34.2 store (store schema 5) whose adopted package declares
 the existence check of the v0.34.2 golden. Any other reported reference is `would_lose_recovery` with resume's code and a detail that names the
 reason: a built-in the upgrade does not adopt, an adopted package from a store that is not schema 5, or a package whose check differs from the
-golden. Hermes has no golden here, so its reported references are fail-closed too. A stopped session whose reference the preflight budget
+golden. A reported id of an `assigned` runtime whose conversation file is missing is `already_not_resumable` with resume's code and needs no flag: the running release only starts an empty conversation under it, so the upgrade loses nothing and every later preflight reports the same verdict. Hermes has no golden here, so its reported references are fail-closed too. A stopped session whose reference the preflight budget
 reached before its check is `would_lose_recovery` with `reference_unverified_within_budget`: the reference is not known to be present, so it is
 never adoptable, and the detail gives the number of such sessions in the report. The budget is 20 seconds by default, bounds the version probes and
 the reference checks together, and is raised with `service upgrade|check --preflight-budget <SECONDS>` (1 to 300; the CLI's preflight deadline

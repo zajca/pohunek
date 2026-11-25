@@ -1592,7 +1592,9 @@ hook schema may report, and the report replaces the stored value and its
 provenance (`reported`) in the session, its durable record and its resume
 binding, so `/clear` and in-session resume are followed and `session.resume`
 launches with the reported conversation. The declared existence
-check runs for a still-assigned reference. A hook runtime may declare the same
+check runs for a still-assigned reference and for a reported id of an assigned
+runtime, so a reported conversation whose file is gone is refused with
+`agent_native_reference_missing`. A hook runtime may declare the same
 kind of check under `[native_reference.existence]` for its id-kind reference;
 the official `claude` package declares one, so its recovery additionally requires a
 regular transcript file under its effective declared config home; either
