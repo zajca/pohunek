@@ -978,7 +978,7 @@ async fn a_cline_manifest_written_while_watching_is_indexed_by_a_live_event() {
 
 /// Session directories of the large Cline store scenario: more than the
 /// backend-wide directory budget of one walk.
-const CLINE_STORE_SESSIONS: usize = 8300;
+const CLINE_STORE_SESSIONS: usize = super::MAX_WALK_DIRECTORIES + 108;
 
 #[tokio::test]
 async fn a_cline_store_over_the_directory_budget_keeps_its_newest_sessions_live() {

@@ -776,17 +776,7 @@ impl TranscriptIndex {
                     }
                 };
                 if file_type.is_dir() {
-                    // A nested provider root, however it is spelled, is scanned as
-                    // its own root so its transcripts carry its own agent kind.
-                    let resolved =
-                        root_canonical.join(path.strip_prefix(&root.path).unwrap_or(&path));
-                    if canonical
-                        .iter()
-                        .zip(all_roots)
-                        .any(|(other_canonical, other)| {
-                            *other_canonical == resolved && other.path != root.path
-                        })
-                    {
+                    if is_nested_provider_root(root, all_roots, canonical, &root_canonical, &path) {
                         continue;
                     }
                     if root.depth_limit().is_some_and(|max| depth >= max) {
@@ -850,6 +840,24 @@ impl TranscriptIndex {
             .get(path)
             .is_some_and(|entry| entry.signature == signature && *entry.owner == *owner)
     }
+}
+
+/// Whether the directory `path` below `root` is another root of `all_roots`,
+/// however it is spelled (`canonical` holds the canonical path of each root,
+/// `root_canonical` that of `root`). A nested provider root is scanned as its
+/// own root so its transcripts carry its own agent kind.
+fn is_nested_provider_root(
+    root: &TranscriptRoot,
+    all_roots: &[TranscriptRoot],
+    canonical: &[PathBuf],
+    root_canonical: &Path,
+    path: &Path,
+) -> bool {
+    let resolved = root_canonical.join(path.strip_prefix(&root.path).unwrap_or(path));
+    canonical
+        .iter()
+        .zip(all_roots)
+        .any(|(other_canonical, other)| *other_canonical == resolved && other.path != root.path)
 }
 
 /// Whether an indexed transcript no longer exists as a regular file.
