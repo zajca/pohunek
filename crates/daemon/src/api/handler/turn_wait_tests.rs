@@ -104,9 +104,10 @@ const SETTLE_YIELDS: usize = 64;
 pub(super) struct Fixture {
     state: DaemonState,
     pub(super) sessions: SessionRegistry,
+    notifications: NotificationService,
     pub(super) root: Arc<tempfile::TempDir>,
-    _projector: crate::shutdown::DriverHandle,
-    _coordinator: crate::shutdown::DriverHandle,
+    projector_driver: crate::shutdown::DriverHandle,
+    coordinator_driver: crate::shutdown::DriverHandle,
 }
 
 impl Fixture {
@@ -151,6 +152,48 @@ impl Fixture {
         Self::assemble(root, sessions)
     }
 
+    /// Replaces the daemon over the same data directory, as a daemon restart
+    /// does: the sessions do not survive in the new registry, the notification
+    /// store does, and startup reconciliation runs before the API serves.
+    pub(super) async fn restarted(self) -> Self {
+        let root = Arc::clone(&self.root);
+        drop(self);
+        let agents = root.path().join("agents");
+        let sessions = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                agents_dir: Some(agents),
+                ..SessionRegistryConfig::default()
+            },
+            official_host(),
+        );
+        let notifications = NotificationService::open(&root.path().join("data"))
+            .expect("notification service opens");
+        crate::notifications::resolve_stale_attention(&sessions, &notifications).await;
+        Self::assemble(root, sessions)
+    }
+
+    /// Replaces the notification side of the daemon (store handle, projector,
+    /// debounce coordinator) while the sessions stay live, as a daemon upgrade
+    /// that adopts running workers does: the projector starts without any
+    /// memory of what the sessions did, and the startup pass runs first.
+    pub(super) async fn restarted_over_live_sessions(self) -> Self {
+        let root = Arc::clone(&self.root);
+        let sessions = self.sessions.clone();
+        // Dropping a handle leaves its task running, so the old drivers stop
+        // explicitly: only the new ones may see the observations that follow.
+        self.projector_driver.stop().await;
+        self.coordinator_driver.stop().await;
+        drop(self);
+        let notifications = NotificationService::open(&root.path().join("data"))
+            .expect("notification service opens");
+        crate::notifications::resolve_stale_attention(&sessions, &notifications).await;
+        let restarted = Self::assemble(root, sessions);
+        // The projector subscribes to session events from its own task; an
+        // observation reported before that would never reach it.
+        settle().await;
+        restarted
+    }
+
     fn assemble(root: Arc<tempfile::TempDir>, sessions: SessionRegistry) -> Self {
         let notifications = NotificationService::open(&root.path().join("data"))
             .expect("notification service opens");
@@ -170,15 +213,22 @@ impl Fixture {
             crate::test_support::overlay_registry(),
             crate::api::OverlaySource::Default,
         )
-        .with_notifications(notifications)
+        .with_notifications(notifications.clone())
         .with_attention_coordinator(attention);
         Self {
             state,
             sessions,
+            notifications,
             root,
-            _projector: projector,
-            _coordinator: coordinator,
+            projector_driver: projector,
+            coordinator_driver: coordinator,
         }
+    }
+
+    /// Runs the startup pass that acknowledges stale attention records on
+    /// this daemon, whose sessions are all live.
+    pub(super) async fn resolve_stale_attention(&self) -> usize {
+        crate::notifications::resolve_stale_attention(&self.sessions, &self.notifications).await
     }
 
     /// Creates a live session through `session.new` and returns its id.

@@ -741,6 +741,9 @@ async fn run() -> Result<(), DaemonError> {
     Box::pin(sessions.reconcile_workers())
         .await
         .map_err(DaemonError::Reconcile)?;
+    // Attention records the previous daemon left open for sessions that are
+    // gone, ended, lost or working again must not surface at the first client.
+    pohunek_daemon::notifications::resolve_stale_attention(&sessions, &notifications).await;
 
     // 8. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);

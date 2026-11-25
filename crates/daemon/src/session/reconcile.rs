@@ -15543,6 +15543,82 @@ generation "$1"
             assert!(records.is_empty(), "{records:#?}");
         }
 
+        /// Attention records a previous daemon left open name a crashed session
+        /// (lost runtime after a host restart), a stopped one and one that no
+        /// longer exists. After startup reconciliation none of them is open, so
+        /// no client lists a needs-you notification for a session that is gone.
+        #[tokio::test]
+        async fn attention_records_left_open_for_dead_sessions_are_acknowledged_at_startup() {
+            use crate::notifications::{resolve_stale_attention, NotificationService};
+
+            let fixture = fixture(Arc::new(RetryInspector::default()) as Arc<dyn ProcessInspector>);
+            persist_record(&fixture.root, "s-4251", Some("runtime-s-4251"));
+            write_journal_record(
+                &fixture.root,
+                "s-4251",
+                "worker-s-4251",
+                TEST_GENERATION,
+                dead_worker(),
+                Some("runtime-s-4251"),
+                |journal| {
+                    journal.boot_session_id =
+                        Some("00000000-0000-4000-8000-00000000dead".to_owned());
+                },
+            );
+            persist_record(&fixture.root, "s-4252", None);
+            let store = Store::new(fixture.root.join("data/metadata.jsonl"));
+            let mut stopped = store
+                .load_sessions()
+                .expect("load store")
+                .into_iter()
+                .find(|record| record.session_id == "s-4252")
+                .expect("record");
+            stopped.info.state = protocol::SessionState::Stopped;
+            store.record_session(&stopped).expect("store stopped");
+
+            let notifications = NotificationService::open(&fixture.root.join("notifications"))
+                .expect("open notification service");
+            for session in ["s-4251", "s-4252", "s-4253"] {
+                notifications
+                    .create(
+                        serde_json::from_value(serde_json::json!({
+                            "source": {
+                                "provider": "pohunek",
+                                "provider_event": "agent_state",
+                                "host_local_source_id": format!("projector:{session}:agent_blocked:1")
+                            },
+                            "kind": "agent_blocked",
+                            "severity": "action_required",
+                            "title": "Needs you",
+                            "body": format!("Session {session} is waiting."),
+                            "session_id": session,
+                            "dedupe_key": format!("attention:{session}")
+                        }))
+                        .expect("create params"),
+                    )
+                    .expect("seed an open attention record");
+            }
+            let unread = || {
+                notifications
+                    .list(protocol::NotificationListParams {
+                        status: Some(protocol::NotificationStatus::Unread),
+                        ..protocol::NotificationListParams::default()
+                    })
+                    .expect("list notifications")
+                    .notifications
+            };
+            assert_eq!(unread().len(), 3);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("start");
+            let resolved = resolve_stale_attention(&fixture.registry, &notifications).await;
+
+            assert_eq!(resolved, 3);
+            let still_open = unread();
+            assert!(still_open.is_empty(), "{still_open:#?}");
+        }
+
         /// A sweep that settles for many polls logs one `info` summary, however
         /// many polls it took; the polls themselves log at `debug`.
         #[tokio::test(start_paused = true)]

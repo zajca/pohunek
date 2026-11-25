@@ -32,7 +32,9 @@ pub(crate) use coordinator::ResolveAsOf;
 #[doc(inline)]
 pub use notice_sink::ApprovalNoticeSink;
 #[doc(inline)]
-pub use projector::{attention_dedupe_key, spawn_projector, turn_dedupe_key};
+pub use projector::{
+    attention_dedupe_key, resolve_stale_attention, spawn_projector, turn_dedupe_key,
+};
 #[doc(inline)]
 pub use retention::spawn_notification_retention;
 #[doc(inline)]
@@ -536,6 +538,14 @@ impl NotificationService {
         // treated as awaiting the owner rather than stopped as idle.
         self.inner.store.ensure_available().is_err()
             || self.inner.store.has_active_attention(session_id)
+    }
+
+    /// The sessions named by an attention record that is still `unread` or
+    /// `read`; empty while the store is not in use.
+    pub(crate) fn active_attention_sessions(
+        &self,
+    ) -> std::collections::HashSet<protocol::SessionId> {
+        self.inner.store.active_attention_sessions()
     }
 
     /// Acknowledge active session notifications for `dedupe_key`.
