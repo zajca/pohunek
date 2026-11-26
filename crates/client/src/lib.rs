@@ -8,6 +8,7 @@ mod integration;
 mod local_socket;
 mod notifications;
 mod overlay_config;
+mod paging;
 mod transport;
 
 #[doc(inline)]
