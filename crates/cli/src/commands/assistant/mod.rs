@@ -690,9 +690,6 @@ fn assistant_workdir(
     ensure_assistant_workdir(&paths.data_dir).map(Some)
 }
 
-// Claude Code persists folder trust per directory but never for `$HOME`, so
-// the assistant runs in its own directory (`pohunek_paths::ASSISTANT_WORKDIR_SUBDIR`)
-// and the owner's answer persists per host instead of re-asking on every launch.
 /// Owner-private mode of a launcher-created assistant working directory:
 /// no group or other access, so no other local user reads the trust state.
 const ASSISTANT_WORKDIR_MODE: u32 = 0o700;
@@ -726,6 +723,9 @@ fn ensure_assistant_workdir(data_dir: &Path) -> Result<PathBuf, CliError> {
             return Err(unusable(data_dir, &format!("cannot create it: {err}")));
         }
     }
+    // Claude Code persists folder trust per directory but never for `$HOME`, so
+    // the assistant runs in its own directory and the owner's answer persists
+    // per host instead of re-asking on every launch.
     let workdir = data_dir.join(pohunek_paths::ASSISTANT_WORKDIR_SUBDIR);
     match std::fs::DirBuilder::new()
         .mode(ASSISTANT_WORKDIR_MODE)

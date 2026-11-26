@@ -296,14 +296,21 @@ fn an_acknowledged_start_prints_the_outcome_for_humans() {
 #[test]
 fn an_undelivered_prompt_behind_a_dialog_names_where_to_answer_it() {
     let line = "waiting on a dialog: see `pohunek session screen s-ack-1`, answer it with `pohunek attach s-ack-1`";
-    for (delivered, activity, expected) in [
-        (false, Some("blocked"), true),
-        (false, Some("idle"), false),
-        (false, None, false),
-        (true, Some("blocked"), false),
+    let acknowledged: &[&str] = &["--input-ack-timeout-ms", "100"];
+    // The daemon keeps a blocked create and answers `prompt_delivered: false`
+    // whether or not the caller asked for the acknowledgement.
+    let plain: &[&str] = &[];
+    for (args, delivered, activity, expected) in [
+        (acknowledged, false, Some("blocked"), true),
+        (acknowledged, false, Some("idle"), false),
+        (acknowledged, false, None, false),
+        (acknowledged, true, Some("blocked"), false),
+        (plain, false, Some("blocked"), true),
+        (plain, false, Some("idle"), false),
+        (plain, true, Some("blocked"), false),
     ] {
         let run = run_local(
-            &["--input-ack-timeout-ms", "100"],
+            args,
             Daemon {
                 prompt_delivered: Some(delivered),
                 activity,
@@ -315,7 +322,7 @@ fn an_undelivered_prompt_behind_a_dialog_names_where_to_answer_it() {
         assert_eq!(
             run.stdout().contains(line),
             expected,
-            "delivered={delivered} activity={activity:?}: {}",
+            "args={args:?} delivered={delivered} activity={activity:?}: {}",
             run.stdout()
         );
     }

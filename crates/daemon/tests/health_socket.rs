@@ -9309,7 +9309,14 @@ async fn a_worktree_removed_before_the_agent_starts_fails_closed() {
     let socket = temp_socket("cwd-missing-worktree");
     // The hook deletes the worktree it runs in, reproducing a worktree that
     // vanishes between the bind and the spawn.
-    let config_dir = host_post_create_hook(&socket, "#!/bin/sh\nrm -rf \"$(pwd -P)\"\nexit 0\n");
+    let removed_record = socket.dir.join("removed-worktree");
+    let config_dir = host_post_create_hook(
+        &socket,
+        &format!(
+            "#!/bin/sh\npwd -P > '{}'\nrm -rf \"$(pwd -P)\"\nexit 0\n",
+            removed_record.display()
+        ),
+    );
     let started = socket.dir.join("agent-started");
     let script = format!("touch '{}'; exec sleep 30", started.display());
     let config = SessionRegistryConfig {
@@ -9334,12 +9341,17 @@ async fn a_worktree_removed_before_the_agent_starts_fails_closed() {
     assert_eq!(error.code, "session_cwd_missing");
     assert_eq!(error.class, ErrorClass::Runtime);
     let hint = error.recover.expect("the refusal carries a hint");
+    let removed =
+        std::fs::read_to_string(&removed_record).expect("the hook recorded its directory");
+    let removed = removed.trim_end();
     assert!(
-        hint.starts_with(&format!(
-            "the working directory {}",
-            worktree_root.display()
-        )) && hint.ends_with("does not exist; nothing was started"),
-        "the hint names the removed worktree below the worktree root: {hint}"
+        Path::new(removed).starts_with(&*worktree_root),
+        "the removed worktree lies below the worktree root: {removed}"
+    );
+    assert_eq!(
+        hint,
+        format!("the working directory {removed} does not exist; nothing was started"),
+        "the hint names the exact removed worktree"
     );
 
     let list = Request::make("cwd-missing-list", method::SESSION_LIST, Value::Null);
@@ -9452,28 +9464,36 @@ async fn a_missing_working_directory_is_named_in_the_refusal() {
 #[tokio::test]
 async fn a_missing_assistant_directory_names_the_command_that_creates_it() {
     let base = temp_dir("cwd-missing-assistant-base");
-    let assistant = base.join("assistant");
-    let config = SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
-        store_path: Some(base.join("metadata.jsonl")),
-        ..SessionRegistryConfig::default()
-    };
-    let error = refused_for_missing_cwd("cwd-missing-assistant", config, assistant.clone()).await;
+    // The second spelling names the same directory with a `.` component.
+    for (tag, requested) in [
+        ("cwd-missing-assistant", base.join("assistant")),
+        (
+            "cwd-missing-assistant-dot",
+            base.join(".").join("assistant"),
+        ),
+    ] {
+        let config = SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+            store_path: Some(base.join("metadata.jsonl")),
+            ..SessionRegistryConfig::default()
+        };
+        let error = refused_for_missing_cwd(tag, config, requested.clone()).await;
 
-    assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
-    let hint = error.recover.expect("the refusal carries a hint");
-    assert!(
-        hint.starts_with(&format!(
-            "the working directory {} does not exist; nothing was started",
-            assistant.display()
-        )),
-        "{hint}"
-    );
-    assert!(
-        hint.contains("`pohunek assistant` creates it")
-            && hint.contains("`pohunek assistant setup`"),
-        "{hint}"
-    );
+        assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
+        let hint = error.recover.expect("the refusal carries a hint");
+        assert!(
+            hint.starts_with(&format!(
+                "the working directory {} does not exist; nothing was started",
+                requested.display()
+            )),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("`pohunek assistant` creates it")
+                && hint.contains("`pohunek assistant setup`"),
+            "{hint}"
+        );
+    }
 }
 
 /// The daemon opens its event journal with the retention of its configuration:

@@ -10870,6 +10870,10 @@ fn launch_cwd_missing_error(cwd: &Path, assistant_workdir: Option<&Path>) -> Pro
         "the working directory {} does not exist; nothing was started",
         cwd.display()
     );
+    // `Path` equality compares components, so a `.` or a repeated or trailing
+    // separator in the requested path still names the assistant directory. A
+    // `..` is not folded: after a missing or symlinked component it is not the
+    // lexical parent.
     if assistant_workdir == Some(cwd) {
         hint.push_str(
             "; `pohunek assistant` creates it (run `pohunek assistant setup` first if the assistant is not installed)",

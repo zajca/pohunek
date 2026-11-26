@@ -6024,6 +6024,12 @@ fn run_accounts_add(
     let status = pohunek_test_support::wait::poll_until("claude-accounts to exit", || {
         child.try_wait().expect("poll claude-accounts")
     });
+    // The reader ends when the terminal reports the closed slave (EIO on Linux,
+    // end of file elsewhere); the wait is bounded so a reader that stays
+    // blocked fails the test instead of hanging it.
+    pohunek_test_support::wait::poll_until("the transcript reader to end", || {
+        transcript.is_finished().then_some(())
+    });
     transcript.join().expect("transcript thread");
     let output = collected.lock().expect("transcript lock").clone();
     (

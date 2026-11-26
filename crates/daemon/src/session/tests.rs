@@ -24789,6 +24789,13 @@ async fn strict_refusal_reports_the_activity_the_blocked_decision_read() {
         error.msg
     );
     assert!(
+        error
+            .msg
+            .contains("raise input.initial_startup_grace_ms if the agent starts slowly"),
+        "a non-blocked timeout keeps the grace hint: {}",
+        error.msg
+    );
+    assert!(
         !error.msg.contains("blocked"),
         "a blocked label never sits next to the grace hint: {}",
         error.msg

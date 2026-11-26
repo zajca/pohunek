@@ -290,12 +290,14 @@ session is removed through the same rollback as any failed initial-input create.
 `pohunek session new --input-ack-timeout-ms <1..8000>` (with `--input` or
 `--input-stdin`) delivers the initial input like a waited `session input` and
 reports whether the agent started working on it within that window as
-`prompt_delivered` (`--json`, a top-level key) or `prompt delivered: yes/no`
-(after `no` on a `blocked` session the human output adds a `waiting on a dialog`
-line naming `pohunek session screen <id>` and `pohunek attach <id>`);
+`prompt_delivered` (`--json`, a top-level key) or `prompt delivered: yes/no`;
 the session is kept either way, and a delivery that fails before the submit is
 written rolls the create back as above. A host whose daemon does not advertise
 `session_new_input_ack_supported` is refused before the session is created.
+A kept create whose agent is `blocked` on a dialog and whose initial input is not
+yet delivered prints a `waiting on a dialog` line in the human output, with or
+without `--input-ack-timeout-ms`; it names `pohunek session screen <id>` and
+`pohunek attach <id>`.
 
 A session launched from a profile that declares options records the choice of
 every option it launched with, defaults included: `agent_options` on

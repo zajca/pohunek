@@ -955,6 +955,11 @@ pub(crate) async fn run_new(
                 replayed,
             )
         );
+        // The daemon answers `prompt_delivered` for a kept create without the
+        // acknowledgement flag too.
+        if let Some(line) = waiting_on_dialog_line(info, result.prompt_delivered == Some(false)) {
+            print!("{line}");
+        }
     }
     Ok(())
 }
@@ -2342,16 +2347,21 @@ fn render_new_human(
             "  prompt delivered: {}",
             if delivered { "yes" } else { "no" }
         );
-        if !delivered && info.activity == Some(AgentActivity::Blocked) {
-            let _ = writeln!(
-                output,
-                "  waiting on a dialog: see `pohunek session screen {id}`, answer it with `pohunek attach {id}`; the prompt is sent once the agent is ready",
-                id = info.id.0
-            );
-        }
     }
     write_warnings(&mut output, &info.warnings);
     output
+}
+
+/// The line telling where to answer the dialog a kept create is blocked on.
+/// It is the last line of the human output, so a warning above it does not
+/// bury it.
+fn waiting_on_dialog_line(info: &SessionInfo, prompt_undelivered: bool) -> Option<String> {
+    (prompt_undelivered && info.activity == Some(AgentActivity::Blocked)).then(|| {
+        format!(
+            "  waiting on a dialog: see `pohunek session screen {id}`, answer it with `pohunek attach {id}`; the prompt is sent once the agent is ready\n",
+            id = info.id.0
+        )
+    })
 }
 
 fn render_list_human(sessions: &[SessionInfo]) -> String {
