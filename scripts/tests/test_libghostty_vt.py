@@ -240,9 +240,24 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertTrue(any(step.get("uses") == MACOS_ACTION for step in macos))
         self.assertTrue(any("libghostty-vt-size-gate" in str(step.get("run", "")) for step in macos))
 
-    def test_the_offline_proof_rebuilds_from_the_cached_zig_and_tarballs(self):
-        text = (WORKFLOWS / "pinned-cache-offline.yml").read_text()
-        steps = harness.job_steps(text, "libghostty-vt")
+    def test_the_offline_proof_runs_in_both_workflows(self):
+        proof = (WORKFLOWS / "pinned-cache-offline.yml").read_text()
+        producer = (WORKFLOWS / "libghostty-vt.yml").read_text()
+        self.check_offline_job(proof, "libghostty-vt")
+        self.check_offline_job(producer, "offline")
+        # On a pull request the proof of pinned-cache-offline.yml would read
+        # entries no main run has saved; the producer workflow proves it in
+        # its own run, after the job that saved them.
+        block = re.search(r"(?ms)^  libghostty-vt:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", proof).group(1)
+        self.assertRegex(block, r"(?m)^    if: \$\{\{ github\.event_name != 'pull_request' \}\}$")
+        block = re.search(r"(?ms)^  offline:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", producer).group(1)
+        self.assertRegex(block, r"(?m)^    needs: library$")
+        self.assertEqual(
+            harness.workflow_env(producer)["OFFLINE_HOSTS"], harness.workflow_env(proof)["OFFLINE_HOSTS"]
+        )
+
+    def check_offline_job(self, text, job):
+        steps = harness.job_steps(text, job)
         offline = [i for i, step in enumerate(steps) if "pinned-cache-offline apply" in str(step.get("run", ""))]
         calls = [i for i, step in enumerate(steps) if step.get("uses") == LIBRARY_ACTION]
         self.assertEqual(len(offline), 1)

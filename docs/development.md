@@ -135,21 +135,26 @@ tarball or runs a compiler:
   mirrored types natively and verifies the directory.
 - `.github/workflows/libghostty-vt.yml` (dispatch, pull requests that touch the
   build inputs, and pushes to main, which save the cache entries) runs
-  `library (<target>)` for the glibc, musl and macOS targets, and
-  `macos arm64 (link, minos, size)`, which links the size probe on `macos-15`
-  with the release deployment target, checks `minos 14.0` and fails when the
-  stripped binary grows by more than `max_stripped_size_delta_bytes` of the pin
-  (3 MiB).
+  `library (<target>)` for the glibc, musl and macOS targets,
+  `offline rebuild (glibc)` (after `library`, in the same run: the built
+  library restores, and a forced rebuild runs from the cached Zig and
+  tarballs with every download host refused), and
+  `macos arm64 (link, minos, size)`, which links the spike's size probe on
+  `macos-15` with the release deployment target, checks `minos 14.0` and fails
+  when the stripped binary grows by more than `max_stripped_size_delta_bytes`
+  of the pin (3 MiB). The size probe stands in for `pohunek-sessiond` until a
+  crate links the library: on Linux its growth (+1.90 MiB) is slightly above
+  the one measured for `pohunek-sessiond` (+1.82 MiB, `report/sessiond.json`).
 - Release: `release-build.yml` runs the action in `binaries`, `kit-linux` and
   `packages` and builds the macOS library in `libghostty-darwin` for
   `kit-macos` and `rehearsal-macos`; `release.yml` does the same for
   `stage-macos`. `libghostty-darwin` also uploads `libghostty-vt-evidence`, the
   pin as JSON, which `release-evidence.yml` attests with the archives: the
   supply-chain record of the C library, which `cargo audit` does not see.
-- `pinned-cache-offline.yml` has a `libghostty-vt` job: the built library
-  restores from its entry, and a forced rebuild runs from the cached Zig and
-  tarballs with every download host (`release.files.ghostty.org` included)
-  refused.
+- `pinned-cache-offline.yml` has a `libghostty-vt` job with the same two steps,
+  for `workflow_dispatch` after a main run (it is skipped on a pull request,
+  where the entries of main do not exist yet). `release.files.ghostty.org` is
+  one of its refused hosts.
 - `scripts/tests/test_libghostty_vt.py` runs the action's miss, hit and forced
   rebuild, and keeps a list of the workflow jobs that run cargo: each one either
   uses the action or is listed as not yet linking the library, so a new lane
@@ -277,6 +282,15 @@ that path too.
   `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
+
+The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
+`ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
+`library (x86_64-unknown-linux-musl)`, `library (aarch64-apple-darwin)`,
+`offline rebuild (glibc)` and `macos arm64 (link, minos, size)` run on a pull
+request that touches the library build inputs (see
+[libghostty-vt library](#libghostty-vt-library)) and decide that pull request by
+their own result. The release jobs `libghostty-vt for aarch64-apple-darwin`
+(`release-build.yml`, `release.yml`) belong to the release run.
 
 The nightly `CI budgets` workflow checks per-step and per-job medians over the
 newest 30 green `ci.yml` runs per event against `scripts/ci-budgets.json`:

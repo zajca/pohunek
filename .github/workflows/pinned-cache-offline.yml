@@ -159,10 +159,11 @@ jobs:
   # its entry, and a forced rebuild (no restore of the built library) runs the
   # pinned Zig and the two pinned tarballs from their entries, so the miss path
   # of the action needs no download host either. The entries come from the
-  # libghostty-vt.yml run on main (or, on a pull request that changes the
-  # build, from that workflow's run on the same ref).
+  # libghostty-vt.yml run on main, so the job is skipped on a pull request,
+  # where libghostty-vt.yml proves the same thing in its own run.
   libghostty-vt:
     name: offline hit (libghostty-vt)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
