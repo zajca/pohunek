@@ -158,6 +158,8 @@ async fn a_session_set_larger_than_one_response_is_listed_completely_by_the_cli(
             .is_some_and(|hint| hint.contains("cursor")),
         "{error:?}"
     );
+
+    harness.stop().await;
 }
 
 #[tokio::test]
@@ -177,6 +179,8 @@ async fn limit_and_cursor_walk_the_set_in_id_order() {
         json!({ "limit": PAGE, "cursor": second[PAGE - 1] }),
     ));
     assert_eq!(third, ids[2 * PAGE..]);
+
+    harness.stop().await;
 }
 
 #[tokio::test]
@@ -188,4 +192,6 @@ async fn a_zero_limit_is_refused() {
         .expect_err("a zero limit is refused");
 
     assert_eq!(error.code, "bad_request", "{error:?}");
+
+    harness.stop().await;
 }
