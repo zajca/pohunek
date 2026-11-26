@@ -22947,7 +22947,22 @@ generation "$1"
 
         /// [`stop_worker_at_forward`] that runs `between` once the worker is
         /// stopped and before the operation goes on.
-        async fn stop_worker_at_forward_then<T: Send + 'static>(
+        fn stop_worker_at_forward_then<'a, T: Send + 'static>(
+            fixture: &'a Fixture,
+            created: &'a SessionInfo,
+            points: usize,
+            answer: Answer,
+            between: impl std::future::Future<Output = ()> + 'a,
+            operation: impl std::future::Future<Output = T> + Send + 'static,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (T, StoppedWorker)> + 'a>> {
+            Box::pin(stop_worker_at_forward_boxed(
+                fixture, created, points, answer, between, operation,
+            ))
+        }
+
+        /// The body of [`stop_worker_at_forward_then`], boxed by it so its
+        /// callers' futures stay small.
+        async fn stop_worker_at_forward_boxed<T: Send + 'static>(
             fixture: &Fixture,
             created: &SessionInfo,
             points: usize,
@@ -22972,6 +22987,16 @@ generation "$1"
                     .report_hold
                     .lock()
                     .expect("report hold is never poisoned") = hold;
+            };
+            // The worker watcher polls the worker connection every
+            // `WORKER_CONNECT_RETRY`; a poll on the wire when the worker stops
+            // holds the connection, so the forward would time out before its
+            // request is written and leave nothing tracked. Parked after a
+            // snapshot, the watcher has no request in flight.
+            let parked_watcher = if matches!(answer, Answer::Timeout | Answer::Lost) {
+                Box::pin(park_worker_watcher(fixture, created)).await
+            } else {
+                None
             };
             arm(Some(gate.clone()));
             let operation = tokio::spawn(operation);
@@ -23017,7 +23042,42 @@ generation "$1"
                 .await
                 .expect("the operation ends at the worker bound")
                 .expect("the operation finishes");
+            if let Some(parked) = parked_watcher {
+                parked.release.notify_one();
+            }
             (result, stopped)
+        }
+
+        /// Parks the session's worker watcher after a snapshot, or returns `None`
+        /// when a scenario cancelled the watchers. A parked watcher has no
+        /// request in flight on the worker connection; release the returned gate
+        /// to let it go on.
+        async fn park_worker_watcher(
+            fixture: &Fixture,
+            created: &SessionInfo,
+        ) -> Option<crate::runtime::lifecycle::tests::StartGate> {
+            let watcher_runs = !fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .expect("the session")
+                .runtime_watch_cancel
+                .is_cancelled();
+            if !watcher_runs {
+                return None;
+            }
+            let parked = fixture
+                .registry
+                .hold_next_input(&created.id, "worker_snapshot");
+            pohunek_test_support::wait::guard(
+                "the worker watcher to park after a snapshot",
+                parked.entered.notified(),
+            )
+            .await;
+            Some(parked)
         }
 
         fn unbound_report(created: &SessionInfo, seq: u64) -> protocol::SessionReportAgentParams {

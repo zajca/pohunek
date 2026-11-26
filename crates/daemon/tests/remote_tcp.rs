@@ -2120,10 +2120,15 @@ async fn daemon_doctor_names_a_version_probe_that_ran_to_its_deadline() {
         spawn_dual_servers_serving_official_runtimes("doctor-probe-deadline", "0.0.0", config)
             .await;
     let mut client = connect_unix(&socket).await;
+    // A probe that never ends would otherwise run into the nextest kill with
+    // no output; the guard names the unanswered doctor request instead.
     let payload = ok_payload(
-        exchange(
-            &mut client,
-            &Request::make("doctor-probe-deadline", method::DAEMON_DOCTOR, Value::Null),
+        pohunek_test_support::wait::guard(
+            "the doctor answer with every probe at its deadline",
+            exchange(
+                &mut client,
+                &Request::make("doctor-probe-deadline", method::DAEMON_DOCTOR, Value::Null),
+            ),
         )
         .await,
     );

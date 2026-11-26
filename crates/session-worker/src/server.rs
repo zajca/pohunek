@@ -9946,6 +9946,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn natural_exit_bounds_a_descendant_that_never_closes_the_pty() {
+        // Another test run's unreadable holder would keep the forced-close sweep
+        // unconfirmed.
+        let _host_lock = pohunek_test_support::host_lock::HostLock::acquire(
+            pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
+            "natural_exit_bounds_a_descendant_that_never_closes_the_pty",
+        );
+        let (capture, _subscriber) = capture_warnings();
         let directory = BarrierDirectory::new();
         // The descendant never closes the PTY, so the drain always expires; its
         // short bound only keeps the test fast. The stop that follows uses the
@@ -10005,11 +10012,7 @@ mod tests {
             worker_instance_id,
         );
 
-        pohunek_test_support::wait::wait_until("the natural drain to complete", || async {
-            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
-                .then_some(())
-        })
-        .await;
+        assert_exits_without_a_fault(&server, &capture).await;
         let state = server.shared.state.lock().await;
         assert_eq!(
             state
