@@ -24,6 +24,8 @@ mod attach_ended_refused;
 mod attach_menu_keys;
 #[path = "attach_stream_input.rs"]
 mod attach_stream_input;
+#[path = "attach_synchronized_repaint.rs"]
+mod attach_synchronized_repaint;
 #[path = "claude_package.rs"]
 mod claude_package;
 #[path = "codex_package.rs"]

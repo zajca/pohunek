@@ -601,6 +601,19 @@ immediately following probe (no other output byte between) is not answered. The
 reply is no input evidence: it arms no input token, submits nothing and never
 touches the submit mark.
 
+Every terminal repaint (the attach snapshot and the repaint after a gap) is one
+synchronized-output bracket: it begins with `CSI ? 2026 h`, so a terminal that
+implements DEC mode 2026 draws it atomically, and it ends with `CSI ? 2026 l`.
+The bracket spans the whole repaint however many frames carry it. The worker's
+terminal tracker follows the program's own mode 2026 (set and reset sequences
+and `RIS`); while the program holds it set, the repaint omits the closing
+reset, so the attached terminal stays in the program's state. The tracker keeps
+the state the program last set, with no timeout: a program that stops mid-frame
+without resetting the mode leaves every later repaint unclosed, and the client's
+terminal ends the held frame by its own timeout. A terminal that does not know the
+mode ignores both sequences, so the worker emits them to every client; an
+out-of-repository client receives standard DEC private mode 2026.
+
 Retained replay and terminal repaint payloads are split into contiguous frames
 bounded by the negotiated worker data payload. History capacity is independent
 of the per-frame allocation limit: increasing retained history must never

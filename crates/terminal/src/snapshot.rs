@@ -13,6 +13,14 @@ use crate::program_status::{ProbeSpan, PROGRAM_STATUS_COMMAND};
 /// prevents an unterminated sequence from retaining arbitrary PTY output.
 const MAX_OSC_BYTES: usize = 4 * 1024;
 
+/// DEC private mode number of synchronized output.
+const SYNCHRONIZED_OUTPUT_MODE: u32 = 2026;
+
+/// Begins a synchronized-output bracket (DEC private mode 2026).
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+/// Ends a synchronized-output bracket (DEC private mode 2026).
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
 /// Provider-independent current terminal state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
@@ -123,6 +131,9 @@ impl TerminalTracker {
         let (cursor_row, cursor_col) = screen.cursor_position();
         let alternate_screen = screen.alternate_screen();
         let mut ansi = Vec::new();
+        // One bracket spans the whole repaint, so a terminal that implements
+        // mode 2026 draws it as one frame however the bytes are chunked.
+        ansi.extend_from_slice(SYNC_BEGIN);
         if alternate_screen {
             ansi.extend_from_slice(b"\x1b[?1049h");
         }
@@ -130,6 +141,11 @@ impl TerminalTracker {
         ansi.extend_from_slice(&screen.input_mode_formatted());
         ansi.extend_from_slice(&screen.contents_formatted());
         ansi.extend_from_slice(&screen.cursor_state_formatted());
+        // A program that set mode 2026 keeps it: the bracket's begin already
+        // left it set, and a reset here would end the program's own frame.
+        if !self.osc.synchronized_output {
+            ansi.extend_from_slice(SYNC_END);
+        }
 
         TerminalSnapshot {
             watermark,
@@ -156,7 +172,8 @@ struct OscTracker {
     progress: Option<String>,
     /// Bytes fed so far; the index of the byte being advanced.
     consumed: u64,
-    /// Index of the latest `ESC` seen in the ground state.
+    /// Index of the latest `ESC` that may begin an escape sequence: one seen in
+    /// the ground state or one that interrupts a CSI or another `ESC`.
     escape_at: u64,
     /// Index of the `ESC` that introduced the current OSC.
     osc_start: u64,
@@ -167,6 +184,10 @@ struct OscTracker {
     csi_param: u32,
     /// Whether an earlier parameter of that CSI names an alternate screen.
     csi_selects: bool,
+    /// Whether an earlier parameter of that CSI names mode 2026.
+    csi_sync: bool,
+    /// Whether the program itself set DEC private mode 2026 and has not reset it.
+    synchronized_output: bool,
 }
 
 /// Something the tracker applies between two parser runs.
@@ -198,6 +219,8 @@ impl OscTracker {
             event: None,
             csi_param: 0,
             csi_selects: false,
+            csi_sync: false,
+            synchronized_output: false,
         }
     }
 
@@ -229,11 +252,15 @@ impl OscTracker {
             }
             b';' => {
                 self.csi_selects |= is_alternate_screen_mode(self.csi_param);
+                self.csi_sync |= self.csi_param == SYNCHRONIZED_OUTPUT_MODE;
                 self.csi_param = 0;
             }
             b'h' | b'l' => {
                 if self.csi_selects || is_alternate_screen_mode(self.csi_param) {
                     self.event = Some(TrackerEvent::BufferSwitch);
+                }
+                if self.csi_sync || self.csi_param == SYNCHRONIZED_OUTPUT_MODE {
+                    self.synchronized_output = byte == b'h';
                 }
                 self.state = OscState::Ground;
             }
@@ -242,7 +269,8 @@ impl OscTracker {
                 self.state = OscState::Escape;
             }
             0x18 | 0x1a => self.state = OscState::Ground,
-            0x00..=0x1f => {}
+            // DEL is ignored inside a sequence, as terminals do.
+            0x00..=0x1f | 0x7f => {}
             _ => self.state = OscState::Ground,
         }
     }
@@ -268,6 +296,11 @@ impl OscTracker {
                         self.escape_at = self.consumed;
                         OscState::Escape
                     }
+                    b'c' => {
+                        // RIS resets every mode, 2026 included.
+                        self.synchronized_output = false;
+                        OscState::Ground
+                    }
                     _ => OscState::Ground,
                 };
             }
@@ -276,6 +309,7 @@ impl OscTracker {
                     b'?' => {
                         self.csi_param = 0;
                         self.csi_selects = false;
+                        self.csi_sync = false;
                         OscState::CsiPrivate
                     }
                     0x1b => {
@@ -386,7 +420,7 @@ mod tests {
         assert_eq!(snapshot.title.as_deref(), Some("building"));
         assert!(snapshot.visible_text.contains("ok"));
         assert_eq!((snapshot.cursor_row, snapshot.cursor_col), (1, 5));
-        assert!(snapshot.ansi.starts_with(b"\x1b[2J\x1b[H"));
+        assert!(snapshot.ansi.starts_with(b"\x1b[?2026h\x1b[2J\x1b[H"));
     }
 
     #[test]

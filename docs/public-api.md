@@ -5331,6 +5331,11 @@ Attach stream rules:
 - If redemption fails, the daemon replies with a normal error response on the
   second connection and does not switch to raw byte mode.
 - After successful redemption, bytes are opaque. Clients must not assume UTF-8.
+- The repaint is one synchronized-output bracket: it begins with `CSI ? 2026 h`
+  and ends with `CSI ? 2026 l`, unless the program itself holds mode 2026 set,
+  in which case the closing reset is omitted so the program's state is kept.
+  Terminals that do not implement the mode ignore both sequences. A client that
+  parses the stream itself treats them as ordinary private-mode sequences.
 - A fresh attach never reconstructs the screen by replaying raw output emitted
   at historical terminal sizes. It starts from the current terminal snapshot,
   then receives live bytes without a gap or overlap.
