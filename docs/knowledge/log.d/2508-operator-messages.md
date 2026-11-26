@@ -9,7 +9,8 @@
   `last activity: blocked`.
 - `pohunek session new` (human output) prints a `waiting on a dialog` line when the kept session
   is `blocked` and the daemon reports the initial input as not delivered, with or without
-  `--input-ack-timeout-ms`; it names `pohunek session screen <id>` and `pohunek attach <id>`.
+  `--input-ack-timeout-ms`; it names `pohunek session screen <id>` and `pohunek attach <id>`
+  (`<host>/<id>` for a session on another host).
 - Claude package 2.3.1: `claude-accounts add <name>` reports `<name>` in its success message, and
   `claude-accounts add` runs on macOS: its wrapper step passes `--` before the mode (`chmod -- 755 file`),
   because BSD `chmod` reads a `--` after the mode as a file name.

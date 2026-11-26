@@ -297,7 +297,7 @@ written rolls the create back as above. A host whose daemon does not advertise
 A kept create whose agent is `blocked` on a dialog and whose initial input is not
 yet delivered prints a `waiting on a dialog` line in the human output, with or
 without `--input-ack-timeout-ms`; it names `pohunek session screen <id>` and
-`pohunek attach <id>`.
+`pohunek attach <id>` (`<host>/<id>` for a session on another host).
 
 A session launched from a profile that declares options records the choice of
 every option it launched with, defaults included: `agent_options` on
