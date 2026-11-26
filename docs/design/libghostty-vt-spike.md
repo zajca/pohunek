@@ -172,7 +172,7 @@ the link results were identical in run
 Rust's self-contained musl linking; the workflow links with `musl-gcc` like
 `release-build.yml`. The glibc ceiling is 2.41.
 
-### `size-probe` (the model surface linked into a small Rust binary)
+### `size-probe` (the model surface linked into a small Rust binary, local)
 
 | Target | Stripped without | Stripped with | Delta | Unstripped delta |
 |---|---|---|---|---|
@@ -201,7 +201,7 @@ macOS arm64 was not built for `pohunek-sessiond`.
 
 ### Throughput and memory
 
-Median of 5 runs, MiB/s of PTY bytes, glibc x86_64 (musl in parentheses). The
+Local: median of 5 runs, MiB/s of PTY bytes, glibc x86_64 (musl in parentheses). The
 resident delta is the first run in a fresh process.
 
 | Subject | Agent trace | Flood 64 MiB | Resident delta (flood) |
@@ -226,7 +226,7 @@ On the CI runners (median of 5, MiB/s, agent trace / flood):
 
 libghostty is 2.4x, 2.5x and 2.9x `TerminalTracker` on the agent trace and 1.6x,
 2.0x and 1.8x on the flood. The resident delta on Linux is 9.1 MiB for
-libghostty and 31.3 MiB for `vt100-scrollback`; the macOS runner does not
+libghostty and 31.3 to 31.9 MiB for `vt100-scrollback`; the macOS runner does not
 report it.
 
 ## Adoption criteria
