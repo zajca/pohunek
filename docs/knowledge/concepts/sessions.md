@@ -333,9 +333,10 @@ and values remain opaque strings and use the same validation as
 
 `session.list` orders sessions by id and takes `limit` and `cursor` (the id of the
 last session of the previous page). A set that does not fit one control line is
-refused with `session_list_too_large`; `pohunek session list` and the SDK
-`session_list` page through the set themselves, 200 sessions at a time and fewer
-when the daemon says the page is too large.
+refused with `session_list_too_large`; `pohunek session list` and the Rust SDK
+`Client::session_list` page through the set themselves, 200 sessions at a time and
+fewer when the daemon says the page is too large. The TypeScript SDK does not page
+yet (tracked in #2570).
 
 The CLI exposes these predicates as repeatable `pohunek session list
 --meta-eq key=value` and `--meta-has key` options. Equality splits on the first

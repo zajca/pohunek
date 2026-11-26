@@ -155,3 +155,111 @@ async fn an_unchanged_set_of_exactly_one_page_is_listed_once() {
 
     assert_eq!(listed, set);
 }
+
+#[tokio::test]
+async fn a_page_that_ends_at_or_before_its_cursor_is_refused() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    // The second page starts after the cursor but ends before it: no daemon
+    // that pages answers it.
+    let script = vec![
+        ids(0, page()),
+        vec!["s-00300".to_owned(), "s-00100".to_owned()],
+    ];
+    let socket = spawn_daemon(&env, script);
+    let mut client = connect(&socket).await;
+
+    let error = client
+        .session_list(SessionListParams::default())
+        .await
+        .expect_err("a page that does not follow its cursor is refused");
+
+    let pohunek_client::ClientError::Protocol(error) = error else {
+        panic!("a protocol error, got {error:?}");
+    };
+    assert_eq!(error.code, "session_list_cursor_repeated");
+}
+
+/// Bytes of the name each session of the oversized fixture carries: one record
+/// nearly fills a control line.
+const BIG_NAME_BYTES: usize = 900_000;
+
+/// Serves a daemon that answers `session_list_too_large` to every request for
+/// more than one session, and to a request for one session answers the session
+/// after the cursor, with a name of [`BIG_NAME_BYTES`] bytes, without end.
+fn spawn_endless_big_daemon(env: &TestEnv) -> std::path::PathBuf {
+    let socket = env.socket_path("big-list").expect("fixture socket");
+    let listener = UnixListener::bind(&socket).expect("bind fixture socket");
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (reader, mut write) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(request) = serde_json::from_str::<Request>(&line) else {
+                        return;
+                    };
+                    let response = match request.method() {
+                        protocol::method::DAEMON_HEALTH => Response::ok(
+                            PROTOCOL_VERSION,
+                            request.id(),
+                            json!({
+                                "status": "ok",
+                                "daemon_version": "fixture",
+                                "protocol_version": PROTOCOL_VERSION.get()
+                            }),
+                        ),
+                        protocol::method::SESSION_LIST => {
+                            let params = request.params();
+                            if params["limit"].as_u64() == Some(1) {
+                                let after = params["cursor"]
+                                    .as_str()
+                                    .and_then(|cursor| cursor.strip_prefix("s-"))
+                                    .and_then(|number| number.parse::<usize>().ok())
+                                    .map_or(0, |number| number + 1);
+                                let mut record = session(&format!("s-{after:05}"));
+                                record["name"] = json!("n".repeat(BIG_NAME_BYTES));
+                                Response::ok(PROTOCOL_VERSION, request.id(), json!([record]))
+                            } else {
+                                Response::err(
+                                    PROTOCOL_VERSION,
+                                    request.id(),
+                                    protocol::ProtocolError::new(
+                                        protocol::ErrorClass::Runtime,
+                                        "session_list_too_large",
+                                        "the matching sessions exceed the public response budget",
+                                        None,
+                                    ),
+                                )
+                            }
+                        }
+                        other => panic!("the client sent an unexpected request: {other}"),
+                    }
+                    .expect("valid fixture response");
+                    let mut encoded = serde_json::to_vec(&response).expect("serialize response");
+                    encoded.push(b'\n');
+                    if write.write_all(&encoded).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    socket
+}
+
+#[tokio::test]
+async fn a_walk_past_the_byte_bound_is_refused() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let socket = spawn_endless_big_daemon(&env);
+    let mut client = connect(&socket).await;
+
+    let error = client
+        .session_list(SessionListParams::default())
+        .await
+        .expect_err("an endless listing of large records is refused");
+
+    let pohunek_client::ClientError::Protocol(error) = error else {
+        panic!("a protocol error, got {error:?}");
+    };
+    assert_eq!(error.code, "session_list_walk_limit");
+}
