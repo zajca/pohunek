@@ -149,9 +149,10 @@ Proposals are read-only until applied under the mode rules.
    highest first. Report `dropped` and `limits_reached` as counts only.
 5. Propose `pohunek project add <repo_root> --name <name>`: the name is the
    last component of `repo_root`, made unique against existing project labels.
-   Add `--base-branch <branch>` only when
-   `git -C <repo_root> symbolic-ref --short refs/remotes/origin/HEAD` names one
-   (drop the `origin/` prefix); otherwise leave the default.
+   Add `--base-branch <branch>` only when the user names a base branch for that
+   repository; otherwise leave the default. Never run `git` to find it: no pohunek
+   command reports a repository's default branch and `git` is not in the
+   allowlist, so it would stop the session on a permission prompt.
 
 ### Groups
 
