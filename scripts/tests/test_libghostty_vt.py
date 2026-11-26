@@ -244,7 +244,7 @@ class WorkflowWiringTests(unittest.TestCase):
         proof = (WORKFLOWS / "pinned-cache-offline.yml").read_text()
         producer = (WORKFLOWS / "libghostty-vt.yml").read_text()
         self.check_offline_job(proof, "libghostty-vt")
-        self.check_offline_job(producer, "offline")
+        self.check_offline_job(producer, "offline", populate=True)
         # On a pull request the proof of pinned-cache-offline.yml would read
         # entries no main run has saved; the producer workflow proves it in
         # its own run, after the job that saved them.
@@ -256,11 +256,37 @@ class WorkflowWiringTests(unittest.TestCase):
             harness.workflow_env(producer)["OFFLINE_HOSTS"], harness.workflow_env(proof)["OFFLINE_HOSTS"]
         )
 
-    def check_offline_job(self, text, job):
+    def test_the_producer_and_the_spike_gate_watch_every_build_input(self):
+        producer = (WORKFLOWS / "libghostty-vt.yml").read_text()
+        for path in (
+            ".github/actions/libghostty-vt-macos/**",
+            "spikes/libghostty-vt/scripts/measure",
+            "scripts/libghostty-vt.pin.toml",
+        ):
+            self.assertEqual(producer.count(f"      - {path}\n"), 2, path)
+        spike = (WORKFLOWS / "libghostty-spike.yml").read_text()
+        gate = re.search(r"grep -Eq '(.*)'; then", spike).group(1)
+        for path in (
+            "scripts/libghostty-vt.pin.toml",
+            "scripts/build-libghostty-vt",
+            "scripts/libghostty-vt-abi-probe.c",
+            ".github/actions/libghostty-vt/action.yml",
+            ".github/actions/libghostty-vt-macos/action.yml",
+        ):
+            self.assertRegex(path, gate)
+
+    def check_offline_job(self, text, job, populate=False):
         steps = harness.job_steps(text, job)
         offline = [i for i, step in enumerate(steps) if "pinned-cache-offline apply" in str(step.get("run", ""))]
         calls = [i for i, step in enumerate(steps) if step.get("uses") == LIBRARY_ACTION]
         self.assertEqual(len(offline), 1)
+        if populate:
+            # An online forced build before the hosts go offline puts the Zig
+            # and tarball entries in place under every cache state of `library`.
+            self.assertEqual(len(calls), 3)
+            self.assertLess(calls[0], offline[0])
+            self.assertEqual(steps[calls[0]]["with"]["force-build"], "true")
+            calls = calls[1:]
         self.assertEqual(len(calls), 2)
         self.assertLess(offline[0], min(calls))
         restore, rebuild = (steps[i] for i in calls)

@@ -34,7 +34,9 @@ on:
       - scripts/libghostty-vt-size-gate
       - scripts/libghostty-vt.pin.toml
       - .github/actions/libghostty-vt/**
+      - .github/actions/libghostty-vt-macos/**
       - .github/actions/setup-zig/**
+      - spikes/libghostty-vt/scripts/measure
       - .github/workflows/libghostty-vt.yml
   pull_request:
     paths:
@@ -43,7 +45,9 @@ on:
       - scripts/libghostty-vt-size-gate
       - scripts/libghostty-vt.pin.toml
       - .github/actions/libghostty-vt/**
+      - .github/actions/libghostty-vt-macos/**
       - .github/actions/setup-zig/**
+      - spikes/libghostty-vt/scripts/measure
       - .github/workflows/libghostty-vt.yml
 
 permissions: {}
@@ -127,11 +131,13 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  # The offline proof of the action, in the run that saved its entries (the
-  # same workflow run, so the same cache scope): the built library restores
-  # from its entry, and a forced rebuild runs from the cached Zig and
-  # tarballs, with every download host of the miss paths refused. The same
-  # proof runs from pinned-cache-offline.yml after a main run.
+  # The offline proof of the action, independent of whether `library` hit or
+  # missed. An online forced build first restores the Zig and tarball entries
+  # or downloads and saves them in this job, so the offline steps find them
+  # under every cache state. Then, with every download host of the miss paths
+  # refused, the built library restores from its entry and a second forced
+  # build runs from the cached Zig and tarballs. The same proof runs from
+  # pinned-cache-offline.yml after a main run.
   offline:
     name: offline rebuild (glibc)
     needs: library
@@ -143,6 +149,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      - name: Populate the Zig and tarball entries online
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+          force-build: "true"
 
       - name: Take the miss-path download hosts offline
         timeout-minutes: 5
