@@ -325,7 +325,48 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
     | `pohunekd/plugin-assistant` | Step 9. | Its release vX.Y.Z is published and the digest is in the core notes. |
     | `pohunekd/pohunek-plugin-index` | Step 9b: the `CORE_TAG` PR, then the `pohunek.context.assistant/X.Y.Z` entry PR. | The signed `official-index-v2.json` lists the assistant entry. |
     | Hosts that run pohunek for other services (the `pohunekd/autoreview` review hosts) | Their operator gets the version and whether the protocol window requires an upgrade; upgrade on their schedule. | The operator acknowledged. |
-    | pohunek.dev | `follow-release` moves the `pohunek` pin in `releases.config.json` and records the post (step 8); a manual run is `gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek`. | The site shows vX.Y.Z with the post, and each downstream release above once it is out. |
+    | pohunek.dev | `follow-release` moves the `pohunek` pin in `releases.config.json` and records the post (step 8); a manual run is `gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek`. The roadmap is hand-written and is reconciled in step 10b. | The site shows vX.Y.Z with the post, the roadmap names vX.Y.Z as released (step 10b), and each downstream release above once it is out. |
+
+10b. **Website: changelog and roadmap.** Run this after step 8 shows the
+    published, approved post, because the site records a release body the first
+    time it sees it. The core Release workflow does not notify the site.
+
+    1. **Follow the release.** Dispatch the site's follow workflow for the new
+       version and wait for it:
+
+       ```bash
+       gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek -f version=X.Y.Z
+       gh run watch --repo pohunekd/pohunek.dev "$(gh run list --repo pohunekd/pohunek.dev --workflow=follow-release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+       ```
+
+       Without `-f version` the run follows the newest release of every
+       product. A failed run is reported with its failing job; do not retry it
+       blindly.
+    2. **Verify the changelog page.** Re-query the live site, not the run:
+       the recorded entry (`source` must be `release-notes`, see the Website
+       check of step 8) and the rendered page:
+
+       ```bash
+       curl -fsS https://pohunek.dev/changelog/pohunek/ | grep -c 'id="pohunek-X.Y.Z"'   # 1
+       ```
+
+       The count stays 0 until the deploy that follows the run has finished;
+       check the deploy run before reporting a missing page.
+    3. **Update the roadmap.** `src/data/roadmap.ts` of `pohunekd/pohunek.dev`
+       is hand-written. In one pull request there, move `roadmapRelease` to
+       `vX.Y.Z` and `roadmapAsOf` to today, then reconcile against GitHub:
+       - each track in `roadmapTracks`: its status, status note, progress and
+         issue links follow the epic's state and child counts in
+         `zajca/pohunek`; remove a track whose work is gone and add one for a
+         new epic of the shipped milestone;
+       - `nextMilestone`: the open milestone of the next release (number from
+         its URL, title such as `0.46`, closed and total issue counts, and the
+         epics that define it).
+
+       The "Recent core releases" table of `/roadmap/` is derived from the
+       recorded changelog and needs no edit. Verify the page after its deploy:
+       `curl -fsS https://pohunek.dev/roadmap/ | grep -c 'vX.Y.Z'` prints at
+       least 1.
 
 11. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
