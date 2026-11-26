@@ -43,7 +43,7 @@ pub struct SubscribeHeartbeatCapability {
 
 /// The broadcast channel a subscriber lagged on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SubscriptionChannel.ts"))]
 pub enum SubscriptionChannel {
@@ -51,7 +51,16 @@ pub enum SubscriptionChannel {
     Session,
     /// Notification events; re-seed with `notification.list`.
     Notification,
+    /// A channel a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; the client
+    /// re-seeds everything it follows.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
 }
+
+crate::tolerant_enum!(SubscriptionChannel);
 
 /// Payload of a `subscription_lagged` event.
 ///

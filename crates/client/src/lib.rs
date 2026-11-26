@@ -18,6 +18,7 @@ pub use discovery::{
 };
 pub use error::ClientError;
 pub use local_socket::{local_socket_path, local_socket_path_for};
+pub use pohunek_paths::{PathEnv, PathError, Platform, UnsafeEndpointReason};
 pub use overlay::{
     ConfiguredTransport, ExternalIdentity, ExternalIdentityKind, HostTarget, LocalIdentity,
     OverlayDiagnostic, OverlayRegistry, RegistryError,

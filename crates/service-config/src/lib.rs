@@ -2569,15 +2569,26 @@ fn default_record_sweep_interval_secs() -> u64 {
 /// On-disk `[subscriptions]` table; the writer omits it while every key equals
 /// its default.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawSubscriptions {
-    #[serde(default = "default_session_event_capacity")]
+    #[serde(
+        default = "default_session_event_capacity",
+        skip_serializing_if = "is_default_session_event_capacity"
+    )]
     session_event_capacity: u64,
-    #[serde(default = "default_notification_event_capacity")]
+    #[serde(
+        default = "default_notification_event_capacity",
+        skip_serializing_if = "is_default_notification_event_capacity"
+    )]
     notification_event_capacity: u64,
-    #[serde(default = "default_heartbeat_min_ms")]
+    #[serde(
+        default = "default_heartbeat_min_ms",
+        skip_serializing_if = "is_default_heartbeat_min_ms"
+    )]
     heartbeat_min_ms: u32,
-    #[serde(default = "default_heartbeat_max_ms")]
+    #[serde(
+        default = "default_heartbeat_max_ms",
+        skip_serializing_if = "is_default_heartbeat_max_ms"
+    )]
     heartbeat_max_ms: u32,
 }
 
@@ -2630,6 +2641,22 @@ fn default_heartbeat_min_ms() -> u32 {
 
 fn default_heartbeat_max_ms() -> u32 {
     DEFAULT_SUBSCRIPTION_SETTINGS.heartbeat_max_ms
+}
+
+fn is_default_session_event_capacity(value: &u64) -> bool {
+    *value == default_session_event_capacity()
+}
+
+fn is_default_notification_event_capacity(value: &u64) -> bool {
+    *value == default_notification_event_capacity()
+}
+
+fn is_default_heartbeat_min_ms(value: &u32) -> bool {
+    *value == default_heartbeat_min_ms()
+}
+
+fn is_default_heartbeat_max_ms(value: &u32) -> bool {
+    *value == default_heartbeat_max_ms()
 }
 
 #[expect(
