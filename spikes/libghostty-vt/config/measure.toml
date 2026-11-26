@@ -1,0 +1,19 @@
+# Settings of scripts/measure. Every key is required.
+
+# Wall-clock limit of one cargo build, in seconds.
+build_timeout_seconds = 3600
+# Wall-clock limit of one throughput or size-probe run, in seconds.
+run_timeout_seconds = 900
+# Binaries the cold release build compiles.
+bins = ["size-probe", "throughput"]
+# Throughput subjects and workloads, in table order.
+models = ["vt100", "vt100-parser", "vt100-scrollback", "libghostty"]
+workloads = ["agent", "flood"]
+# Link checks of the binary built with the feature. glibc_ceiling is the
+# highest GLIBC symbol version a glibc binary may need (the ceiling the release
+# glibc check enforces); macos_minos is the minimum OS of a macOS binary.
+glibc_ceiling = "2.41"
+macos_minos = "14.0"
+cxx_runtime_symbol_prefixes = ["_ZSt", "__cxa_", "__gxx_"]
+# Version of the measurements.json layout.
+schema_version = 1

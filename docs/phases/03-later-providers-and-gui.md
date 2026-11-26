@@ -64,6 +64,9 @@ remains the intended rendering technology.
   handoff were roadmap. The Rust crate `libghostty-vt` existed but was pre-1.0
   with a Zig toolchain dependency. **Re-verify libghostty's current state at the
   time this work actually starts** — it moves fast and may have advanced.
+- A measured comparison of libghostty-vt 1.0.2 with the current `vt100` screen
+  model, and the decision to defer replacing it, is in
+  [libghostty-vt spike report](../design/libghostty-vt-spike.md).
 
 ### Approach (when built)
 

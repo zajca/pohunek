@@ -1,0 +1,3562 @@
+{
+  "models": [
+    "vt100",
+    "vt100-scrollback",
+    "libghostty"
+  ],
+  "traces": [
+    {
+      "trace": "claude",
+      "assertions": [
+        {
+          "id": "enters-alternate-screen",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "leaves-alternate-screen",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "size-stays",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "reply-marker",
+          "basis": "spec",
+          "source": "https://ecma-international.org/publications-and-standards/standards/ecma-48",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "reply-first-word",
+          "basis": "spec",
+          "source": "https://ecma-international.org/publications-and-standards/standards/ecma-48",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "reply-third-word",
+          "basis": "spec",
+          "source": "https://ecma-international.org/publications-and-standards/standards/ecma-48",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "reply-second-paragraph",
+          "basis": "spec",
+          "source": "https://ecma-international.org/publications-and-standards/standards/ecma-48",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 21,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"\")",
+              "right": "None"
+            }
+          ]
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 21,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"\")",
+              "right": "None"
+            }
+          ]
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 139,
+          "differences": [
+            {
+              "record": 21,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"\")",
+              "right": "None"
+            }
+          ]
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 139,
+          "differences": [
+            {
+              "record": 21,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"\")",
+              "right": "None"
+            }
+          ]
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5784,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "combining",
+      "assertions": [
+        {
+          "id": "one-mark-joins-base",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr29/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "one-mark-next-cell",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "stacked-marks-join-base",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr29/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "stacked-marks-next-cell",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "mark-after-wide-joins-base",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr29/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "mark-after-wide-next-cell",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 73,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 73,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5576,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "emoji-width",
+      "assertions": [
+        {
+          "id": "family-per-codepoint",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": "UAX 11 East_Asian_Width with Emoji_Presentation = wide, one code point at a time, ZWJ width 0",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "family-cluster",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr29/",
+          "width_method": "UAX 29 extended grapheme cluster, width of its emoji presentation = 2",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: cell text: expected \"x\", found \"👩\\u{200d}\"",
+            "vt100-scrollback": "FAIL: cell text: expected \"x\", found \"👩\\u{200d}\""
+          }
+        },
+        {
+          "id": "vs16-heart-cluster",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr29/",
+          "width_method": "UAX 29 extended grapheme cluster, emoji presentation sequence width = 2",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: cell text: expected \"x\", found \"\"",
+            "vt100-scrollback": "FAIL: cell text: expected \"x\", found \"\""
+          }
+        },
+        {
+          "id": "vs16-heart-per-codepoint",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": "UAX 11 East_Asian_Width, one code point at a time, variation selectors width 0",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "vs15-heart",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": "UAX 11 East_Asian_Width, text presentation sequence width = 1",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "flag-per-codepoint",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": "UAX 11 East_Asian_Width with Emoji_Presentation = wide, one code point at a time",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: cell text: expected \"x\", found \"\"",
+            "vt100-scrollback": "FAIL: cell text: expected \"x\", found \"\""
+          }
+        },
+        {
+          "id": "flag-cluster",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr29/",
+          "width_method": "UAX 29 extended grapheme cluster, flag width = 2",
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"👨\\u{200d}\"",
+              "right": "\"👨\\u{200d}👩\\u{200d}👧\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"👩\\u{200d}\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 1,
+              "col": 2,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 1,
+              "col": 3,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"👧\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 1,
+              "col": 4,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 1,
+              "col": 5,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"x\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 2,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 2,
+              "col": 1,
+              "left": "\"x\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 2,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 2,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 5,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 1,
+              "left": "\"🇿\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 5,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 2,
+              "left": "\"x\"",
+              "right": "\"🇿\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 5,
+              "col": 2,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 5,
+              "col": 3,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 6,
+              "col": 0,
+              "left": "\"🇨\"",
+              "right": "\"🇨🇿\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 6,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 6,
+              "col": 1,
+              "left": "\"🇿\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 6,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            }
+          ]
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"👨\\u{200d}\"",
+              "right": "\"👨\\u{200d}👩\\u{200d}👧\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"👩\\u{200d}\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 1,
+              "col": 2,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 1,
+              "col": 3,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"👧\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 1,
+              "col": 4,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 1,
+              "col": 5,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"x\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 2,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 2,
+              "col": 1,
+              "left": "\"x\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 2,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 2,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 5,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 1,
+              "left": "\"🇿\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 5,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 2,
+              "left": "\"x\"",
+              "right": "\"🇿\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 5,
+              "col": 2,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 5,
+              "col": 3,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 6,
+              "col": 0,
+              "left": "\"🇨\"",
+              "right": "\"🇨🇿\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 6,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 6,
+              "col": 1,
+              "left": "\"🇿\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 6,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            }
+          ]
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 140,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 140,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5651,
+          "differences": [
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"👨\\u{200d}\"",
+              "right": "\"👨\\u{200d}👩\\u{200d}👧\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"👩\\u{200d}\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 0,
+              "col": 2,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 0,
+              "col": 3,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"👧\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 0,
+              "col": 4,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 0,
+              "col": 5,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"x\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 3,
+              "col": 0,
+              "left": "1",
+              "right": "2"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 3,
+              "col": 1,
+              "left": "\"x\"",
+              "right": "\"\""
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 3,
+              "col": 1,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 3,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 0,
+              "left": "\"🇨\"",
+              "right": "\"🇨🇿\""
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 2,
+              "left": "\"🇿\"",
+              "right": "\"x\""
+            },
+            {
+              "record": 1,
+              "what": "cell width",
+              "row": 5,
+              "col": 2,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 1,
+              "what": "spacer tail",
+              "row": 5,
+              "col": 3,
+              "left": "true",
+              "right": "false"
+            },
+            {
+              "record": 1,
+              "what": "cell text",
+              "row": 5,
+              "col": 4,
+              "left": "\"x\"",
+              "right": "\"\""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace": "hyperlink-wrap",
+      "assertions": [
+        {
+          "id": "link-first-cell",
+          "basis": "spec",
+          "source": "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: the model cannot observe OSC 8 hyperlinks",
+            "vt100-scrollback": "FAIL: the model cannot observe OSC 8 hyperlinks"
+          }
+        },
+        {
+          "id": "link-after-wrap",
+          "basis": "spec",
+          "source": "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: the model cannot observe OSC 8 hyperlinks",
+            "vt100-scrollback": "FAIL: the model cannot observe OSC 8 hyperlinks"
+          }
+        },
+        {
+          "id": "link-ends",
+          "basis": "spec",
+          "source": "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: the model cannot observe OSC 8 hyperlinks",
+            "vt100-scrollback": "FAIL: the model cannot observe OSC 8 hyperlinks"
+          }
+        },
+        {
+          "id": "wrap-flag",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "text-after-link",
+          "basis": "spec",
+          "source": "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 68,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 68,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5605,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "kitty-keyboard",
+      "assertions": [
+        {
+          "id": "push-sets-flags",
+          "basis": "spec",
+          "source": "https://sw.kovidgoyal.net/kitty/keyboard-protocol/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: the model cannot observe the Kitty keyboard flags",
+            "vt100-scrollback": "FAIL: the model cannot observe the Kitty keyboard flags"
+          }
+        },
+        {
+          "id": "pop-restores-flags",
+          "basis": "spec",
+          "source": "https://sw.kovidgoyal.net/kitty/keyboard-protocol/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: the model cannot observe the Kitty keyboard flags",
+            "vt100-scrollback": "FAIL: the model cannot observe the Kitty keyboard flags"
+          }
+        },
+        {
+          "id": "negotiation-prints-nothing",
+          "basis": "spec",
+          "source": "https://sw.kovidgoyal.net/kitty/keyboard-protocol/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 65,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 65,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5584,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "osc52",
+      "assertions": [
+        {
+          "id": "write-observed",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: the model cannot observe OSC 52 clipboard writes",
+            "vt100-scrollback": "FAIL: the model cannot observe OSC 52 clipboard writes"
+          }
+        },
+        {
+          "id": "write-prints-nothing",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "read-prints-nothing",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 74,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 74,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5593,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "program-status",
+      "assertions": [
+        {
+          "id": "probe-and-record-print-nothing",
+          "basis": "pohunek-contract",
+          "source": "crates/terminal/src/program_status.rs",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 58,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 58,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5579,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "resize-alt-screen",
+      "assertions": [
+        {
+          "id": "alt-screen-active-at-resize",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "size-after-resize",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "alt-screen-left",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "primary-content-restored",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "cursor-restored-after-1049",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 3,
+              "what": "cursor",
+              "row": null,
+              "col": null,
+              "left": "1,0",
+              "right": "2,0"
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"a\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 1,
+              "left": "\"l\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"t\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 3,
+              "left": "\"e\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"r\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 5,
+              "left": "\"n\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"a\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 7,
+              "left": "\"t\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 8,
+              "left": "\"e\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"\"",
+              "right": "\"l\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"e\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"n\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"e\""
+            }
+          ]
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 3,
+              "what": "cursor",
+              "row": null,
+              "col": null,
+              "left": "1,0",
+              "right": "2,0"
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"a\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 1,
+              "left": "\"l\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"t\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 3,
+              "left": "\"e\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"r\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 5,
+              "left": "\"n\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"a\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 7,
+              "left": "\"t\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 0,
+              "col": 8,
+              "left": "\"e\"",
+              "right": "\"\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"\"",
+              "right": "\"l\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"e\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"n\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"e\""
+            }
+          ]
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 64,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 64,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5584,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "resize-wrap",
+      "assertions": [
+        {
+          "id": "autowrap-sets-wrapped",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "autowrap-continuation",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "size-after-shrink",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "size-after-grow",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": [
+            {
+              "record": 6,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "1"
+            },
+            {
+              "record": 7,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "2"
+            }
+          ]
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 3,
+              "what": "cursor",
+              "row": null,
+              "col": null,
+              "left": "2,0",
+              "right": "3,0"
+            },
+            {
+              "record": 3,
+              "what": "row wrapped",
+              "row": 0,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 3,
+              "what": "row wrapped",
+              "row": 1,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"U\"",
+              "right": "\"K\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"V\"",
+              "right": "\"L\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"W\"",
+              "right": "\"M\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"X\"",
+              "right": "\"N\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"Y\"",
+              "right": "\"O\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"Z\"",
+              "right": "\"P\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"0\"",
+              "right": "\"Q\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"1\"",
+              "right": "\"R\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"2\"",
+              "right": "\"S\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 9,
+              "left": "\"3\"",
+              "right": "\"T\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 0,
+              "left": "\"\"",
+              "right": "\"U\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 1,
+              "left": "\"\"",
+              "right": "\"V\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"W\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"X\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"Y\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"Z\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"0\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"1\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"2\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 9,
+              "left": "\"\"",
+              "right": "\"3\""
+            },
+            {
+              "record": 6,
+              "what": "row wrapped",
+              "row": 0,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"U\"",
+              "right": "\"A\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 1,
+              "left": "\"V\"",
+              "right": "\"B\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"W\"",
+              "right": "\"C\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 3,
+              "left": "\"X\"",
+              "right": "\"D\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"Y\"",
+              "right": "\"E\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 5,
+              "left": "\"Z\"",
+              "right": "\"F\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"0\"",
+              "right": "\"G\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 7,
+              "left": "\"1\"",
+              "right": "\"H\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 8,
+              "left": "\"2\"",
+              "right": "\"I\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 9,
+              "left": "\"3\"",
+              "right": "\"J\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 10,
+              "left": "\"\"",
+              "right": "\"K\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 11,
+              "left": "\"\"",
+              "right": "\"L\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 12,
+              "left": "\"\"",
+              "right": "\"M\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 13,
+              "left": "\"\"",
+              "right": "\"N\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 14,
+              "left": "\"\"",
+              "right": "\"O\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 15,
+              "left": "\"\"",
+              "right": "\"P\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 16,
+              "left": "\"\"",
+              "right": "\"Q\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 17,
+              "left": "\"\"",
+              "right": "\"R\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 18,
+              "left": "\"\"",
+              "right": "\"S\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 19,
+              "left": "\"\"",
+              "right": "\"T\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"a\"",
+              "right": "\"U\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"f\"",
+              "right": "\"V\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"t\"",
+              "right": "\"W\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"e\"",
+              "right": "\"X\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"r\"",
+              "right": "\"Y\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"-\"",
+              "right": "\"Z\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"s\"",
+              "right": "\"0\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"h\"",
+              "right": "\"1\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"r\"",
+              "right": "\"2\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 9,
+              "left": "\"i\"",
+              "right": "\"3\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 0,
+              "left": "\"n\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 1,
+              "left": "\"k\"",
+              "right": "\"f\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"e\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"-\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"s\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"h\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 9,
+              "left": "\"\"",
+              "right": "\"i\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 10,
+              "left": "\"\"",
+              "right": "\"n\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 11,
+              "left": "\"\"",
+              "right": "\"k\""
+            },
+            {
+              "record": 7,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "1"
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"a\"",
+              "right": "\"U\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 1,
+              "left": "\"f\"",
+              "right": "\"V\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"t\"",
+              "right": "\"W\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 3,
+              "left": "\"e\"",
+              "right": "\"X\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"r\"",
+              "right": "\"Y\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 5,
+              "left": "\"-\"",
+              "right": "\"Z\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"s\"",
+              "right": "\"0\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 7,
+              "left": "\"h\"",
+              "right": "\"1\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 8,
+              "left": "\"r\"",
+              "right": "\"2\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 9,
+              "left": "\"i\"",
+              "right": "\"3\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"n\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"k\"",
+              "right": "\"f\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"e\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"-\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"s\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"h\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 9,
+              "left": "\"\"",
+              "right": "\"i\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 10,
+              "left": "\"\"",
+              "right": "\"n\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 11,
+              "left": "\"\"",
+              "right": "\"k\""
+            }
+          ]
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 3,
+              "what": "cursor",
+              "row": null,
+              "col": null,
+              "left": "2,0",
+              "right": "3,0"
+            },
+            {
+              "record": 3,
+              "what": "row wrapped",
+              "row": 0,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 3,
+              "what": "row wrapped",
+              "row": 1,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"U\"",
+              "right": "\"K\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"V\"",
+              "right": "\"L\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"W\"",
+              "right": "\"M\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"X\"",
+              "right": "\"N\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"Y\"",
+              "right": "\"O\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"Z\"",
+              "right": "\"P\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"0\"",
+              "right": "\"Q\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"1\"",
+              "right": "\"R\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"2\"",
+              "right": "\"S\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 1,
+              "col": 9,
+              "left": "\"3\"",
+              "right": "\"T\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 0,
+              "left": "\"\"",
+              "right": "\"U\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 1,
+              "left": "\"\"",
+              "right": "\"V\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"W\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"X\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"Y\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"Z\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"0\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"1\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"2\""
+            },
+            {
+              "record": 3,
+              "what": "cell text",
+              "row": 2,
+              "col": 9,
+              "left": "\"\"",
+              "right": "\"3\""
+            },
+            {
+              "record": 6,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "1",
+              "right": "0"
+            },
+            {
+              "record": 6,
+              "what": "row wrapped",
+              "row": 0,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"U\"",
+              "right": "\"A\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 1,
+              "left": "\"V\"",
+              "right": "\"B\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"W\"",
+              "right": "\"C\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 3,
+              "left": "\"X\"",
+              "right": "\"D\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"Y\"",
+              "right": "\"E\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 5,
+              "left": "\"Z\"",
+              "right": "\"F\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"0\"",
+              "right": "\"G\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 7,
+              "left": "\"1\"",
+              "right": "\"H\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 8,
+              "left": "\"2\"",
+              "right": "\"I\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 9,
+              "left": "\"3\"",
+              "right": "\"J\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 10,
+              "left": "\"\"",
+              "right": "\"K\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 11,
+              "left": "\"\"",
+              "right": "\"L\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 12,
+              "left": "\"\"",
+              "right": "\"M\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 13,
+              "left": "\"\"",
+              "right": "\"N\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 14,
+              "left": "\"\"",
+              "right": "\"O\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 15,
+              "left": "\"\"",
+              "right": "\"P\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 16,
+              "left": "\"\"",
+              "right": "\"Q\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 17,
+              "left": "\"\"",
+              "right": "\"R\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 18,
+              "left": "\"\"",
+              "right": "\"S\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 0,
+              "col": 19,
+              "left": "\"\"",
+              "right": "\"T\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"a\"",
+              "right": "\"U\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"f\"",
+              "right": "\"V\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"t\"",
+              "right": "\"W\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"e\"",
+              "right": "\"X\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"r\"",
+              "right": "\"Y\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"-\"",
+              "right": "\"Z\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"s\"",
+              "right": "\"0\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"h\"",
+              "right": "\"1\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"r\"",
+              "right": "\"2\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 1,
+              "col": 9,
+              "left": "\"i\"",
+              "right": "\"3\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 0,
+              "left": "\"n\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 1,
+              "left": "\"k\"",
+              "right": "\"f\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"e\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"-\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"s\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"h\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 9,
+              "left": "\"\"",
+              "right": "\"i\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 10,
+              "left": "\"\"",
+              "right": "\"n\""
+            },
+            {
+              "record": 6,
+              "what": "cell text",
+              "row": 2,
+              "col": 11,
+              "left": "\"\"",
+              "right": "\"k\""
+            },
+            {
+              "record": 7,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "2",
+              "right": "1"
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 0,
+              "left": "\"a\"",
+              "right": "\"U\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 1,
+              "left": "\"f\"",
+              "right": "\"V\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 2,
+              "left": "\"t\"",
+              "right": "\"W\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 3,
+              "left": "\"e\"",
+              "right": "\"X\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 4,
+              "left": "\"r\"",
+              "right": "\"Y\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 5,
+              "left": "\"-\"",
+              "right": "\"Z\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 6,
+              "left": "\"s\"",
+              "right": "\"0\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 7,
+              "left": "\"h\"",
+              "right": "\"1\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 8,
+              "left": "\"r\"",
+              "right": "\"2\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 0,
+              "col": 9,
+              "left": "\"i\"",
+              "right": "\"3\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 0,
+              "left": "\"n\"",
+              "right": "\"a\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 1,
+              "left": "\"k\"",
+              "right": "\"f\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 2,
+              "left": "\"\"",
+              "right": "\"t\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 3,
+              "left": "\"\"",
+              "right": "\"e\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 4,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 5,
+              "left": "\"\"",
+              "right": "\"-\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 6,
+              "left": "\"\"",
+              "right": "\"s\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 7,
+              "left": "\"\"",
+              "right": "\"h\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 8,
+              "left": "\"\"",
+              "right": "\"r\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 9,
+              "left": "\"\"",
+              "right": "\"i\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 10,
+              "left": "\"\"",
+              "right": "\"n\""
+            },
+            {
+              "record": 7,
+              "what": "cell text",
+              "row": 1,
+              "col": 11,
+              "left": "\"\"",
+              "right": "\"k\""
+            }
+          ]
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 77,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 77,
+          "differences": [
+            {
+              "record": 7,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "2",
+              "right": "0"
+            }
+          ]
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5610,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "scroll-region",
+      "assertions": [
+        {
+          "id": "above-region-untouched",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "region-scrolled-up",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "region-second-scrolled-up",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "region-bottom-new-line",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "below-region-untouched",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "last-row-untouched",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 70,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 70,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5573,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "scrollback",
+      "assertions": [
+        {
+          "id": "scrolled-rows-retained",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "FAIL: scrollback rows: expected \"12\", found \"0\"",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "visible-bottom",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "size-after-shrink",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": [
+            {
+              "record": 3,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "11"
+            },
+            {
+              "record": 4,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "12"
+            }
+          ]
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 3,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "11"
+            },
+            {
+              "record": 4,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "0",
+              "right": "12"
+            }
+          ]
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 79,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 79,
+          "differences": [
+            {
+              "record": 4,
+              "what": "scrollback rows",
+              "row": null,
+              "col": null,
+              "left": "12",
+              "right": "0"
+            }
+          ]
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5671,
+          "differences": []
+        }
+      ]
+    },
+    {
+      "trace": "title-progress",
+      "assertions": [
+        {
+          "id": "latest-title-wins",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "progress-payload",
+          "basis": "spec",
+          "source": "https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "osc-prints-nothing",
+          "basis": "spec",
+          "source": "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": []
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": []
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 58,
+          "differences": [
+            {
+              "record": 2,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"title two\")",
+              "right": "None"
+            }
+          ]
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 58,
+          "differences": [
+            {
+              "record": 2,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"title two\")",
+              "right": "None"
+            }
+          ]
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5579,
+          "differences": [
+            {
+              "record": 2,
+              "what": "title",
+              "row": null,
+              "col": null,
+              "left": "Some(\"title two\")",
+              "right": "None"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trace": "wide-chars",
+      "assertions": [
+        {
+          "id": "wide-first-cell",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "wide-spacer-tail",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "second-wide-cell",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "narrow-after-wide",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "wide-at-last-column-moved",
+          "basis": "spec",
+          "source": "https://www.unicode.org/reports/tr11/",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        },
+        {
+          "id": "final-cursor",
+          "basis": "spec",
+          "source": "https://ecma-international.org/publications-and-standards/standards/ecma-48",
+          "width_method": null,
+          "outcome": {
+            "libghostty": "pass",
+            "vt100": "pass",
+            "vt100-scrollback": "pass"
+          }
+        }
+      ],
+      "pairs": [
+        {
+          "left": "vt100",
+          "right": "vt100-scrollback",
+          "differences": []
+        },
+        {
+          "left": "vt100",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 1,
+              "what": "row wrapped",
+              "row": 1,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            }
+          ]
+        },
+        {
+          "left": "vt100-scrollback",
+          "right": "libghostty",
+          "differences": [
+            {
+              "record": 1,
+              "what": "row wrapped",
+              "row": 1,
+              "col": null,
+              "left": "false",
+              "right": "true"
+            }
+          ]
+        }
+      ],
+      "repaint": [
+        {
+          "model": "vt100",
+          "repaint_bytes": 78,
+          "differences": []
+        },
+        {
+          "model": "vt100-scrollback",
+          "repaint_bytes": 78,
+          "differences": []
+        },
+        {
+          "model": "libghostty",
+          "repaint_bytes": 5572,
+          "differences": []
+        }
+      ]
+    }
+  ]
+}

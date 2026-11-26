@@ -98,10 +98,11 @@ jobs:
             grep -q "ZIG_SHA256: $ZIG_SHA256" "$file" || { echo "::error::$file does not pin the Zig sha256 of this workflow"; exit 1; }
           done
 
-      # A pull request runs the macOS job only when it touches a build input;
-      # a dispatch always runs it. The job-level `if` of the macOS job reads
-      # this output, so no macOS runner starts when the gate is off.
-      - name: Decide whether the macOS job runs
+      # A pull request runs the measurements and the macOS job only when it
+      # touches a build or measurement input; a dispatch always runs them. The
+      # job-level `if` of the macOS job reads this output, so no macOS runner
+      # starts when the gate is off.
+      - name: Decide whether the measurements and the macOS job run
         id: gate
         env:
           EVENT: ${{ github.event_name }}
@@ -110,7 +111,7 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT" = workflow_dispatch ] || git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
-            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|src/(ffi|ghostty|ghostty_model).rs)|.github/workflows/libghostty-spike.yml)'; then
+            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|config/|fixtures/|src/(lib|config|trace|expect|model|replay|report|ffi|ghostty|ghostty_model|vt100_model|registry).rs|src/bin/(size-probe|throughput).rs)|.github/workflows/libghostty-spike.yml)'; then
             echo run=true >> "$GITHUB_OUTPUT"
           else
             echo run=false >> "$GITHUB_OUTPUT"
@@ -179,6 +180,33 @@ jobs:
           cmp "$RUNNER_TEMP/report/report.json" "$RUNNER_TEMP/report-musl/report.json"
           ls -l "$binary" "$RUNNER_TEMP"/ghostty-*/lib/libghostty-vt.a | tee "$RUNNER_TEMP/sizes.txt"
 
+      # Cold release builds of size-probe with and without the feature, binary
+      # sizes, link checks and throughput, per target (scripts/measure). The
+      # numbers describe this runner and are indicative.
+      - name: Measure (glibc and musl)
+        if: steps.gate.outputs.run == 'true'
+        timeout-minutes: 40
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/measurements"
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
+            python3 -I "$SPIKE_DIR/scripts/measure" --target "$target" \
+              --ghostty-dir "$RUNNER_TEMP/ghostty-$target" --runner ubuntu-24.04 \
+              --scratch "$RUNNER_TEMP/measure-$target" \
+              --out "$RUNNER_TEMP/measurements/$target.json" |
+              tee -a "$RUNNER_TEMP/measurements/table.txt"
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.gate.outputs.run == 'true'
+        with:
+          name: spike-measurements-linux
+          path: ${{ runner.temp }}/measurements
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: spike-report-libghostty
@@ -244,3 +272,21 @@ jobs:
           grep -q "minos 14.0" "$RUNNER_TEMP/otool.txt"
           xcodebuild -version
           "$binary" --models vt100,libghostty --out "$RUNNER_TEMP/report-macos"
+
+      - name: Measure (macOS arm64)
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/measurements"
+          python3 -I "$SPIKE_DIR/scripts/measure" --target aarch64-apple-darwin \
+            --ghostty-dir "$RUNNER_TEMP/ghostty" --runner macos-15 \
+            --scratch "$RUNNER_TEMP/measure-macos" \
+            --out "$RUNNER_TEMP/measurements/aarch64-apple-darwin.json" |
+            tee "$RUNNER_TEMP/measurements/table.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spike-measurements-macos
+          path: ${{ runner.temp }}/measurements
+          if-no-files-found: error

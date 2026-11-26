@@ -8,7 +8,8 @@
 //! - [`trace`]: the versioned PTY trace format.
 //! - `record-trace` (binary): runs a command in a real PTY and writes a trace.
 //! - [`expect`]: spec-derived assertions in a `*.expect.toml` sidecar.
-//! - [`model`], [`vt100_model`]: the model interface and the shipped model.
+//! - [`model`], [`vt100_model`], [`registry`]: the model interface, the shipped
+//!   model, the same parser with scrollback, and the models by name.
 //! - [`replay`], [`report`]: replay every fixture through every model and
 //!   list each assertion outcome and each grid difference.
 //! - `ffi`, `ghostty`, `ghostty_model` (feature `libghostty`): the libghostty-vt
@@ -23,6 +24,7 @@
 pub mod config;
 pub mod expect;
 pub mod model;
+pub mod registry;
 pub mod replay;
 pub mod report;
 pub mod trace;

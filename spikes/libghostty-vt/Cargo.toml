@@ -39,3 +39,8 @@ undocumented_unsafe_blocks = "warn"
 # Optimized dev builds keep the replay of every fixture through every model fast.
 [profile.dev]
 opt-level = 2
+
+# The workspace release profile (Cargo.toml of the repository root), so the
+# size and speed numbers describe what the shipped binaries get.
+[profile.release]
+opt-level = 2
