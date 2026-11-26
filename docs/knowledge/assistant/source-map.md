@@ -47,8 +47,9 @@ Current CLI and command surface:
 - `crates/cli/src/commands/setup_host.rs`
 - `crates/cli/src/commands/setup_assistant.rs`
 - `crates/cli/src/commands/upgrade_assistant.rs` — the assistant package step of
-  `pohunek service upgrade`: gate, owner hold, install through the index path of
-  `setup_assistant.rs`, and the `assistant.install` outcome.
+  `pohunek service upgrade`: gate, owner hold, the one listed-digest decision
+  of `setup_assistant.rs` (`decide`), install through its index path, and the
+  `assistant.install` outcome.
 - `crates/cli/src/commands/assistant/mod.rs` — the `assistant_package_missing`
   recovery: a local launch plans through `setup_assistant.rs` against the
   daemon's core version, installs through the daemon's signed plugin index

@@ -88,45 +88,9 @@ impl Rig {
         self.server.set(INDEX_PATH, self.keys.signed(Vec::new()));
     }
 
-    /// Runs `assistant` with `arguments` and returns the exit code, the JSON
-    /// document on stdout and the human text on stderr.
-    ///
-    /// The launch names an explicit agent the daemon does not list, which the
-    /// launcher allows without a capable runtime: `--print-prompt` never
-    /// starts a session, so the agent needs no binary, and the run still walks
-    /// the same `assistant.materialize` path as a launch.
+    /// Runs `assistant` with `arguments`; see [`assistant_index::run_assistant`].
     fn assistant(&self, arguments: &[&str]) -> (i32, Value, String) {
-        let url = self.url();
-        let mut full: Vec<&str> = vec![
-            "assistant",
-            "--agent",
-            "fixture-agent",
-            "--print-prompt",
-            "--no-snapshot",
-            "--no-start-daemon",
-        ];
-        full.extend(arguments.iter().copied());
-        full.push("--json");
-        let output = self
-            .install
-            .env
-            .command(pohunek_test_support::bin_exe("pohunek"))
-            .args(&full)
-            .env("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", &url)
-            .output()
-            .expect("run pohunek assistant");
-        let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-            panic!(
-                "stdout of {full:?} is one JSON document ({error}): {} / {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
-        (
-            output.status.code().expect("exit code"),
-            document,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
+        assistant_index::run_assistant(&self.install.env, &self.url(), arguments)
     }
 
     /// The assistant package versions the daemon lists.
@@ -322,16 +286,23 @@ fn serve_remote_missing_package(
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let served = std::sync::Arc::clone(&served);
-            std::thread::spawn(move || serve_remote_connection(stream, &served));
+            std::thread::spawn(move || serve_remote_connection(stream, &served, false));
         }
     });
 }
 
 /// Serves the fixture answers on any byte stream, a TCP peer for the remote
 /// scenario or a Unix socket for the local one, and records each method.
+/// With `list_fails` the daemon supports index installs of a context package
+/// and refuses `package.list`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the capability document of the fixture daemon is one literal"
+)]
 fn serve_remote_connection<S: std::io::Read + std::io::Write>(
     stream: S,
     served: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    list_fails: bool,
 ) {
     use std::io::{BufRead as _, BufReader};
     let mut reader = BufReader::new(stream);
@@ -364,6 +335,18 @@ fn serve_remote_connection<S: std::io::Read + std::io::Write>(
                 ),
             )
             .expect("valid fixture response")
+        } else if list_fails && request.method() == protocol::method::PACKAGE_LIST {
+            protocol::Response::err(
+                protocol::PROTOCOL_VERSION,
+                request.id(),
+                protocol::ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "package_list_unavailable",
+                    "the package store cannot be listed".to_owned(),
+                    None,
+                ),
+            )
+            .expect("valid fixture response")
         } else if request.method() == protocol::method::HOST_INSPECT {
             protocol::Response::ok(
                 protocol::PROTOCOL_VERSION,
@@ -391,9 +374,9 @@ fn serve_remote_connection<S: std::io::Read + std::io::Write>(
                     "session_remove_tree_supported": false,
                     "session_adopt_supported": false,
                     "package_install_commands_supported": false,
-                    "package_install_index_supported": false,
+                    "package_install_index_supported": list_fails,
                     "package_bind_profile_expected_supported": false,
-                    "package_install_index_context_supported": false,
+                    "package_install_index_context_supported": list_fails,
                     "package_create_profile_supported": false,
                     "package_create_profile_options_supported": false,
                     "package_create_preset_supported": false,
@@ -541,18 +524,18 @@ async fn s4_remote_host_installs_nothing_against_the_index() {
     assert!(rig.listed().await.is_empty(), "nothing installed");
 }
 
-/// A local launch against a daemon that still answers the N-1 placeholder
-/// remedy: the CLI prints the plan's outcome for an empty index, never the
-/// daemon's placeholder text. The scripted daemon owns the socket the CLI
-/// dials; the real daemon of the rig only supplies the trust anchor and the
-/// index.
-#[tokio::test]
-async fn s5_old_daemon_placeholder_hint_never_reaches_the_local_output() {
+/// Binds a scripted daemon on the socket the CLI dials when it runs with the
+/// returned `XDG_RUNTIME_DIR`, and returns the directory and the methods the
+/// daemon served.
+fn serve_scripted_daemon(
+    rig: &Rig,
+    list_fails: bool,
+) -> (
+    std::path::PathBuf,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
     use std::os::unix::fs::PermissionsExt as _;
-    let rig = Rig::start().await;
-    rig.publish_nothing();
-    let root = rig.install.env.root().to_path_buf();
-    let runtime = root.join("old-daemon-run");
+    let runtime = rig.install.env.root().join("old-daemon-run");
     std::fs::create_dir_all(runtime.join("pohunek")).expect("create the socket directory");
     std::fs::set_permissions(
         runtime.join("pohunek"),
@@ -560,16 +543,83 @@ async fn s5_old_daemon_placeholder_hint_never_reaches_the_local_output() {
     )
     .expect("make the socket directory owner-private");
     let listener = std::os::unix::net::UnixListener::bind(runtime.join("pohunek/daemon.sock"))
-        .expect("bind the old daemon socket");
+        .expect("bind the scripted daemon socket");
     let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let accepting = std::sync::Arc::clone(&served);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let served = std::sync::Arc::clone(&accepting);
-            std::thread::spawn(move || serve_remote_connection(stream, &served));
+            std::thread::spawn(move || serve_remote_connection(stream, &served, list_fails));
         }
     });
+    (runtime, served)
+}
+
+/// A daemon that cannot list its packages leaves the plan with a gap, as the
+/// upgrade step does, instead of an install that would replace a selection
+/// the plan could not read.
+#[tokio::test]
+async fn a_list_error_makes_the_setup_plan_a_gap_not_an_install() {
+    let rig = Rig::start().await;
+    rig.publish("0.42.0");
+    let (runtime, served) = serve_scripted_daemon(&rig, true);
+    let url = rig.url();
+    let output = rig
+        .install
+        .env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", &url)
+        .args([
+            "assistant",
+            "--agent",
+            "fixture-agent",
+            "--print-prompt",
+            "--no-snapshot",
+            "--no-start-daemon",
+            "--yes",
+            "--json",
+            "help me",
+        ])
+        .output()
+        .expect("run pohunek assistant");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{combined}");
+    assert!(
+        combined.contains("the package store cannot be listed"),
+        "the list error is the gap: {combined}"
+    );
+    let served = served.lock().expect("served requests").clone();
+    assert!(
+        served
+            .iter()
+            .any(|served| served == protocol::method::PACKAGE_LIST),
+        "the plan asked the daemon to list: {served:?}"
+    );
+    assert!(
+        !served
+            .iter()
+            .any(|served| served == protocol::method::PACKAGE_INSTALL),
+        "nothing was installed: {served:?}"
+    );
+    assert!(rig.listed().await.is_empty(), "nothing installed");
+}
+
+/// A local launch against a daemon that still answers the N-1 placeholder
+/// remedy: the CLI prints the plan's outcome for an empty index, never the
+/// daemon's placeholder text. The scripted daemon owns the socket the CLI
+/// dials; the real daemon of the rig only supplies the trust anchor and the
+/// index.
+#[tokio::test]
+async fn s5_old_daemon_placeholder_hint_never_reaches_the_local_output() {
+    let rig = Rig::start().await;
+    rig.publish_nothing();
+    let (runtime, served) = serve_scripted_daemon(&rig, false);
     let url = rig.url();
     let output = rig
         .install

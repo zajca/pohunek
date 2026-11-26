@@ -3151,7 +3151,8 @@ login shell fails, hangs or prints junk or yields no usable directory (the
 fallback list never replaces a recorded path), `service_search_path_unmanaged`
 where the host records no path, `service_refresh_blocked_by_transaction` while an
 install or upgrade record is pending, `service_refresh_config_schema` for a `service.toml` of another
-schema than this release writes (nothing is rewritten; run the installed release's own
+schema than this release writes (`service check` and `service upgrade` give it for a
+pending `refresh-path` record over such a file; nothing is rewritten; run the installed release's own
 `refresh-path` when it has the command, otherwise stop the live sessions, save a copy of `service.toml`, uninstall, install the
 installed version from its archive with the same `--prefix`, reapply the non-default settings
 except the recorded `search_path`, and rerun the upgrade), and `service_not_installed`. A set but relative `$SHELL`, or a
@@ -3183,10 +3184,13 @@ selected one, so `pohunek plugin select pohunek.context.assistant --digest
 <replaced_digest>` selects it again), `detail` and `command`; the fields that do
 not apply are `null`. `result` is one of:
 
-- `installed`: a newer version is installed and selected in one registry commit;
+- `installed`: the listed version is installed and selected in one registry commit;
   the old version stays installed. The daemon verifies the signed index and the
-  archive digest for it, as for `pohunek setup`;
-- `not_published`: the index lists no version newer than the selected one for the
+  archive digest for it, as for `pohunek setup`. It is also the result for a
+  selected version that does not serve (a damaged root, or a revoked digest other
+  than the listed one) and is not older than the listing: setup and the upgrade
+  replace it with the listed version. A revoked listed digest is `failed`;
+- `not_published`: the index lists no version newer than the selected, serving one for the
   new core and this host's platform (the package is published after the core
   release, and the official index lists it only once it is admitted), so the old
   package is kept;
@@ -3195,10 +3199,12 @@ not apply are `null`. `result` is one of:
   is selected (no index request is made), or the listed version is installed
   and not selected or disabled (found after the index is read; a daemon
   install of an installed digest keeps its recorded state, so only
-  `plugin select` changes the selection, and the step changes none); `command` names the
-  `plugin enable` and `plugin select` steps;
+  `plugin select` changes the selection, and the step changes none); `command` names
+  `plugin select`, preceded by `plugin enable` when the digest is disabled;
 - `failed`: the index or the archive could not be fetched, or the index or the
-  digest was refused (`detail` carries the reason); the daemon installs nothing
+  digest was refused, the listed digest is revoked, a faulted listed digest was
+  installed again and is not the selected package, or the daemon could not list
+  its packages (`detail` carries the reason); the daemon installs nothing
   it did not verify, `status` and `version` are read after the attempt and
   `command` is `pohunek setup`;
 - `skipped`: `--no-assistant-package` was given; no index request was made.

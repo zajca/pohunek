@@ -13,7 +13,7 @@ use crate::client::Client;
 use crate::commands::plugin::{self, Error};
 use crate::commands::plugin_index;
 use crate::commands::service::assistant_state;
-use crate::commands::setup_assistant::{self, PACKAGE_ID, UPDATE_COMMAND};
+use crate::commands::setup_assistant::{self, Decision, PACKAGE_ID, UPDATE_COMMAND};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::service::report::{
@@ -140,10 +140,6 @@ async fn install(
             Some(hold.command),
         );
     }
-    let selected = listed
-        .packages
-        .iter()
-        .find(|info| info.selected && info.package.id.to_string() == PACKAGE_ID);
     let wanted = match setup_assistant::request(None) {
         Ok(wanted) => wanted,
         Err(error) => return failed(error.to_string()),
@@ -161,45 +157,26 @@ async fn install(
         Err(error) => return failed(error.to_string()),
     };
     let version = resolved.version.to_string();
-    if selected_version.is_some_and(|current| !setup_assistant::is_older(current, &version)) {
-        return not_published(core, selected_version);
-    }
     let digest = resolved.digest.as_str().to_owned();
-    let installed = listed.packages.iter().find(|info| {
-        info.package.id == resolved.id
-            && info.digest == resolved.digest
-            && info.fault.is_none()
-            && !info.revoked
-    });
-    if let Some(held) = installed {
-        // The listed digest is already installed: a daemon install of it keeps
-        // the recorded state, so only the owner's `plugin select` changes the
-        // selection, as after `pohunek setup`.
-        let (state, command) = if held.enabled {
-            (
-                "not selected",
-                format!("pohunek plugin select {PACKAGE_ID} --digest {digest}"),
-            )
-        } else {
-            (
-                "disabled",
-                format!(
-                    "pohunek plugin enable {PACKAGE_ID} --digest {digest} && pohunek plugin select {PACKAGE_ID} --digest {digest}"
-                ),
-            )
-        };
-        return outcome(
+    match setup_assistant::decide(&listed.packages, &resolved) {
+        Decision::Keep(_) => not_published(core, selected_version),
+        Decision::Revoked(detail) => failed(detail),
+        Decision::Held(hold) => outcome(
             AssistantInstallResult::Held,
             Some(format!(
-                "version {} is installed but {state}, which the upgrade leaves as it is",
-                held.package.version
+                "{}, which the upgrade leaves as it is",
+                hold.detail
             )),
-            Some(command),
-        );
-    }
-    match setup_assistant::install(&mut client, &version, &digest, options.index_url, None).await {
-        Ok(()) => installed_outcome(version, digest, selected),
-        Err(detail) => failed(detail),
+            Some(hold.command),
+        ),
+        Decision::Install { replaces } => {
+            match setup_assistant::install(&mut client, &version, &digest, options.index_url, None)
+                .await
+            {
+                Ok(()) => installed_outcome(version, digest, replaces),
+                Err(detail) => failed(detail),
+            }
+        }
     }
 }
 

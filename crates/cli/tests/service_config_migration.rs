@@ -809,56 +809,92 @@ fn a_written_migration_verifies_whatever_cache_directory_the_resume_resolves() {
     );
 }
 
-/// An interrupted `refresh-path` of a schema-7 installation is judged by the
-/// adoption gate with the recorded search path the rollback restores; the
-/// judged copy revalidates every key, so the gate derives the session
-/// temporary root for it instead of failing on an unrecorded one.
+/// Journals a `refresh-path` interrupted before it replaced the daemon job,
+/// over the file whose exact bytes are `source`.
+fn pending_refresh(config: &Path, state: &Path, source: &[u8]) {
+    let digest = format!("{:x}", sha2::Sha256::digest(source));
+    let record = Record {
+        schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
+        operation: Operation::RefreshPath,
+        version: "0.36.0".to_owned(),
+        prefix: config
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("fixture root")
+            .join("prefix"),
+        // The checked version itself, so the rollback swaps no daemon and the
+        // adoption preflight, which needs a service manager, is not asked.
+        previous_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        version_dir_preexisted: true,
+        config_backup: None,
+        step: Step::Started,
+        rolling_back: false,
+        runtime_stop: false,
+        runtime_backup: None,
+        launchd_default_path: None,
+        launchd_boot_identity: None,
+        accepted_risks: None,
+        refresh: Some(pohunek_cli::service::record::RefreshJournal {
+            previous: vec!["/usr/bin".into()],
+            target: vec!["/usr/bin".into(), "/bin".into()],
+            digest_before: digest.clone(),
+            digest_after: digest,
+            daemon_before: None,
+        }),
+    };
+    Store::new(state.to_path_buf())
+        .save(&record)
+        .expect("journal the interrupted refresh");
+}
+
+/// An interrupted `refresh-path` over a schema-7 file is refused by the check
+/// with the code and hint the upgrade's rollback gives: the rollback reads the
+/// file with the strict current-schema reader, so the check does not plan it
+/// as a clean roll back.
 #[test]
-fn check_judges_a_pending_refresh_over_a_schema_seven_config_without_a_root_error() {
+fn check_refuses_a_pending_refresh_over_a_schema_seven_config_like_the_upgrade() {
     let host = Host::schema_seven_with_waits(120_000, 2_700_000);
-    let (_success, envelope) = check_with_setup(&host, |config, state, source| {
-        let digest = format!("{:x}", sha2::Sha256::digest(source));
-        let record = Record {
-            schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
-            operation: Operation::RefreshPath,
-            version: "0.36.0".to_owned(),
-            prefix: config
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::parent)
-                .expect("fixture root")
-                .join("prefix"),
-            previous_version: Some("0.36.0".to_owned()),
-            version_dir_preexisted: true,
-            config_backup: None,
-            step: Step::Started,
-            rolling_back: false,
-            runtime_stop: false,
-            runtime_backup: None,
-            launchd_default_path: None,
-            launchd_boot_identity: None,
-            accepted_risks: None,
-            refresh: Some(pohunek_cli::service::record::RefreshJournal {
-                previous: vec!["/usr/bin".into()],
-                target: vec!["/usr/bin".into(), "/bin".into()],
-                digest_before: digest.clone(),
-                digest_after: digest,
-                daemon_before: None,
-            }),
-        };
-        Store::new(state.to_path_buf())
-            .save(&record)
-            .expect("journal the interrupted refresh");
-    });
-    let message = envelope
-        .get("err")
-        .and_then(|refusal| refusal.get("msg"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    assert!(
-        !message.contains("session_tmp_root"),
-        "{envelope}: the gate does not fail on an unrecorded root"
+    let (success, envelope) = check_with_setup(&host, pending_refresh);
+    assert!(!success, "{envelope}");
+    let refusal = envelope.get("err").expect("the refusal document");
+    assert_eq!(
+        refusal.get("code").and_then(Value::as_str),
+        Some("service_refresh_config_schema"),
+        "{envelope}"
     );
+    assert!(
+        refusal
+            .get("recover")
+            .and_then(Value::as_str)
+            .is_some_and(|hint| hint.contains("service refresh-path")),
+        "{envelope}: the hint names the installed release's refresh-path"
+    );
+}
+
+/// The same interrupted `refresh-path` over a current-schema file is rolled
+/// back by the upgrade, so the check does not refuse it for the schema. The
+/// check may stop at the service manager on a host without a user manager;
+/// the schema refusal is the one it must not give.
+#[test]
+fn check_does_not_refuse_a_pending_refresh_over_a_current_schema_config() {
+    let host = Host::current_with_waits(120_000, 2_700_000);
+    let (success, envelope) = check_with_setup(&host, pending_refresh);
+    let code = envelope
+        .get("err")
+        .and_then(|refusal| refusal.get("code"))
+        .and_then(Value::as_str);
+    assert_ne!(code, Some("service_refresh_config_schema"), "{envelope}");
+    assert_ne!(code, Some("service_config_invalid"), "{envelope}");
+    if success {
+        let report = &envelope["ok"];
+        assert_eq!(report["operation"], "upgrade", "{envelope}");
+        assert_eq!(report["pending_action"], "roll_back", "{envelope}");
+        assert_eq!(
+            report["pending_transaction"]["operation"], "refresh_path",
+            "{envelope}"
+        );
+    }
 }
 
 /// A command that never writes the file reads a schema-7 file whatever the

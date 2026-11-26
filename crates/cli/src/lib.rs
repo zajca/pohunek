@@ -38,11 +38,15 @@ pub mod upgrade_assistant {
     //! commits the upgrade, so the seam is the action minus the engine. The
     //! full binary cannot stage an older-to-newer core change in-process (the
     //! engine's version override is a builder the binary never reaches), and
-    //! `tests/release_upgrade.rs` is opt-in on Linux (`POHUNEK_SYSTEMD_E2E=1`)
-    //! and stages neither an older assistant package selected before the swap
-    //! nor a stopped daemon after it. `tests/assistant_package_upgrade.rs`
-    //! therefore drives [`reconcile`] against a daemon of the harness, and runs
-    //! the real binary for the rows that need no committed upgrade.
+    //! `tests/release_upgrade.rs` is opt-in on Linux (`POHUNEK_SYSTEMD_E2E=1`),
+    //! runs the real command with `--no-assistant-package` and asserts that
+    //! row (the opt-out report of an answering daemon). It stages neither an
+    //! older assistant package selected before the swap, nor a revoked or
+    //! faulted listed digest, nor a stopped daemon after the swap, nor a
+    //! loopback plugin index. `tests/assistant_package_upgrade.rs` therefore
+    //! drives [`reconcile`] against a daemon of the harness for the Outdated,
+    //! unordered and Unchecked rows and the index rows, and runs the real
+    //! binary for the rows that need no committed upgrade.
     use crate::paths::Paths;
     use crate::service::report::AssistantPackageReport;
 

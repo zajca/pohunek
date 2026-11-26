@@ -409,10 +409,23 @@ fn parse_envelope(stdout: &str, success: bool) -> Result<Value, String> {
     }
 }
 
+/// What the `assistant` object of a `service upgrade --json` payload must say.
+#[derive(Debug, Clone, Copy)]
+enum AssistantRow {
+    /// A previous release's report has no assistant step.
+    NotReported,
+    /// The head's run with `--no-assistant-package`: the daemon was asked, the
+    /// opt-out is reported and nothing is installed or asked of the plugin
+    /// index, so the release workflow stays offline and independent of the live
+    /// index.
+    OptedOut,
+}
+
 /// Checks a `service upgrade --json` payload. v0.33.1's report has no
 /// `accepted_runtime_loss` (nor `preflight`); an absent field means nothing
-/// was accepted, while an explicit `true` is refused.
-fn assert_upgrade_report(report: &Value, from: &str, to: &str) {
+/// was accepted, while an explicit `true` is refused. `assistant` is the state
+/// the real `service upgrade --from` run reports for the assistant package.
+fn assert_upgrade_report(report: &Value, from: &str, to: &str, assistant: AssistantRow) {
     assert_eq!(
         report["unchanged"], false,
         "the daemon was not swapped: {report}"
@@ -424,25 +437,46 @@ fn assert_upgrade_report(report: &Value, from: &str, to: &str) {
         Some(&Value::Bool(true)),
         "the upgrade accepted runtime loss: {report}"
     );
+    match assistant {
+        AssistantRow::NotReported => {}
+        AssistantRow::OptedOut => assert_assistant_opted_out(report, to),
+    }
 }
 
-/// Checks that the head's `service upgrade --no-assistant-package` ran the
-/// assistant package step, reported the opt-out and asked no plugin index, so
-/// the release workflow stays offline and independent of the live index.
-fn assert_assistant_step_skipped(report: &Value) {
+/// Checks the `assistant` object of the head's `service upgrade
+/// --no-assistant-package` run.
+fn assert_assistant_opted_out(report: &Value, to: &str) {
     let assistant = &report["assistant"];
     assert_eq!(
         assistant["package_id"], "pohunek.context.assistant",
         "the upgrade carries the assistant package state: {report}"
     );
+    assert_eq!(assistant["core_version"], to, "{report}");
     assert_ne!(
         assistant["status"], "unchecked",
-        "the upgraded daemon answered: {report}"
+        "the upgraded daemon answered, so the state is not `unchecked`: {report}"
     );
+    // The harness stages no assistant package, so the upgraded daemon lists none.
+    assert_eq!(assistant["status"], "absent", "{report}");
+    assert!(
+        assistant["version"].is_null(),
+        "no version is staged: {report}"
+    );
+    let install = &assistant["install"];
     assert_eq!(
-        assistant["install"]["result"], "skipped",
+        install["result"], "skipped",
         "the opt-out is reported and nothing is installed: {report}"
     );
+    assert_eq!(install["command"], "pohunek setup", "{report}");
+    assert!(
+        install["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("--no-assistant-package")),
+        "the detail names the opt-out: {report}"
+    );
+    for field in ["version", "digest", "replaced_version", "replaced_digest"] {
+        assert!(install[field].is_null(), "{field} stays empty: {report}");
+    }
 }
 
 /// Inputs and paths of one run.
@@ -2261,8 +2295,12 @@ impl Upgrade {
             "--json",
         ]);
         eprintln!("service upgrade: {report}");
-        assert_upgrade_report(&report, &self.previous_version, &self.head_version);
-        assert_assistant_step_skipped(&report);
+        assert_upgrade_report(
+            &report,
+            &self.previous_version,
+            &self.head_version,
+            AssistantRow::OptedOut,
+        );
         // After an apply the upgrade's preflight is the judgement against the
         // installed packages, which carries no plan; `service check` above
         // carries the plan and `runtimes` below the applied step.
@@ -2740,7 +2778,66 @@ mod tests {
     #[test]
     fn the_v0_33_1_upgrade_report_is_accepted_without_the_newer_fields() {
         let report = parse_envelope(V0331_UPGRADE, true).expect("upgrade envelope");
-        assert_upgrade_report(&report, "0.33.0", "0.33.1");
+        assert_upgrade_report(&report, "0.33.0", "0.33.1", AssistantRow::NotReported);
+    }
+
+    /// `service upgrade --no-assistant-package --json` of the head: the
+    /// `UpgradeReport` of `crates/cli/src/service/report.rs` with the
+    /// `assistant` object of an upgraded daemon that has no assistant package.
+    const HEAD_UPGRADE: &str = r#"{"cli_version":"0.46.0","protocol":{"minimum":8,"maximum":8},
+        "ok":{"from_version":"0.45.0","to_version":"0.46.0","unchanged":false,"resumed":false,
+        "rolled_back":null,"removed_versions":[],"kept_versions":[],"gc_error":null,
+        "accepted_runtime_loss":false,
+        "assistant":{"package_id":"pohunek.context.assistant","status":"absent","version":null,
+        "core_version":"0.46.0","detail":null,"command":null,
+        "install":{"result":"skipped","version":null,"digest":null,"replaced_version":null,
+        "replaced_digest":null,"detail":"--no-assistant-package was given",
+        "command":"pohunek setup"}}}}"#;
+
+    #[test]
+    fn the_head_upgrade_report_carries_the_opted_out_assistant_step() {
+        let report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "the upgrade carries the assistant package state")]
+    fn a_head_report_without_the_assistant_step_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report.as_object_mut().expect("report").remove("assistant");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "the state is not `unchecked`")]
+    fn an_unchecked_assistant_state_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report["assistant"]["status"] = Value::from("unchecked");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "\"absent\"")]
+    fn a_staged_state_other_than_absent_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report["assistant"]["status"] = Value::from("current");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "no version is staged")]
+    fn a_version_in_the_unstaged_assistant_state_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report["assistant"]["version"] = Value::from("0.46.0");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "the opt-out is reported and nothing is installed")]
+    fn an_assistant_install_that_ran_despite_the_opt_out_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report["assistant"]["install"]["result"] = Value::from("installed");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
     }
 
     #[test]
@@ -2748,7 +2845,7 @@ mod tests {
     fn an_explicit_runtime_loss_acceptance_is_refused() {
         let mut report = parse_envelope(V0331_UPGRADE, true).expect("upgrade envelope");
         report["accepted_runtime_loss"] = Value::Bool(true);
-        assert_upgrade_report(&report, "0.33.0", "0.33.1");
+        assert_upgrade_report(&report, "0.33.0", "0.33.1", AssistantRow::NotReported);
     }
 
     #[test]
@@ -2756,7 +2853,7 @@ mod tests {
     fn an_unchanged_upgrade_is_refused() {
         let mut report = parse_envelope(V0331_UPGRADE, true).expect("upgrade envelope");
         report["unchanged"] = Value::Bool(true);
-        assert_upgrade_report(&report, "0.33.0", "0.33.1");
+        assert_upgrade_report(&report, "0.33.0", "0.33.1", AssistantRow::NotReported);
     }
 
     #[test]

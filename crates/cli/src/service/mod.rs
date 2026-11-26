@@ -438,6 +438,16 @@ async fn finish_check(
         checked.report.warnings.extend(warnings);
         checked.report.warnings.extend(gated.warnings);
     }
+    // The upgrade judges the adoption preflight before it rolls the refresh
+    // back, so a file of another schema is refused after that gate, as install
+    // and upgrade refuse it.
+    if checked
+        .pending
+        .as_ref()
+        .is_some_and(|record| record.operation == record::Operation::RefreshPath)
+    {
+        refresh::load_installed_config(context)?;
+    }
     Ok(checked.report)
 }
 

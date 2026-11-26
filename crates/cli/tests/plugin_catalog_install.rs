@@ -98,12 +98,12 @@ check = "none"
 }
 
 /// A package archive on disk with the digest the daemon will see.
-struct Built {
-    path: PathBuf,
-    digest: PackageDigest,
+pub(crate) struct Built {
+    pub(crate) path: PathBuf,
+    pub(crate) digest: PackageDigest,
 }
 
-fn entry_for(built: &Built, version: &str, platform: &str, core: &str) -> CatalogEntry {
+pub(crate) fn entry_for(built: &Built, version: &str, platform: &str, core: &str) -> CatalogEntry {
     CatalogEntry {
         package_id: PackageId::parse(PACKAGE_ID).expect("package id"),
         runtime_id: RuntimeId::parse(RUNTIME).expect("runtime id"),
@@ -248,7 +248,7 @@ impl Install {
         }
     }
 
-    fn archive(&self, version: &str) -> Built {
+    pub(crate) fn archive(&self, version: &str) -> Built {
         let entries = [
             ArchiveEntry {
                 path: "runtime.toml".to_owned(),
@@ -311,7 +311,7 @@ impl Install {
     }
 
     /// `plugin install <archive> --catalog <catalog> --yes`.
-    async fn install_catalog(&self, built: &Built, catalog: &Path) -> (i32, Value) {
+    pub(crate) async fn install_catalog(&self, built: &Built, catalog: &Path) -> (i32, Value) {
         self.json(&[
             "plugin",
             "install",
