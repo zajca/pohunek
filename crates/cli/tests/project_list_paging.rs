@@ -134,6 +134,8 @@ async fn a_project_set_larger_than_one_response_is_listed_completely_by_the_cli(
         .map(|project| project["id"].as_str().expect("project id").to_owned())
         .collect();
     assert_eq!(listed_ids, ids(&projects));
+
+    harness.stop().await;
 }
 
 #[tokio::test]
@@ -153,6 +155,8 @@ async fn a_page_whose_projects_exceed_one_response_is_a_typed_error() {
             .is_some_and(|hint| hint.contains("cursor")),
         "{error:?}"
     );
+
+    harness.stop().await;
 }
 
 #[tokio::test]
@@ -173,6 +177,8 @@ async fn limit_and_cursor_walk_the_set_in_label_order() {
         json!({ "limit": PAGE, "cursor": cursor_after(&projects[2 * PAGE - 1]) }),
     ));
     assert_eq!(third, all[2 * PAGE..]);
+
+    harness.stop().await;
 }
 
 #[tokio::test]
@@ -191,4 +197,6 @@ async fn a_zero_limit_and_a_foreign_cursor_are_refused() {
 
     assert_eq!(zero.code, "bad_request", "{zero:?}");
     assert_eq!(foreign.code, "bad_request", "{foreign:?}");
+
+    harness.stop().await;
 }
