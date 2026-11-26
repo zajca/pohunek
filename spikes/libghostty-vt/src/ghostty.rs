@@ -538,7 +538,7 @@ impl HeadlessTerminal {
     ///
     /// Returns a [`GhosttyError`] when formatting fails.
     pub fn format_plain(&self) -> Result<Vec<u8>, GhosttyError> {
-        self.format(ffi::FORMATTER_FORMAT_PLAIN, 0)
+        self.format(ffi::FORMATTER_FORMAT_PLAIN, 0, None)
     }
 
     /// A byte stream that recreates the screen, with cursor, modes, styles,
@@ -547,11 +547,20 @@ impl HeadlessTerminal {
     /// # Errors
     ///
     /// Returns a [`GhosttyError`] when formatting fails.
-    pub fn format_vt(&self) -> Result<Vec<u8>, GhosttyError> {
-        self.format(ffi::FORMATTER_FORMAT_VT, ffi::FORMATTER_EXTRAS_ALL)
+    pub fn format_vt(&self, unwrap: bool, trim: bool) -> Result<Vec<u8>, GhosttyError> {
+        self.format(
+            ffi::FORMATTER_FORMAT_VT,
+            ffi::FORMATTER_EXTRAS_ALL,
+            Some((unwrap, trim)),
+        )
     }
 
-    fn format(&self, format: c_int, extras: u32) -> Result<Vec<u8>, GhosttyError> {
+    fn format(
+        &self,
+        format: c_int,
+        extras: u32,
+        line_options: Option<(bool, bool)>,
+    ) -> Result<Vec<u8>, GhosttyError> {
         let mut formatter: ffi::Formatter = ptr::null_mut();
         // SAFETY: `handle` is live; a NULL allocator selects the default.
         check("formatter_new", unsafe {
@@ -574,6 +583,17 @@ impl HeadlessTerminal {
                     ptr::from_ref(&extras).cast(),
                 )
             })?;
+            if let Some((unwrap, trim)) = line_options {
+                for (option, value, operation) in [
+                    (ffi::FORMATTER_OPT_UNWRAP, unwrap, "formatter_set unwrap"),
+                    (ffi::FORMATTER_OPT_TRIM, trim, "formatter_set trim"),
+                ] {
+                    // SAFETY: UNWRAP and TRIM take a `bool`.
+                    check(operation, unsafe {
+                        ffi::ghostty_formatter_set(formatter, option, ptr::from_ref(&value).cast())
+                    })?;
+                }
+            }
             let mut out: *mut u8 = ptr::null_mut();
             let mut len = 0_usize;
             // SAFETY: the buffer is allocated by libghostty with the default allocator.

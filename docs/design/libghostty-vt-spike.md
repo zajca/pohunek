@@ -19,15 +19,20 @@ so it outlives workflow artifacts.
   stripped `pohunek-sessiond` on Linux and 1.5 to 1.6 minutes of cold Zig build
   locally (2.8 to 2.9 minutes on the CI runners). It links statically on musl, adds no C++ runtime symbol, stays under
   the glibc ceiling and links on macOS arm64 with `minos 14.0`.
-- It is not adoptable yet because adoption criteria 2 and 3 fail. For criterion 3, the repaint that
-  attach depends on does not round-trip on 5 of 13 traces (emoji clusters,
-  soft-wrap flags, scrollback and reflow after a resize). The measured wins
-  over `vt100` are mostly properties `vt100` cannot observe, scrollback (which
-  `vt100` with a scrollback buffer also passes) and emoji widths that the one
-  recorded agent trace does not exercise.
-- Criteria 2 and 3 fail, so the product decision is: keep `vt100`, keep `vte` as the print
-  observer, do not start the adoption sequence (A1 to A5 of the plan), and
-  revisit when the open items below are closed.
+- It is not adoptable yet because adoption criterion 2 fails: the measured
+  wins over `vt100` are mostly properties `vt100` cannot observe, scrollback
+  (which `vt100` with a scrollback buffer also passes) and emoji widths that
+  the one recorded agent trace does not exercise.
+- The repaint that attach depends on is not a libghostty defect. With the
+  formatter's default options it differs on 5 of 13 traces; all but one of
+  those traces are closed by two formatter options (`UNWRAP` on,
+  `TRIM` off), which the harness now uses. One trace is left (`emoji-width`):
+  a screen whose rows were written under different mode 2027 settings cannot
+  be replayed as one text stream. Criterion 3 therefore holds on 12 of 13
+  traces, and the owner decides whether the 13th is in scope.
+- The product decision is: keep `vt100`, keep `vte` as the print observer,
+  do not start the adoption sequence (A1 to A5 of the plan), and revisit when
+  the open items below are closed.
 
 ## Method
 
@@ -64,8 +69,10 @@ group.
 | `wide-chars` | East Asian wide characters, one at the last column | 6 | UAX 11, ECMA-48 |
 
 **Repaint round trip.** Each model's repaint (`TerminalSnapshot::ansi` for
-`vt100`, the VT formatter with all extras for libghostty) is fed to a fresh
-instance of the same model and the two final screens are diffed. OSC 52 writes
+`vt100`, the VT formatter with all extras for libghostty, with the options of
+`ghostty_repaint_*` in `config/model.toml`) is fed to a fresh instance of the
+same model, created at the size of the source, and the two final screens are
+diffed. OSC 52 writes
 and progress are not screen state and are left out.
 
 **Measurements.** `scripts/measure` builds `size-probe` and `throughput` cold
@@ -130,22 +137,60 @@ model of the same kind):
 |---|---|---|---|
 | `claude` | 1 (title) | 1 (title) | 0 |
 | `emoji-width` | 0 | 0 | 17 |
-| `hyperlink-wrap` | 0 | 0 | 1 (row 0 soft-wrap flag) |
-| `resize-wrap` | 0 | 1 | 49 |
-| `scrollback` | 0 | 1 | 12 |
+| `hyperlink-wrap` | 0 | 0 | 0 |
+| `resize-wrap` | 0 | 1 | 0 |
+| `scrollback` | 0 | 1 | 0 |
 | `title-progress` | 1 (title) | 1 (title) | 1 (title) |
-| `wide-chars` | 0 | 0 | 1 (row 1 soft-wrap flag) |
+| `wide-chars` | 0 | 0 | 0 |
 | other 6 traces | 0 | 0 | 0 |
 
 The title differences are not repaint failures: neither model's ANSI repaint
 carries the title, which `TerminalSnapshot` transports as its own field. Without
-them `vt100` has no difference, and libghostty differs on 5 of 13 traces. The
+them `vt100` has no difference, and libghostty differs on 1 of 13 traces. The
 `vt100` figure is a weaker claim than it looks: its model has no scrollback,
-so there is nothing to lose. The libghostty differences are measured, not
-root-caused: the VT formatter was run with all extras and its default
-`UNWRAP` and `TRIM` options, and mode 2027 was left off. Whether other
-formatter options or enabling mode 2027 in the fresh instance close them was
-not tried.
+so there is nothing to lose, and `vt100-scrollback` keeps its history out of
+`TerminalSnapshot::ansi`, which is why it differs on `scrollback` and
+`resize-wrap`. The libghostty repaint carries the history rows.
+
+**Root cause of the libghostty repaint differences.** The formatter was first
+run with all extras and its default options (`UNWRAP` off, `TRIM` on). Each
+option was then varied alone and together; mode 2027 was enabled in the fresh
+instance by writing `CSI ? 2027 h` before the repaint. Traces that differ:
+
+| Formatter options | `emoji-width` | `hyperlink-wrap` | `resize-wrap` | `scrollback` | `wide-chars` | Traces |
+|---|---|---|---|---|---|---|
+| default (`UNWRAP` off, `TRIM` on) | 17 | 1 | 49 | 12 | 1 | 5 |
+| `UNWRAP` on | 17 | 0 | 50 | 12 | 0 | 3 |
+| `TRIM` off | 17 | 1 | 0 | 0 | 1 | 3 |
+| `UNWRAP` on, `TRIM` off | 17 | 0 | 0 | 0 | 0 | 1 |
+
+Writing `CSI ? 2027 h` to the fresh instance changes no count in any row of
+this table. The fresh instance has a source-sized grid in every variant.
+
+- `hyperlink-wrap`, `wide-chars` (row wrap flag): with `UNWRAP` off the
+  formatter writes every screen row as its own line, so the fresh terminal
+  does not mark the soft-wrapped rows as wrapped. `UNWRAP` on writes a
+  wrapped line as one line, which the fresh terminal wraps again at the same
+  width. Closed by configuration.
+- `resize-wrap`, `scrollback` (retained rows and shifted cells): with `TRIM`
+  on the formatter drops blank rows at the end of the output, so the fresh
+  terminal lays history and screen out one row off (12 against 11 retained
+  rows). The formatter header documents that VT output with trimming off
+  keeps those rows "so the output fills the same rows as the screen".
+  Closed by configuration.
+- `emoji-width` (17 differences, rows 0, 3 and 5): the trace writes the same
+  text under `CSI ? 2027 l` and `CSI ? 2027 h`. The rows written with the mode
+  off hold one cell per code point, the rows written with it on hold one
+  cluster. A cell does not record the width method it was written under, and
+  the formatter emits the text of every row plus one final mode state
+  (extra `MODES`), so the rows of the other method come back with the wrong
+  cells. The rows written under the final mode state (1, 2 and 6) round-trip.
+  This is a property of a text repaint, not a defect in the library, and no
+  formatter option addresses it. A screen that keeps one width method round
+  trips; a program that switches the mode between rows of one screen does not.
+
+The configured repaint is larger, 5.6 KB on an 8x20 screen against 0.1 KB for
+`vt100`, because trimming is off and the extras are all on.
 
 **Agent trace.** The recorded Claude Code session replays with identical cells in
 `vt100` and libghostty; the only difference is the title. It is one short trace
@@ -235,7 +280,7 @@ report it.
 |---|---|---|---|
 | 1 | No assertion regressions | **Met.** Every assertion `vt100` passes, libghostty passes. | 59 / 59 against 49 / 59 |
 | 2 | Measured wins on the motivating cases | **Not met.** Wide and emoji: 3 width-method wins, but only count together with criterion 4, and the agent trace has no such content. Combining marks: no win, both pass. Soft-wrap reflow: libghostty reflows, but no neutral assertion exists, so it is a difference, not a measured win. Scrollback: libghostty passes, and so does `vt100-scrollback`, so scrollback alone does not justify adoption. | D2 tables |
-| 3 | Repaint fidelity | **Not met.** Zero differences on every fixture is required; libghostty differs on 5 of 13 traces excluding titles. | repaint table |
+| 3 | Repaint fidelity | **Met on 12 of 13 traces, not on `emoji-width`.** Zero differences on every fixture is required. The five differing traces of the default formatter options: four are closed by `UNWRAP` on and `TRIM` off (the harness uses them). The remaining 17 differences come from rows written under different mode 2027 settings in one screen, which a text repaint cannot carry. The owner decides whether that case is in scope. | repaint table, formatter options table |
 | 4 | Agent TUI parity | **Met for the one trace**: the visible text is identical; the only difference is the title. | `claude` pairwise section |
 | 5 | Linking | **Met.** musl static, no C++ runtime symbol, no duplicate symbol, glibc 2.39 at most (ceiling 2.41), macOS arm64 with `minos 14.0` and no warning. | link table, runs 45794204949 and 45804222731 |
 | 6 | Cost thresholds (owner, 2026-11-26) | **Met on the measured targets; open for macOS arm64 `pohunek-sessiond` size.** Size +1.82 MiB per Linux target (limit +3 MiB). Cold build: Zig build 1.5 to 1.6 min locally and 2.8 to 2.9 min on the CI runners (macOS arm64: 2.9 min, cross build on Linux), plus 0 to 4 s of Cargo, under +5 min per target. Throughput better than `vt100` on the agent trace and the flood on every target. macOS arm64 `size-probe` +0.96 MiB; `pohunek-sessiond` size not measured. | tables above |
@@ -246,8 +291,11 @@ implemented in the harness, so the answer is unknown and `vte` stays.
 
 ## Recommendation: defer
 
-Not adopt: criteria 2 and 3 fail, and criterion 3 is the property attach
-correctness rests on. Not drop: criteria 1, 4 and 5 pass, criterion 6 passes on the measured targets, the throughput and
+Not adopt: criterion 2 fails, and criterion 3 holds on 12 of 13 traces only,
+with a documented residual (`emoji-width`). The repaint that attach correctness
+rests on is not what blocks adoption: the formatter round-trips with `UNWRAP`
+on and `TRIM` off, and keeps the history that `TerminalSnapshot::ansi` of
+`vt100-scrollback` does not. Not drop: criteria 1, 4 and 5 pass, criterion 6 passes on the measured targets, the throughput and
 size cost are well inside the thresholds, and libghostty fixes things `vt100`
 cannot do (hyperlink, Kitty keyboard and OSC 52 state, grapheme clusters under
 mode 2027, retained scrollback in a byte-bounded buffer: 9 MiB resident at an 8 MiB
@@ -255,9 +303,9 @@ limit, against 31 MiB for 10 000 `vt100` rows after the flood).
 
 Revisit when these are done, in this order:
 
-1. Find out why the libghostty repaint does not round-trip (formatter options
-   such as `UNWRAP`, mode 2027 in the fresh instance, how history rows are
-   emitted) and re-run the repaint table. Criterion 3 is the gate.
+1. Decide whether a screen that switches mode 2027 between rows must
+   round-trip (criterion 3, `emoji-width`); if so, a repaint built from the
+   cells and their widths, not from the formatter text, is the only way.
 2. Add a second real agent trace (plan decision O2) and wide or emoji
    content to the agent recording, so criteria 2 and 4 can speak to emoji
    widths.
@@ -281,8 +329,7 @@ already differs on `scrollback` and `resize-wrap` (1 each).
 - A native Zig build time on macos-15: the macOS library is cross-built on
   Linux, so 175.1 s is the cross-build time.
 - Resident memory on macOS (the runner does not report it).
-- Whether libghostty formatter options or mode 2027 close the repaint
-  differences.
+- Other formatter options (selection, plain or HTML output) as a repaint.
 - The `vte` print-observation coverage.
 - A second agent runtime, and any trace with emoji content from a real agent.
 - Memory of libghostty at a scrollback equal in rows to the `vt100` setting,

@@ -12,6 +12,9 @@ const NAME: &str = "libghostty";
 #[derive(Debug)]
 pub struct GhosttyModel {
     terminal: HeadlessTerminal,
+    repaint_unwrap: bool,
+    repaint_trim: bool,
+    repaint_prefix: Vec<u8>,
 }
 
 #[allow(
@@ -34,6 +37,9 @@ impl GhosttyModel {
     pub fn new(config: &ModelConfig, rows: u16, cols: u16) -> Result<Self, ModelError> {
         Ok(Self {
             terminal: HeadlessTerminal::new(config, rows, cols).map_err(model_error)?,
+            repaint_unwrap: config.ghostty_repaint_unwrap,
+            repaint_trim: config.ghostty_repaint_trim,
+            repaint_prefix: config.ghostty_repaint_prefix.clone().into_bytes(),
         })
     }
 }
@@ -54,7 +60,13 @@ impl GridModel for GhosttyModel {
     }
 
     fn repaint(&self) -> Result<Option<Vec<u8>>, ModelError> {
-        self.terminal.format_vt().map(Some).map_err(model_error)
+        let body = self
+            .terminal
+            .format_vt(self.repaint_unwrap, self.repaint_trim)
+            .map_err(model_error)?;
+        let mut bytes = self.repaint_prefix.clone();
+        bytes.extend_from_slice(&body);
+        Ok(Some(bytes))
     }
 
     fn dump(&self) -> Result<GridDump, ModelError> {

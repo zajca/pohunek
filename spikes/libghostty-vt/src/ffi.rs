@@ -179,6 +179,8 @@ pub const BUILD_INFO_KITTY_GRAPHICS: c_int = 2;
 
 // `GhosttyFormatterOption`, `GhosttyFormatterFormat` and the extras bits.
 pub const FORMATTER_OPT_EMIT: c_int = 1;
+pub const FORMATTER_OPT_UNWRAP: c_int = 2;
+pub const FORMATTER_OPT_TRIM: c_int = 3;
 pub const FORMATTER_OPT_EXTRAS: c_int = 5;
 pub const FORMATTER_FORMAT_PLAIN: c_int = 0;
 pub const FORMATTER_FORMAT_VT: c_int = 1;
