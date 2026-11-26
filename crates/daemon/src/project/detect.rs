@@ -180,7 +180,7 @@ pub fn project_id(git_common_dir: &Path) -> String {
 /// Runs blocking `git` subprocesses; call it from `spawn_blocking`.
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "the io::Result is the documented contract that lets a genuine I/O fault surface"
+    reason = "every failure path returns Ok(None) today; the io::Result is the signature `detect_at` maps to the documented `project_detect_failed` error"
 )]
 pub(crate) fn detect(cwd: &Path, search_path: &SearchPath) -> io::Result<Option<DetectedProject>> {
     // Step 1: is this a work tree? A bare repo answers "false" here but "true"
