@@ -16,7 +16,7 @@ actions. The current CLI exposes `pohunek project list`, `add`, `show`,
 
 `project.list` orders projects by label, then id, and takes `limit` and `cursor`. A
 set that does not fit one control line is refused with `project_list_too_large`;
-`pohunek project list` and the Rust client `project_list` page through the set
+`pohunek project list` and the Rust SDK `Client::project_list` page through the set
 themselves, 200 projects at a time and fewer when the daemon says the page is too
 large.
 
