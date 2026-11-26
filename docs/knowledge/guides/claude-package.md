@@ -756,13 +756,15 @@ open and the records stay authoritative
   passively. When the visible screen names a usage limit, the detector records
   one sighting per screen and the session loop logs it at info under
   `session.program_status.limit_screen`, at most a bounded number of sightings
-  per detector: the matched marker, the held record in
+  per runtime launch for each marker class (the bare `usage limit` and `weekly
+  limit` phrases, and the specific phrases): the matched marker, the held record in
   canonical form, its age and staleness, the latest unmapped 7501 tokens and the
-  published activity. After the cap the detector queues one suppression line and
-  writes no further sighting, so a transcript that quotes a marker cannot flood
-  the log. The unmapped journal that feeds it is written only for an
-  opted-in runtime and once per distinct `(reason, state, kind, app)` tuple, up
-  to a bounded set per session; after the set is full it writes one suppression
+  published activity. After a class budget the detector queues one suppression
+  line naming the `marker_class` and writes no further sighting of that class, so
+  a transcript that quotes a bare phrase cannot flood the log or spend the
+  budget of the specific phrases. The unmapped journal that feeds it is written
+  only for an opted-in runtime and once per distinct `(reason, state, kind, app)`
+  tuple, up to a bounded set per runtime launch; after the set is full it writes one suppression
   line, so repeated or varied records do not flood the log. Claude's real limit screen has not been
   captured yet; the marker list and the journal line are how the next real hit
   leaves evidence (#2101). The journal changes no activity, attention or input

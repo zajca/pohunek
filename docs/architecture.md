@@ -1254,21 +1254,28 @@ the screen rules stay the fallback.
   daemon's default filter is `info`: a debug-only journal would leave the
   evidence of a newer agent's record nowhere. It is written only when the
   manifest opted in to `[program_status]`, and carries one line per distinct
-  `(reason, state, kind, app)` tuple, up to a bounded set per session; after the
+  `(reason, state, kind, app)` tuple, up to a bounded set per runtime launch (the
+  detector is rebuilt on create, recover and reconcile, so each launch starts a
+  fresh set); after the
   set is full it writes one `further unmapped program-status records suppressed`
   line, so a program that repeats or varies the tokens cannot flood the log.
 - **Usage-limit capture.** A provider usage limit cannot be triggered on
   demand, so the daemon journals what the screen shows when it happens. When
   the visible screen names a usage limit (the detector's bounded marker list,
   matched ASCII case-insensitively) and a manifest opted in to program-status
-  evidence, the detector records one sighting per screen, not one per redraw,
-  and journals at most a bounded number of sightings per detector before one
-  `further usage-limit screen sightings suppressed` line.
+  evidence, the detector records one sighting per screen, not one per redraw
+  (a screen that first names a bare phrase and later a specific one is sighted
+  once more). It journals at most a bounded number of sightings per runtime
+  launch for each marker class: the bare phrases (`usage limit`, `weekly
+  limit`) and the specific phrases have separate budgets, so quoted bare
+  phrases cannot spend the budget of a real limit hit. After a class budget the
+  detector writes one `further usage-limit screen sightings suppressed` line
+  naming the `marker_class`.
   The session loop logs it at info under
   `session.program_status.limit_screen` with the matched marker, the held root
   record in canonical form (`app=..:state=..[:kind=..]`), its age and
   staleness, the latest unmapped payload's tokens, and the published activity.
-  The unmapped journal is deduped per session as above.
+  The unmapped journal is deduped per runtime launch as above.
   The sighting changes no activity, attention or input readiness; the screen
   text and every `msg`/`title` value stay out of the log. The evidence of a real
   limit hit is therefore the journal line plus the record it names (#2101).

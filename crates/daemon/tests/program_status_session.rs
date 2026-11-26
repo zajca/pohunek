@@ -217,7 +217,8 @@ run() {{
     S) printf '\033[2J\033[H✻ Billowing… (1…\r\n'; box ;;
     M) printf '\033]7501;state=blocked:kind=permission:app={APP}:msg=U0VDUkVULVBST01QVC1URVhU\033\\' ;;
     L) printf '\033]7501;state=limit:app={APP}:msg=c2VjcmV0LXN0YXRlLXRleHQ=\033\\'
-       printf '\033]7501;state=blocked:app={APP}:kind=limit:msg=c2VjcmV0LWxpbWl0LXRleHQ=\033\\' ;;
+       printf '\033]7501;state=blocked:app={APP}:kind=limit:msg=c2VjcmV0LWxpbWl0LXRleHQ=\033\\'
+       printf '\033]7501;state=limit:app={APP}:msg=c2VjcmV0LXN0YXRlLXRleHQ=\033\\' ;;
     m) printf 'SYNC\r\n' ;;
     Q) printf '\033[2J\033[H────────────────────────────────────────\r\n  Claude usage limit reached\r\n\r\n  Your limit will reset at 5:00 PM.\r\n\r\n  ❯ 1. Upgrade\r\n    2. Exit\r\n' ;;
     q) exit 0 ;;
@@ -1958,9 +1959,10 @@ async fn the_program_status_diagnostics_are_journaled_at_info_without_their_text
         "record_age_ms=",
         "stale=false",
         "activity=\"blocked\"",
-        "unmapped_reason=\"unknown_kind\"",
-        "unmapped_state=\"blocked\"",
-        "unmapped_kind=\"limit\"",
+        // The rejected payload sent after the applied one is the latest unmapped one.
+        "unmapped_reason=\"rejected\"",
+        "unmapped_state=\"limit\"",
+        "unmapped_kind=\"\"",
         "unmapped_app=\"fake\"",
         "unmapped_has_msg=true",
         "unmapped_has_title=false",
@@ -1972,7 +1974,12 @@ async fn the_program_status_diagnostics_are_journaled_at_info_without_their_text
     assert_eq!(
         fixture.activity(&created.id).await,
         Some((AgentActivity::Blocked, StateSource::OscProgress)),
-        "the limit screen changes no activity"
+        "the limit screen and the rejected payload sent after the applied record change no activity"
+    );
+    assert_eq!(
+        fixture.blocked_kind(&created.id).await,
+        Some(BlockedKind::Unspecified),
+        "the rejected payload after the applied one leaves its blocked kind"
     );
     for secret in [
         "secret-limit-text",

@@ -22,9 +22,11 @@ const UNMAPPED_PROGRAM_STATUS_TARGET: &str = "session.program_status.unmapped";
 /// such a token from turning into a long log line.
 const MAX_JOURNAL_TOKEN_CHARS: usize = 16;
 
-/// Most distinct unmapped 7501 tuples one session journals at info.
+/// Most distinct unmapped 7501 tuples one runtime launch journals at info.
 ///
-/// The journal keeps one line per distinct tuple so a program that repeats a
+/// The parser, and with it the journal, is rebuilt on create, recover and
+/// reconcile, so each launch of a session starts a fresh set. The journal
+/// keeps one line per distinct tuple so a program that repeats a
 /// record cannot flood the log. A program that varies the bounded tokens could
 /// still rotate the log, so the set is bounded: after this many tuples the
 /// parser writes one "further records suppressed" line and nothing more.
@@ -234,7 +236,7 @@ pub struct OscParser {
     /// Whether the active manifest opted in to `[program_status]`. Only then is
     /// an unmapped payload journaled; the detector sets this from the manifest.
     journal_unmapped: bool,
-    /// The distinct unmapped tuples this session journaled, bounded by
+    /// The distinct unmapped tuples this runtime launch journaled, bounded by
     /// [`MAX_JOURNALED_UNMAPPED_TUPLES`].
     journaled_unmapped: Vec<UnmappedProgramStatus>,
     /// Whether the one "further records suppressed" line has been written.
@@ -300,7 +302,7 @@ impl OscParser {
     /// The detector sets this from the active manifest: a runtime without a
     /// `[program_status]` table reads no 7501 evidence, so an unmapped payload
     /// is no diagnostic and must not reach the log. A reconfigure re-evaluates
-    /// it. The journal itself stays per session, so a manifest that opts back
+    /// it. The journal itself stays per runtime launch, so a manifest that opts back
     /// in keeps the already-journaled tuples suppressed.
     pub fn set_journal_unmapped(&mut self, enabled: bool) {
         self.journal_unmapped = enabled;
@@ -311,7 +313,7 @@ impl OscParser {
     /// A resync or a manifest reconfigure discards the session's program-status
     /// evidence, so the diagnostic must not attribute the old payload to a
     /// later screen. The journal dedupe state survives: the same tuple was
-    /// already journaled in this session.
+    /// already journaled in this runtime launch.
     pub fn clear_unmapped(&mut self) {
         self.last_unmapped = None;
     }
@@ -331,7 +333,7 @@ impl OscParser {
     /// The line is INFO, not debug: the daemon's default filter is `info`, so a
     /// debug-only journal would leave the evidence a real hit is meant to
     /// collect nowhere. The record is bounded, and the journal carries one line
-    /// per distinct `(reason, state, kind, app)` tuple per session, up to
+    /// per distinct `(reason, state, kind, app)` tuple per runtime launch, up to
     /// [`MAX_JOURNALED_UNMAPPED_TUPLES`]. After the bound it writes one "further
     /// unmapped records suppressed" line, so a program that varies the bounded
     /// tokens cannot rotate the log either.
