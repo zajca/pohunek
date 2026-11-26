@@ -186,7 +186,7 @@ pub(crate) enum Decision<'a> {
     /// A selection that serves and is not older than the listing stays: it is
     /// the assistant the owner runs now.
     Keep(&'a protocol::PackageInfo),
-    /// The listed digest is installed; `replaces` is the selection it takes
+    /// The listed digest is (re)installed; `replaces` is the selection it takes
     /// over, which does not serve or is older than the listing. A listed digest
     /// that is installed with a fault is installed again (the daemon restores
     /// its root) and replaces nothing.

@@ -3184,10 +3184,13 @@ selected one, so `pohunek plugin select pohunek.context.assistant --digest
 <replaced_digest>` selects it again), `detail` and `command`; the fields that do
 not apply are `null`. `result` is one of:
 
-- `installed`: a newer version is installed and selected in one registry commit;
+- `installed`: the listed version is installed and selected in one registry commit;
   the old version stays installed. The daemon verifies the signed index and the
-  archive digest for it, as for `pohunek setup`;
-- `not_published`: the index lists no version newer than the selected one for the
+  archive digest for it, as for `pohunek setup`. It is also the result for a
+  selected version that does not serve (a damaged root, a revoked digest) and is
+  not older than the listing: setup and the upgrade replace it with the listed
+  version;
+- `not_published`: the index lists no version newer than the selected, serving one for the
   new core and this host's platform (the package is published after the core
   release, and the official index lists it only once it is admitted), so the old
   package is kept;

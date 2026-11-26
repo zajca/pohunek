@@ -850,6 +850,28 @@ async fn a_revoked_listed_digest_is_refused_like_setup_refuses_it() {
     );
 }
 
+/// A selected package whose root is damaged is not kept even when it is not
+/// older than the listing: the step installs the listed digest again, which
+/// restores the root, instead of reporting `not_published`.
+#[tokio::test]
+async fn a_selected_package_with_a_damaged_root_is_installed_again() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    let archive = rig.publish(OLDER_VERSION);
+    let first = document_of_upgrade(&rig).await;
+    assert_eq!(install_of(&first)["result"], "installed", "{first}");
+    rig.damage_root(&archive.digest);
+
+    let document = document_of_upgrade(&rig).await;
+    let install = install_of(&document);
+    assert_eq!(install["result"], "installed", "{document}");
+    assert_eq!(install["version"], OLDER_VERSION, "{document}");
+    let selected = rig.selected().await.expect("selected");
+    assert_eq!(selected.digest, archive.digest.as_str());
+}
+
 /// A listed digest that is installed with a damaged root is installed again
 /// by the upgrade step and by the plan `pohunek assistant` makes, which ends
 /// the same way: the daemon restores the root and the owner's selection
