@@ -22947,7 +22947,22 @@ generation "$1"
 
         /// [`stop_worker_at_forward`] that runs `between` once the worker is
         /// stopped and before the operation goes on.
-        async fn stop_worker_at_forward_then<T: Send + 'static>(
+        fn stop_worker_at_forward_then<'a, T: Send + 'static>(
+            fixture: &'a Fixture,
+            created: &'a SessionInfo,
+            points: usize,
+            answer: Answer,
+            between: impl std::future::Future<Output = ()> + 'a,
+            operation: impl std::future::Future<Output = T> + Send + 'static,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (T, StoppedWorker)> + 'a>> {
+            Box::pin(stop_worker_at_forward_boxed(
+                fixture, created, points, answer, between, operation,
+            ))
+        }
+
+        /// The body of [`stop_worker_at_forward_then`], boxed by it so its
+        /// callers' futures stay small.
+        async fn stop_worker_at_forward_boxed<T: Send + 'static>(
             fixture: &Fixture,
             created: &SessionInfo,
             points: usize,
