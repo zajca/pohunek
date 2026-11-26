@@ -1,0 +1,52 @@
+# Bounds and settings of the spike tooling. Every key is required: a missing or
+# unknown key stops the program at startup.
+
+# Largest trace file the parser reads.
+max_trace_bytes = 33554432
+# Largest `Output` record (one PTY read chunk) a trace may hold.
+max_record_bytes = 1048576
+# Most records one trace may hold.
+max_records = 1000000
+# Terminal dimension bounds, for the header and for every `Resize` record.
+min_dimension = 1
+max_rows = 500
+max_cols = 500
+# Bytes the recorder asks a PTY read for.
+read_chunk_bytes = 4096
+# Wall-clock limit of one recording; the recorder kills a child that outlives it.
+record_timeout_seconds = 120
+# Marker a recorded script prints before it waits for a line on stdin. The
+# recorder applies the next scheduled resize when it sees the marker, then
+# writes a newline to the PTY.
+resize_marker = "\u001b]7771;resize-point\u0007"
+# Environment of a recorded child: nothing is inherited.
+child_term = "xterm-256color"
+child_lang = "C.UTF-8"
+child_path = "/usr/bin:/bin"
+# libghostty-vt headless settings (every one is applied explicitly; the
+# library's own defaults are never relied on).
+# Scrollback is kept in pages of about 400 KB, so the limit is rounded up.
+ghostty_scrollback_max_bytes = 8388608
+# Largest APC, unknown-sequence and parser-continuation buffers.
+ghostty_apc_max_bytes = 65536
+ghostty_unknown_max_bytes = 4096
+ghostty_continuation_max_bytes = 65536
+# Largest OSC 5522 clipboard write transaction.
+ghostty_clipboard_write_max_bytes = 1048576
+# Cell size in pixels reported on resize; only size reports use it.
+ghostty_cell_px = 1
+# A neutral assertion source starts with one of these prefixes.
+allowed_source_prefixes = [
+    "https://www.unicode.org/reports/",
+    "https://www.unicode.org/L2/",
+    "https://ecma-international.org/publications-and-standards/standards/ecma-48",
+    "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html",
+    "https://sw.kovidgoyal.net/kitty/keyboard-protocol/",
+    "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda",
+    "https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences",
+]
+# A source naming the model under test would make "it passes" circular.
+forbidden_source_words = ["ghostty"]
+# A `pohunek-contract` assertion cites a file of this repository under one of
+# these path prefixes.
+contract_source_prefixes = ["docs/", "crates/"]

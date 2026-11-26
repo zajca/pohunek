@@ -1,0 +1,50 @@
+# Source: sources/resize-alt-screen.sh (6x20, resized to 8x30 on the alternate screen).
+
+[[assertion]]
+id = "alt-screen-active-at-resize"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "Mode 1049 set switches to the alternate screen, which stays active across a resize."
+after_resize = 1
+check = "alternate_screen"
+value = true
+
+[[assertion]]
+id = "size-after-resize"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "After the PTY is resized to 8x30 the screen is 8x30."
+after_resize = 1
+check = "size"
+rows = 8
+cols = 30
+
+[[assertion]]
+id = "alt-screen-left"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "Mode 1049 reset returns to the primary screen."
+check = "alternate_screen"
+value = false
+
+[[assertion]]
+id = "primary-content-restored"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The primary screen keeps what was printed before the alternate screen was entered."
+check = "cell"
+row = 0
+col = 0
+text = "p"
+width = 1
+
+[[assertion]]
+id = "cursor-restored-after-1049"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "Mode 1049 restores the cursor saved on entry, at column 0 of row 1, so 'back' starts there."
+check = "cell"
+row = 1
+col = 0
+text = "b"
+width = 1

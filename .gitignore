@@ -31,3 +31,6 @@ crates/protocol/bindings/
 # Editor/OS noise
 .DS_Store
 *.swp
+
+# Standalone spike workspace (spikes/libghostty-vt)
+/spikes/libghostty-vt/target/

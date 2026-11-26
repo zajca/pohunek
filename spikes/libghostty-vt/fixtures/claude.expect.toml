@@ -1,0 +1,84 @@
+# Source: sources/record-claude.sh (30x100).
+#
+# A real Claude Code 2.1.309 (the release pinned in compat/claude/npm) against
+# the loopback Messages stub in sources/claude-messages-stub.py, in an isolated
+# HOME. Steps: wait for the prompt, type "hello there", wait for the stub's
+# reply, leave with /exit. The assertions are limited to facts that follow from
+# the escape sequences the program wrote (ECMA-48 cursor movement, xterm mode
+# 1049); record numbers are indexes into this committed trace.
+#
+# Record 3 holds the alternate-screen switch, record 11 the redraw that shows
+# the reply "Hello from the loopback stub.", record 16 the switch back.
+
+[[assertion]]
+id = "enters-alternate-screen"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The program sets mode 1049 at start, which activates the alternate screen."
+after_record = 4
+check = "alternate_screen"
+value = true
+
+[[assertion]]
+id = "leaves-alternate-screen"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The program resets mode 1049 on exit, which returns to the primary screen."
+check = "alternate_screen"
+value = false
+
+[[assertion]]
+id = "size-stays"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The PTY is never resized, so the screen stays 30x100."
+check = "size"
+rows = 30
+cols = 100
+
+[[assertion]]
+id = "reply-marker"
+basis = "spec"
+source = "https://ecma-international.org/publications-and-standards/standards/ecma-48"
+rule = "The reply redraw is CUP home, CR, CUD 8, then the marker U+25CF: it lands on row 8, column 0."
+after_record = 12
+check = "cell"
+row = 8
+col = 0
+text = "●"
+
+[[assertion]]
+id = "reply-first-word"
+basis = "spec"
+source = "https://ecma-international.org/publications-and-standards/standards/ecma-48"
+rule = "CHA 3 after the marker puts 'Hello' at column 2 of row 8."
+after_record = 12
+check = "cell"
+row = 8
+col = 2
+text = "H"
+width = 1
+
+[[assertion]]
+id = "reply-third-word"
+basis = "spec"
+source = "https://ecma-international.org/publications-and-standards/standards/ecma-48"
+rule = "CHA 14 puts 'the' at column 13 of row 8."
+after_record = 12
+check = "cell"
+row = 8
+col = 13
+text = "t"
+width = 1
+
+[[assertion]]
+id = "reply-second-paragraph"
+basis = "spec"
+source = "https://ecma-international.org/publications-and-standards/standards/ecma-48"
+rule = "CR, CUF 2 and CUD 2 put 'This' at column 2 of row 10."
+after_record = 12
+check = "cell"
+row = 10
+col = 2
+text = "T"
+width = 1

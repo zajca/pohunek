@@ -1,0 +1,12 @@
+# Source: sources/program-status.sh (4x40).
+
+[[assertion]]
+id = "probe-and-record-print-nothing"
+basis = "pohunek-contract"
+source = "crates/terminal/src/program_status.rs"
+rule = "OSC 7501 probes and records are control sequences: nothing of them is drawn, so the visible text starts at row 0, column 0."
+check = "cell"
+row = 0
+col = 0
+text = "v"
+width = 1

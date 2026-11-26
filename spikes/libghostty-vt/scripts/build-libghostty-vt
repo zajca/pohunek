@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Build the pinned libghostty-vt static library for one Rust target.
+
+usage: python3 -I scripts/build-libghostty-vt <rust-target> <out-dir>
+           (--tarball-dir DIR | --fetch) [--zig ZIG] [--pin FILE]
+       python3 -I scripts/build-libghostty-vt <rust-target> <out-dir> --probe-native
+
+The only code that fetches or compiles libghostty. It reads the pins from
+`libghostty-vt.pin.toml`, checks `zig version`, verifies the sha256 of both
+tarballs (taken from --tarball-dir, or downloaded with --fetch), unpacks them
+side by side into a fresh temporary directory and runs an offline `zig build`
+with a new, empty ZIG_GLOBAL_CACHE_DIR. The output directory receives
+`lib/libghostty-vt.a`, `include/ghostty/`, `abi-layout.txt` and `BUILD_INFO`. `--probe-native` only rewrites
+`abi-layout.txt` with the host C compiler, for a library cross-built on a host
+that cannot run the target (the macOS job).
+"""
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SPIKE = HERE.parent
+
+
+def fail(message: str) -> "None":
+    print(f"build-libghostty-vt: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download(url: str, build: dict) -> bytes:
+    """Fetch `url` with the pinned agent; retry network errors, 5xx and 429."""
+    request = urllib.request.Request(url, headers={"User-Agent": build["user_agent"]})
+    attempts = build["download_attempts"]
+    wait = build["download_backoff_seconds"]
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=build["download_timeout_seconds"]) as response:
+                # The sha256 is checked after the download; the read is bounded
+                # so a hostile response cannot fill the disk first.
+                return response.read(build["max_download_bytes"] + 1)
+        except urllib.error.HTTPError as error:
+            retryable = error.code == 429 or error.code >= 500
+            problem = f"HTTP {error.code}"
+        except (urllib.error.URLError, TimeoutError) as error:
+            retryable, problem = True, str(error)
+        if not retryable or attempt == attempts:
+            fail(f"download of {url} failed: {problem} (attempt {attempt} of {attempts})")
+        print(f"build-libghostty-vt: {problem}; retrying in {wait} s", file=sys.stderr)
+        time.sleep(wait)
+        wait *= 2
+    fail("unreachable")
+
+
+def obtain(
+    entry: dict, name: str, tarball_dir: Path | None, fetch: bool, work: Path, build: dict,
+) -> Path:
+    """Return the verified tarball `name`; fail on a hash mismatch."""
+    if tarball_dir is not None:
+        path = tarball_dir / name
+        if not path.is_file():
+            fail(f"{path} does not exist")
+    elif fetch:
+        path = work / name
+        data = download(entry["url"], build)
+        if len(data) > build["max_download_bytes"]:
+            fail(f"{name} is larger than the pinned limit of {build['max_download_bytes']} bytes")
+        path.write_bytes(data)
+    else:
+        fail("pass --tarball-dir DIR or --fetch")
+    actual = sha256_of(path)
+    if actual != entry["sha256"]:
+        fail(f"sha256 mismatch for {name}: pinned {entry['sha256']}, found {actual}")
+    return path
+
+
+def unpack(path: Path, destination: Path) -> None:
+    with tarfile.open(path) as archive:
+        archive.extractall(destination, filter="data")
+
+
+def probe_native(out: Path) -> None:
+    """Record the C layout of the mirrored types with the host `cc`."""
+    with tempfile.TemporaryDirectory(prefix="abi-probe-") as scratch:
+        binary = Path(scratch) / "abi-probe"
+        subprocess.run(
+            ["cc", "-DGHOSTTY_STATIC", "-I", str(out / "include"), str(HERE / "abi_probe.c"), "-o", str(binary)],
+            check=True,
+        )
+        probe = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+    (out / "abi-layout.txt").write_text(probe.stdout)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("target", help="Rust target triple")
+    parser.add_argument("out_dir", type=Path)
+    parser.add_argument("--tarball-dir", type=Path)
+    parser.add_argument("--fetch", action="store_true")
+    parser.add_argument("--zig", default="zig")
+    parser.add_argument("--pin", type=Path, default=SPIKE / "libghostty-vt.pin.toml")
+    parser.add_argument(
+        "--probe-native",
+        action="store_true",
+        help="only (re)write abi-layout.txt in out_dir with the host C compiler, "
+        "for a library cross-built on another host",
+    )
+    args = parser.parse_args()
+
+    if args.probe_native:
+        probe_native(args.out_dir)
+        return
+
+    pins = tomllib.loads(args.pin.read_text())
+    zig_target = pins["targets"].get(args.target)
+    if zig_target is None:
+        fail(f"no Zig target is pinned for {args.target}")
+
+    version = subprocess.run(
+        [args.zig, "version"], check=False, capture_output=True, text=True
+    )
+    if version.returncode != 0 or version.stdout.strip() != pins["zig"]["version"]:
+        found = version.stdout.strip() or version.stderr.strip()
+        fail(f"zig version is {found!r}, the pin is {pins['zig']['version']!r}")
+
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="libghostty-vt-") as scratch_name:
+        scratch = Path(scratch_name)
+        source_tar = obtain(
+            pins["source"], Path(pins["source"]["url"]).name, args.tarball_dir, args.fetch, scratch,
+            pins["build"],
+        )
+        deps_tar = obtain(
+            pins["deps"], Path(pins["deps"]["url"]).name, args.tarball_dir, args.fetch, scratch,
+            pins["build"],
+        )
+        unpack(source_tar, scratch)
+        unpack(deps_tar, scratch)
+        library_version = pins["library"]["version"]
+        source_dir = scratch / f"libghostty-vt-{library_version}"
+        deps_dir = scratch / f"libghostty-vt-{library_version}-deps"
+        if not source_dir.is_dir() or not deps_dir.is_dir():
+            fail("the tarballs did not unpack to the expected directories")
+
+        prefix = scratch / "prefix"
+        cache = scratch / "zig-global-cache"
+        cache.mkdir()
+        environment = {**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(cache)}
+        build_started = time.monotonic()
+        subprocess.run(
+            [
+                args.zig, "build",
+                "--system", str(deps_dir),
+                f"-Doptimize={pins['build']['optimize']}",
+                f"-Dcpu={pins['build']['cpu']}",
+                f"-Dstrip={pins['build']['strip']}",
+                f"-Dvt-features={pins['build']['vt_features']}",
+                f"-Dtarget={zig_target}",
+                "--prefix", str(prefix),
+            ],
+            cwd=source_dir,
+            env=environment,
+            check=True,
+        )
+        build_seconds = time.monotonic() - build_started
+
+        archive = prefix / "lib" / "libghostty-vt.a"
+        if not archive.is_file():
+            fail(f"the build produced no {archive.name}")
+        out = args.out_dir
+        if out.exists():
+            shutil.rmtree(out)
+        (out / "lib").mkdir(parents=True)
+        shutil.copy2(archive, out / "lib" / archive.name)
+        shutil.copytree(prefix / "include" / "ghostty", out / "include" / "ghostty")
+
+        probe_binary = scratch / "abi-probe"
+        subprocess.run(
+            [
+                args.zig, "cc", "-target", zig_target,
+                "-DGHOSTTY_STATIC", "-I", str(out / "include"),
+                str(HERE / "abi_probe.c"),
+                "-o", str(probe_binary),
+            ],
+            check=True,
+            env=environment,
+        )
+        # The probe prints the layout table. A cross-built probe cannot run on
+        # this host; abi-layout.txt then holds only a comment, `build.rs`
+        # refuses it, and `--probe-native` rewrites it on a host that runs the
+        # target.
+        try:
+            probe = subprocess.run(
+                [str(probe_binary)], check=True, capture_output=True, text=True
+            )
+            layout_text = probe.stdout
+        except (OSError, subprocess.CalledProcessError):
+            layout_text = "# probe not runnable on this host; run --probe-native on the target\n"
+        (out / "abi-layout.txt").write_text(layout_text)
+
+        zig_exe = shutil.which(args.zig) or args.zig
+        total = time.monotonic() - started
+        info = [
+            f"library_version={library_version}",
+            f"zig_version={pins['zig']['version']}",
+            f"rust_target={args.target}",
+            f"zig_target={zig_target}",
+            f"source_sha256={pins['source']['sha256']}",
+            f"deps_sha256={pins['deps']['sha256']}",
+            f"archive_bytes={archive.stat().st_size}",
+            f"zig_build_seconds={build_seconds:.1f}",
+            f"script_seconds={total:.1f}",
+            f"zig_path={Path(zig_exe).name}",
+        ]
+        (out / "BUILD_INFO").write_text("\n".join(info) + "\n")
+    print(f"built {out / 'lib' / 'libghostty-vt.a'}")
+
+
+if __name__ == "__main__":
+    main()

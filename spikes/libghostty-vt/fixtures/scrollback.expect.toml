@@ -1,0 +1,34 @@
+# Source: sources/scrollback.sh (5x20, resized to 5x10).
+#
+# Fifteen numbered lines then "done" (16 lines of text) on a five-row screen,
+# with the cursor on the row after the last line: 17 rows of content, so 12 rows
+# scrolled off a screen of five.
+
+[[assertion]]
+id = "scrolled-rows-retained"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "Lines scrolled off the top of the primary screen are saved while the saved-lines limit (saveLines) is not exceeded; 12 rows are saved here."
+check = "scrollback_rows"
+value = 12
+
+[[assertion]]
+id = "visible-bottom"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The last line printed is on the row above the cursor row."
+check = "cell"
+row = 3
+col = 0
+text = "d"
+width = 1
+
+[[assertion]]
+id = "size-after-shrink"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "After the PTY is resized to 5x10 the screen is 5x10."
+after_resize = 1
+check = "size"
+rows = 5
+cols = 10

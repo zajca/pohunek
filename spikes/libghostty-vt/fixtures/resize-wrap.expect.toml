@@ -1,0 +1,47 @@
+# Source: sources/resize-wrap.sh (4x20, resized to 4x10 and back to 4x20).
+#
+# No neutral specification says whether a resize reflows soft-wrapped lines, so
+# the assertions state the facts before the first resize and the size after
+# each one; how the models reflow shows up in the pairwise differences.
+
+[[assertion]]
+id = "autowrap-sets-wrapped"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "With auto-wrap mode (DECAWM) on, a line longer than the screen continues on the next row and the first row is soft-wrapped."
+before_resize = 1
+check = "row_wrapped"
+row = 0
+value = true
+
+[[assertion]]
+id = "autowrap-continuation"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The 21st character of the line is the first cell of the next row."
+before_resize = 1
+check = "cell"
+row = 1
+col = 0
+text = "U"
+width = 1
+
+[[assertion]]
+id = "size-after-shrink"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "After the PTY is resized to 4x10 the screen is 4x10."
+after_resize = 1
+check = "size"
+rows = 4
+cols = 10
+
+[[assertion]]
+id = "size-after-grow"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "After the PTY is resized back to 4x20 the screen is 4x20."
+after_resize = 2
+check = "size"
+rows = 4
+cols = 20

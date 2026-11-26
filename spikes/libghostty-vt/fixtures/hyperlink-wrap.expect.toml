@@ -1,0 +1,51 @@
+# Source: sources/hyperlink-wrap.sh (4x10).
+
+[[assertion]]
+id = "link-first-cell"
+basis = "spec"
+source = "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda"
+rule = "Text printed between OSC 8 ; ; URI ST and OSC 8 ; ; ST carries the URI."
+check = "hyperlink"
+row = 0
+col = 0
+uri = "https://example.invalid/a"
+
+[[assertion]]
+id = "link-after-wrap"
+basis = "spec"
+source = "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda"
+rule = "A link continues across a soft wrap: the last linked character 'F' is on row 1, column 5."
+check = "hyperlink"
+row = 1
+col = 5
+uri = "https://example.invalid/a"
+
+[[assertion]]
+id = "link-ends"
+basis = "spec"
+source = "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda"
+rule = "Text after the closing OSC 8 carries no URI."
+check = "hyperlink"
+row = 1
+col = 6
+uri = ""
+
+[[assertion]]
+id = "wrap-flag"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The first row is soft-wrapped into the second."
+check = "row_wrapped"
+row = 0
+value = true
+
+[[assertion]]
+id = "text-after-link"
+basis = "spec"
+source = "https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda"
+rule = "The sequences themselves print nothing: the character after the link is at row 1, column 6."
+check = "cell"
+row = 1
+col = 6
+text = "z"
+width = 1
