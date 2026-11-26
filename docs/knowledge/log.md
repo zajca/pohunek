@@ -5,6 +5,252 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.45.0
+
+### 2026-11-26, shell-session agents are not attributed through the transcript store, #2531
+
+- `docs/public-api.md` and `docs/knowledge/guides/runtime-packages.md` (Muse
+  and Cline transcript sections) state that only an agent outside any Pohunek
+  session is attributed through a `[transcripts]` store. A foreground agent
+  inside a shell session is not: the session reports its own active agent, and
+  `rescan_external_agents` in `crates/daemon/src/session/mod.rs` skips every
+  process a live session owns before it reaches the transcript match.
+
+### 2026-11-25, Cline session manifests as transcripts, #1954
+
+- The runtime feature `transcripts-cline-session-v1` adds the transcript parser
+  `cline-session-v1`: it reads `<id>/<id>.json` below `[transcripts] dir`, takes the
+  id from `session_id` (equal to the directory name, no `__`) and the working
+  directory from an absolute `cwd`, within 64 KiB, and never opens
+  `*.messages.json`. The walk lists the highest directory names first (the
+  `dated_depth` of the tree is 1). File watchers pass a path on when any compiled
+  parser reads its shape (`TranscriptParser::any_reads`) and the owning root decides
+  with `TranscriptParser::reads`, so `.json` manifests reach a Cline root without
+  `.json` files entering a `jsonl-head-v1` root. See
+  [runtime packages](guides/runtime-packages.md#cline-session-manifests).
+
+### 2026-11-25, passive usage-limit capture, #2101
+
+- A provider usage limit cannot be triggered on demand, so the daemon journals
+  the screen instead. A usage-limit screen the detector sees once logs an info
+  line under `session.program_status.limit_screen` with the matched marker, the
+  held OSC 7501 record in canonical form, its age and staleness, the latest
+  unmapped record's bounded tokens and the published activity. The line is
+  written at most a bounded number of times per detector; after the cap the
+  detector queues one `further usage-limit screen sightings suppressed` line. The sighting
+  changes no activity, attention or input readiness, and no screen or message
+  text is logged.
+- A record the daemon cannot map is journaled at info, not debug, so the
+  evidence reaches the daemon's default `info` filter. The journal runs only
+  when the runtime opted in to program status and carries one line per distinct
+  `(reason, state, kind, app)` tuple, up to a bounded set per session; after the
+  set is full it writes one suppression line, so a program that repeats or
+  varies the tokens cannot flood the log. See
+  [Program status](guides/claude-package.md#program-status-osc-7501); the
+  canary runbook (`docs/runbooks/claude-canary.md`, "Usage-limit evidence")
+  says how to collect the evidence of a real hit.
+
+### 2026-11-25, existence check for reported ids of assigned runtimes, #2528
+
+- `reference_existence` in `crates/daemon/src/session/resume.rs` returns the
+  frozen assigned existence check for a `reported` reference of an `assigned`
+  runtime, falling back to the hook runtime's declared check. Resume, the
+  stored-binding preflight, the activity lookup and the upgrade preflight
+  share it, so a reported id whose conversation file is gone is refused with
+  `agent_native_reference_missing`. The upgrade preflight judges such a
+  missing file `already_not_resumable`, because the running release only
+  starts an empty conversation under it (`reported_check_identity` in
+  `reconcile/upgrade_preflight.rs`). Covered by
+  `recovery_checks_an_assigned_reference_and_a_reported_one`
+  in `crates/daemon/src/session/tests/native_supersede.rs`. Docs: the
+  `sessions.md` assigned-reference paragraph and the `runtime-packages.md`
+  integration paragraph.
+
+### 2026-11-23, Claude subscription accounts and package setup entries, #1562
+
+- Runtime descriptors can export `[setup.<name>]` entries behind the new
+  `package-setup-v1` feature: interactive programs of the package that the owner
+  runs with `pohunek plugin run <package> <setup> [args...]` on a terminal. The
+  daemon only resolves the verified program (`package.setup_resolve`, local and
+  owner only) and never runs it. Install review and `plugin inspect` list them.
+  See [runtime packages](guides/runtime-packages.md#declaring-package-setup-entries).
+- `pohunek plugin profile create --program <abs-path>` attaches an owner-written
+  launch wrapper to a host profile; the daemon checks the executable's path,
+  owner and permissions before it writes the profile. See
+  [agent profiles](concepts/agent-profiles.md#creating-a-profile).
+- The Claude package (2.3.0) ships `claude-accounts`, which registers one
+  subscription per account (`add <name>`, `--login` for the stored login) and
+  creates a `claude-<name>` preset per account, so a session starts under its own
+  subscription with `pohunek session new --agent claude-<name>`. See
+  [Claude package](guides/claude-package.md#one-claude-subscription-per-session).
+- `docs/knowledge/safety/secrets.md`: subscription tokens live in an owner file
+  read by the launch wrapper, never in a profile environment.
+
+### 2026-11-22, signed index accepted design, #2467
+
+- The [plugin index guide](guides/plugin-repositories.md#admission-through-the-index)
+  records the six remaining signed-index items as the accepted design: one
+  `official` scope with no verified tier (deferred to #1619), key records as
+  their own type, entry fields as admission-only, no core cap, compiled index
+  URLs beside a channel file that names only the endorser, and mirrors only
+  through `--index-url`. The release skill admits the assistant through the
+  index after each release: a `CORE_TAG` pull request first, then the
+  `pohunek.context.assistant/X.Y.Z` entry.
+
+### 2026-11-22, assistant installs its missing package, #2511
+
+- `pohunek assistant` recovers from the daemon's `assistant_package_missing`
+  refusal instead of printing the old placeholder install command. A local
+  launch runs the shared `setup_assistant` plan against the daemon's core
+  version: an `Install` step previews the version and digest, asks once
+  (`--yes` skips the question; with `--json` or without a TTY and without
+  `--yes` it prints the preview and stops), installs through the daemon's
+  signed plugin index verification, and retries the launch once. A `Gap` or
+  `Present` step prints the plan's outcome with the error, and the returned
+  error carries that outcome as its recovery hint, so the stale daemon remedy
+  never reaches the output. A remote launch prints
+  `pohunek assistant setup` for that host and installs nothing remotely,
+  because `plugin install` is local-only. When the official index lists no
+  assistant package the daemon's core can use (the id is absent or no entry
+  supports that core), the message names the core version and says to rerun
+  `pohunek assistant setup` after admission; a platform-only gap keeps the
+  resolver's message and never claims a core reason. The daemon's own refusal
+  names `pohunek assistant setup` (or `pohunek setup`) with no core claim and
+  no `<placeholder>`, as do the not-selected, disabled and rejected arms. The
+  match keys on the stable error code alone, never on the message or remedy,
+  so an older daemon's placeholder hint cannot leak through. Covered by
+  `crates/cli/tests/assistant_setup_install.rs` (S1-S4, S6 end to end; S5 by
+  unit tests of the stable-code match and remedy replacement plus an
+  integration run over the no-package plan). A daemon version that cannot be
+  parsed as semantic stops the recovery before anything installs:
+  `host_cap_probe_failed` (configuration class), since the index entries
+  cannot be matched against it.
+
+### 2026-11-21, one credential per account over a shared config home, #1562
+
+- [Agent profiles](concepts/agent-profiles.md) gains "Choosing a credential with
+  a launch option": a launch option whose choices set a non-secret selector, over
+  a wrapper program that reads the credential from an owner file. Pohunek stores
+  only the selector; a resume re-reads whatever the wrapper reads, so a replaced
+  credential file switches identity without `agent_profile_changed`.
+- The `config_home_id` entry now says an equal value means the same config
+  directory, not the same account; clients show `display_name` and the session's
+  `agent_options` for the account.
+- [Claude Code runtime package](guides/claude-package.md) gains "One Claude
+  subscription per session": `claude setup-token` and `CLAUDE_CODE_OAUTH_TOKEN`,
+  the credential precedence, bare mode ignoring the token, no Remote Control or
+  claude.ai connectors, the token inherited by subprocesses and the scrub
+  trade-off, and the rule to choose the account by whose work it is, never by
+  quota. Automatic switching on limits, quota strategies, capacity routing and a
+  token-swapping proxy are not supported.
+- [Secrets](safety/secrets.md) states where such a token lives and that
+  hand-written profile `[env]` entries are not refused for credential names.
+- A core launch-time credential reference is tracked in
+  [#2504](https://github.com/zajca/pohunek/issues/2504).
+
+### 2026-11-21, plugin compat report, #1659
+
+- `pohunek plugin compat [--json]` prints the local core's side of the runtime
+  package contract: the core version (the daemon's `daemon_version`), the
+  protocol version, the `runtime_api` generation and every runtime feature id.
+  `host.inspect` carries `runtime_api` and `runtime_features` as optional
+  fields, also with `skip_runtime_probes`; a daemon that omits them is
+  unknown, and the command fails with `plugin_compat_unsupported` instead of
+  printing an empty list. See [Compatibility
+  report](guides/runtime-packages.md#compatibility-report).
+
+### 2026-11-21, macOS kit build audit, #2407
+
+- The `kit-macos` job of `release-build.yml` builds the kit binaries with
+  `packaging/macos/build-release kit`, the same locked, deployment-target-pinned,
+  path-remapped build as the core macOS archives, and runs `audit-macho` on the
+  staged kit tree before archiving it. The kit bundle is attested, not signed,
+  so `verify-signed` does not apply.
+
+### 2026-11-21, configurable session temporary root, #2454
+
+- `service.toml` is schema 8 with a required `namespace.session_tmp_root`, the
+  root of every session's private `TMPDIR` (`<root>/<store key>/<session id>`). An
+  upgrade from schema 7 and a fresh install record `<cache_dir>/session-tmp`; the
+  installer creates only that default root, the daemon never creates a configured
+  one. A missing root fails the launch with `session_tmpdir_failed`, an unsafe one
+  with `session_tmpdir_unsafe`, both naming the root; the daemon keeps serving and
+  logs one `session.tmp_root_unusable` warning at start. See
+  [Temporary directory](concepts/sessions.md#temporary-directory) and
+  [Setup](guides/setup.md).
+
+### 2026-11-21, docs-check feature-table fact, #2484
+
+- `cargo xtask docs check` holds the runtime feature table of
+  `guides/runtime-packages.md` to the committed registry snapshot
+  (`crates/daemon/src/agent/host/fixtures/features.txt`): the `feature-table`
+  fact fails on a missing, extra or differently dated feature id.
+
+### 2026-11-21, assistant package after an upgrade, #2487
+
+- The release archive does not carry the assistant context package, so
+  `pohunek service upgrade` leaves it at its old version. The upgrade report
+  now carries `assistant` (`current`, `outdated`, `absent`, `unselected`,
+  `unchecked`) and an `outdated` package is reported with `pohunek setup`, which
+  installs the version the plugin index lists. `pohunek assistant` prints a note
+  (`knowledge_bundle_note` in `--json`) when the launched bundle is older than
+  the daemon that serves it.
+
+### 2026-11-21, daemon follows the manager PATH, #2488
+
+- A daemon that runs as its systemd user unit with an empty `search_path` and a
+  unit that sets no `PATH` re-reads the user manager's `PATH` when it inspects the host, runs a doctor or
+  starts or resumes a session, and uses it for executable lookup, the doctor's agent checks, hooks
+  and the environment of new agents; see
+  [environment resolution](guides/environment-resolution.md). Other variables
+  keep their start value, and `refresh-path` still has nothing to refresh there.
+
+### 2026-11-21, stale needs-you records, #2489
+
+- Open `agent_blocked` / `approval_required` records are acknowledged when the
+  session is removed (`session_removed` in the notification projector) and once
+  after startup reconciliation (`resolve_stale_attention`, called from
+  `main.rs` after `reconcile_workers`) for every session that is absent,
+  stopped, done, failed or on a lost runtime. A live session keeps its record
+  whatever its stored activity. The clear signal for a notifier is the
+  existing `notification_updated` event with status `acknowledged`.
+
+### 2026-11-21, one owner for assistant package currency, #2493
+
+- `setup_assistant::selected_package` is the single place that finds the
+  selected assistant context package and decides whether it is older than the
+  version a core or the plugin index lists. `pohunek setup` and the
+  `pohunek service upgrade` report both call it; their behaviour is unchanged.
+  The test-only `upgrade_assistant` library module states why it exists.
+
+### 2026-11-21, the registry owns the manager PATH, #2494
+
+- The search path a daemon follows from its service manager now belongs to the
+  session registry that reads it, and the registry refreshes it where it
+  resolves or launches an agent (`host.inspect`, the doctors, `session.new`,
+  `session.resume`), not from a method list in the request dispatcher. Two
+  registries in one process no longer share it.
+- One `session.new` takes the search path once and uses that value for the agent
+  probe, the worktree bind and its hooks, `git`, the checkout-trust check, the
+  `SessionStart` hook and the launch; `session.resume` does the same for its
+  probe, checkout-trust check and launch. The `git` and
+  hook-interpreter lookups and the `PATH` hooks run with no longer read a
+  process-wide copy, so `host.inspect` reports `git_available` and a worktree
+  hook sees the `PATH` of the registry it belongs to, whichever registry read its
+  manager last.
+
+### 2026-11-21, assistant package installed by the upgrade, #2500
+
+- `pohunek service upgrade` installs the assistant context package after a
+  committed upgrade to a newer version: it asks the signed plugin index for the
+  version listed for the new core and installs and selects it through the daemon,
+  and `install-daemon.sh` does the same through the upgrade. The report carries
+  `assistant.install` (`installed`, `not_published`, `held`, `failed`, `skipped`);
+  none of them fails the upgrade. A disabled or unselected package stays as set,
+  and `--no-assistant-package` skips the step. The release upgrade harness passes
+  the flag, so it stays offline (also closes #2497). A fresh install still gets
+  the package from `pohunek setup`, which the installer names.
+
 ## 0.44.0
 
 ### 2026-11-20, push reuse wording, #2321

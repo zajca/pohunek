@@ -1,4 +1,0 @@
----
-kind: added
----
-`pohunek service upgrade` (and so `packaging/install-daemon.sh`) now installs the assistant context package that matches the new core: after a committed upgrade to a newer version it resolves `pohunek.context.assistant` from the signed plugin index, installs and selects it through the daemon, and reports the outcome (`assistant.install` in `--json`: `installed`, `not_published`, `held`, `failed` or `skipped`). No outcome fails the upgrade, a package you disabled or did not select stays as set, and `--no-assistant-package` skips the step on a host without access to the index. Until the official index lists the package for a release the outcome is `not_published` and `pohunek setup` installs it later. ([#2500](https://github.com/zajca/pohunek/issues/2500), [#2497](https://github.com/zajca/pohunek/issues/2497))
