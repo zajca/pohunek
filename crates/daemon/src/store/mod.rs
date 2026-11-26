@@ -2295,6 +2295,23 @@ fn mirror_worker_instance_id(record: &mut SessionRecord) {
     }
 }
 
+/// Whether `existing` is an ended record whose two copies of the runtime
+/// instance disagree. Its rewrite in the same generation is the repair, so
+/// the instance comparison does not defend it.
+fn has_split_ended_identity(existing: &SessionRecord) -> bool {
+    let Some(current) = existing.info.runtime.as_ref() else {
+        return false;
+    };
+    existing.info.state.is_terminal()
+        && matches!(
+            current.state,
+            protocol::RuntimeState::Lost | protocol::RuntimeState::Terminal
+        )
+        && existing.runtime.worker_instance_id.is_some()
+        && current.worker_instance_id.is_some()
+        && existing.runtime.worker_instance_id != current.worker_instance_id
+}
+
 fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord) -> bool {
     let (Some(current), Some(candidate)) = (
         existing.info.runtime.as_ref(),
@@ -2306,6 +2323,10 @@ fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord)
         return true;
     }
     if candidate.runtime_generation > current.runtime_generation {
+        return false;
+    }
+
+    if has_split_ended_identity(existing) {
         return false;
     }
 

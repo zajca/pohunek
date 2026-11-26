@@ -4724,6 +4724,14 @@ in-memory registry or subscribers and emits no success event. Refresh with
 current authoritative runtime identity, generation, and state; never reuse the
 losing candidate's stale runtime coordinates.
 
+A stored record of an ended session (terminal state, runtime `lost` or
+`terminal`) whose two copies of the runtime instance (`runtime.runtime_id` and
+`info.runtime.worker_instance_id`) disagree is not defended against a rewrite in
+its own generation: the rewrite sets both copies to the candidate's instance.
+`session.remove` of such a session does not return this
+code for the split. A candidate of a lower generation, a record that is not
+ended, and a record whose copies agree keep the refusal.
+
 This code does not report post-rename durability uncertainty. If the atomic
 rename made a session record authoritative but syncing the parent directory
 then failed, the daemon treats the commit as applied and logs a sanitized

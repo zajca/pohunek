@@ -634,6 +634,12 @@ returned runtime identity, decimal generation, and state as authoritative.
 Retry only when the operation is still valid from that current runtime; do not
 reuse the losing operation's runtime coordinates.
 
+The same error on every attempt of `pohunek session rm <id>` for a `failed`
+session with a `lost` runtime can come from a stored record whose two runtime
+instance copies disagree. The daemon accepts such a rewrite (and so the removal
+intent). Removal can still refuse
+for its other reasons, such as processes that are not proven gone.
+
 Do not interpret this error as a failed atomic rename or uncertain disk commit.
 When rename succeeds but the parent-directory durability sync fails, the daemon
 keeps the visible commit applied and writes a sanitized internal warning. It
