@@ -204,7 +204,8 @@ write_wrapper() {
         printf "CLAUDE_BIN='%s'\n" "$claude_path"
         awk 'f { print } /^# BEGIN-TEMPLATE$/ { f = 1 }' "$template"
     } > "$TMP_FILE"
-    chmod 755 -- "$TMP_FILE"
+    # BSD chmod reads a `--` after the mode as a file name, so it comes first.
+    chmod -- 755 "$TMP_FILE"
     mv -f -- "$TMP_FILE" "$WRAPPER"
     TMP_FILE=''
 }
