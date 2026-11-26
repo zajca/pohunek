@@ -586,6 +586,9 @@ IMAGE_KEYED = ("systemd-oomd", "npm:")
 # The runner downloads the actions nested in the composites from these
 # hosts while the proof is offline, so they must stay reachable.
 RUNNER_HOSTS = {"api.github.com", "codeload.github.com"}
+# The libghostty-vt job runs the libghostty-vt action, not a pinned-cache
+# item; test_libghostty_vt.py checks its structure.
+LIBGHOSTTY_JOB = "libghostty-vt"
 
 
 def job_runner(text, job):
@@ -670,6 +673,8 @@ class OfflineProofGuardTests(unittest.TestCase):
         self.assertTrue(jobs)
         sites = item_sites(self.proof)
         for job, steps in jobs.items():
+            if job == LIBGHOSTTY_JOB:
+                continue
             with self.subTest(job=job):
                 offline = offline_step_index(steps)
                 self.assertIsNotNone(offline, "exactly one offline step")
@@ -689,6 +694,8 @@ class OfflineProofGuardTests(unittest.TestCase):
     def test_every_job_ends_by_requiring_the_hit_of_each_of_its_items(self):
         sites = item_sites(self.proof)
         for job, steps in workflow_job_steps(self.proof).items():
+            if job == LIBGHOSTTY_JOB:
+                continue
             with self.subTest(job=job):
                 last = steps[-1]
                 self.assertEqual(last.get("name"), "Require a hit for every restore")

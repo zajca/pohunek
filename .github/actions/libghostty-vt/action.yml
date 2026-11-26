@@ -1,0 +1,212 @@
+name: libghostty-vt
+description: >-
+  Provide the pinned libghostty-vt static library for one Rust target
+  (issue #2538). The library is built by `scripts/build-libghostty-vt` from
+  the two sha256-checked tarballs of `scripts/libghostty-vt.pin.toml` with the
+  pinned Zig, and is never built by cargo. The built directory is cached under
+  a key made of the pin file, the build script, the ABI probe and the target,
+  so a warm lane restores it in seconds and only a cold lane runs Zig. A miss
+  installs Zig through `setup-zig` and restores or downloads the two tarballs
+  (cached under their own key, so a bumped build script does not download them
+  again). Runs on a Linux x86_64 runner only: the Zig release is the x86_64
+  Linux build, and the aarch64-apple-darwin library is cross-built here and
+  handed to the macOS jobs as an artifact (`--probe-native` there records the
+  layout of the mirrored types).
+
+inputs:
+  target:
+    description: >-
+      Rust target triple, a key of the `[targets]` table of the pin file
+      (x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl or
+      aarch64-apple-darwin).
+    required: true
+  export-env:
+    description: >-
+      `true` writes `LIBGHOSTTY_VT_DIR` to `GITHUB_ENV` for the later steps of
+      the job; `false` leaves the environment alone (a job that needs several
+      targets reads the `dir` output instead).
+    required: false
+    default: "true"
+  force-build:
+    description: >-
+      `true` skips the restore and the save of the built library and builds it
+      from the cached tarballs and the cached Zig. The offline proof uses it to
+      show that a build needs no download host.
+    required: false
+    default: "false"
+
+outputs:
+  dir:
+    description: The directory holding `lib/`, `include/`, `abi-layout.txt` and `BUILD_INFO`.
+    value: ${{ steps.key.outputs.dir }}
+  hit:
+    description: "`true` when the built library came from the cache."
+    value: ${{ steps.report.outputs.hit }}
+  zig-hit:
+    description: "`true` when the pinned Zig came from the cache; empty when no build ran."
+    value: ${{ steps.zig.outputs.hit }}
+  tarballs-hit:
+    description: "`true` when the two tarballs came from the cache; empty when no build ran."
+    value: ${{ steps.tarballs-report.outputs.hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs and read the pins
+      id: pins
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        EXPORT_ENV: ${{ inputs.export-env }}
+        FORCE_BUILD: ${{ inputs.force-build }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::libghostty-vt: $*" >&2; exit 1; }
+        [ -n "$TARGET" ] || fail "input 'target' is required"
+        case "$EXPORT_ENV" in true|false) ;; *) fail "input 'export-env' must be true or false, not '$EXPORT_ENV'" ;; esac
+        case "$FORCE_BUILD" in true|false) ;; *) fail "input 'force-build' must be true or false, not '$FORCE_BUILD'" ;; esac
+        [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || fail "runs on a Linux x86_64 runner only"
+        script="${GITHUB_WORKSPACE:?}/scripts/build-libghostty-vt"
+        python3 -I "$script" --print-pin "targets.$TARGET" > /dev/null \
+          || fail "the pin file has no Zig target for $TARGET"
+        {
+          echo "zig-version=$(python3 -I "$script" --print-pin zig.version)"
+          echo "zig-sha256=$(python3 -I "$script" --print-pin zig.linux_x86_64_sha256)"
+          echo "source-sha256=$(python3 -I "$script" --print-pin source.sha256)"
+          echo "deps-sha256=$(python3 -I "$script" --print-pin deps.sha256)"
+        } >> "$GITHUB_OUTPUT"
+
+    # Everything that selects the bytes of the library: the pin file (library,
+    # tarballs, Zig, optimize flags, target mapping), the script that builds it,
+    # the ABI probe whose output it records, and the target.
+    - name: Compute the cache keys
+      id: key
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        SOURCE_SHA256: ${{ steps.pins.outputs.source-sha256 }}
+        DEPS_SHA256: ${{ steps.pins.outputs.deps-sha256 }}
+      run: |
+        set -euo pipefail
+        cd "${GITHUB_WORKSPACE:?}/scripts"
+        inputs_hash="$(cat build-libghostty-vt libghostty-vt-abi-probe.c libghostty-vt.pin.toml | sha256sum | cut -d' ' -f1)"
+        {
+          echo "key=libghostty-vt-${RUNNER_OS:?}-${TARGET}-${inputs_hash}"
+          echo "dir=${RUNNER_TEMP:?}/libghostty-vt-${TARGET}"
+          echo "tarballs-key=libghostty-vt-tarballs-${SOURCE_SHA256:0:16}-${DEPS_SHA256:0:16}"
+          echo "tarballs-dir=${RUNNER_TEMP}/libghostty-vt-tarballs"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore the built library
+      id: restore
+      if: inputs.force-build != 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+
+    # actions/cache/restore leaves `cache-hit` empty when nothing matched.
+    - name: Report the built library
+      id: report
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+        KEY: ${{ steps.key.outputs.key }}
+      run: |
+        set -euo pipefail
+        if [ "$CACHE_HIT" = true ]; then hit=true; state=hit; else hit=false; state=miss; fi
+        echo "hit=$hit" >> "$GITHUB_OUTPUT"
+        echo "libghostty-vt: built library $state ($KEY)"
+        echo "libghostty-vt: built library $state \`$KEY\`" >> "${GITHUB_STEP_SUMMARY:?}"
+
+    - name: Install zig
+      id: zig
+      if: steps.report.outputs.hit != 'true'
+      uses: ./.github/actions/setup-zig
+      with:
+        version: ${{ steps.pins.outputs.zig-version }}
+        sha256: ${{ steps.pins.outputs.zig-sha256 }}
+
+    - name: Restore the pinned tarballs
+      id: tarballs
+      if: steps.report.outputs.hit != 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.key.outputs.tarballs-dir }}
+        key: ${{ steps.key.outputs.tarballs-key }}
+
+    - name: Report the pinned tarballs
+      id: tarballs-report
+      if: steps.report.outputs.hit != 'true'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.tarballs.outputs.cache-hit }}
+        KEY: ${{ steps.key.outputs.tarballs-key }}
+      run: |
+        set -euo pipefail
+        if [ "$CACHE_HIT" = true ]; then hit=true; state=hit; else hit=false; state=miss; fi
+        echo "hit=$hit" >> "$GITHUB_OUTPUT"
+        echo "libghostty-vt: tarballs $state ($KEY)"
+        echo "libghostty-vt: tarballs $state \`$KEY\`" >> "${GITHUB_STEP_SUMMARY:?}"
+
+    # The script checks the sha256 of both files and writes nothing that fails
+    # the check, so only verified tarballs reach the save step.
+    - name: Download the pinned tarballs
+      if: steps.report.outputs.hit != 'true' && steps.tarballs-report.outputs.hit != 'true'
+      shell: bash
+      env:
+        TARBALLS_DIR: ${{ steps.key.outputs.tarballs-dir }}
+      run: |
+        set -euo pipefail
+        rm -rf "${TARBALLS_DIR:?}"
+        python3 -I "${GITHUB_WORKSPACE:?}/scripts/build-libghostty-vt" --download-tarballs "$TARBALLS_DIR"
+
+    - name: Save the pinned tarballs
+      if: steps.report.outputs.hit != 'true' && steps.tarballs-report.outputs.hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.key.outputs.tarballs-dir }}
+        key: ${{ steps.key.outputs.tarballs-key }}
+
+    - name: Build the library
+      if: steps.report.outputs.hit != 'true'
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        OUT_DIR: ${{ steps.key.outputs.dir }}
+        TARBALLS_DIR: ${{ steps.key.outputs.tarballs-dir }}
+      run: |
+        set -euo pipefail
+        python3 -I "${GITHUB_WORKSPACE:?}/scripts/build-libghostty-vt" "$TARGET" "$OUT_DIR" \
+          --tarball-dir "$TARBALLS_DIR"
+        cat "$OUT_DIR/BUILD_INFO"
+        {
+          echo "libghostty-vt: built $TARGET from the pinned sources"
+          echo '```'
+          cat "$OUT_DIR/BUILD_INFO"
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY:?}"
+
+    # Runs on the hit and the build path: a stale or corrupt entry fails the
+    # step instead of reaching the compiler.
+    - name: Verify the library against the pin
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        OUT_DIR: ${{ steps.key.outputs.dir }}
+      run: python3 -I "${GITHUB_WORKSPACE:?}/scripts/build-libghostty-vt" "$TARGET" "$OUT_DIR" --verify
+
+    # The saved entry is the verified build; a hit restored this exact key.
+    - name: Save the built library
+      if: steps.report.outputs.hit != 'true' && inputs.force-build != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Export LIBGHOSTTY_VT_DIR
+      if: inputs.export-env == 'true'
+      shell: bash
+      env:
+        OUT_DIR: ${{ steps.key.outputs.dir }}
+      run: echo "LIBGHOSTTY_VT_DIR=$OUT_DIR" >> "${GITHUB_ENV:?}"

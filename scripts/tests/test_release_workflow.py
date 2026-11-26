@@ -1164,21 +1164,23 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
 
 
 class PinningTests(ReleaseWorkflowFiles):
+    def assert_local_closure_is_pinned(self, action, seen):
+        """Every non-local `uses:` reachable through local composites, at any depth, is pinned."""
+        if action in seen:
+            return
+        seen.add(action)
+        for inner in all_uses((ROOT / action[2:] / "action.yml").read_text()):
+            if LOCAL_ACTION.match(inner):
+                self.assert_local_closure_is_pinned(inner, seen)
+            else:
+                self.assertRegex(canonical_action(inner), PINNED)
+
     def test_every_action_is_pinned_to_a_commit_or_local(self):
         for file, text in self.texts.items():
             for action in all_uses(text):
                 with self.subTest(file=file, action=action):
                     if LOCAL_ACTION.match(action):
-                        nested = (ROOT / action[2:] / "action.yml").read_text()
-                        for inner in all_uses(nested):
-                            # A nested local composite also resolves from
-                            # the same commit; its own uses stay pinned.
-                            if LOCAL_ACTION.match(inner):
-                                deep_text = (ROOT / inner[2:] / "action.yml").read_text()
-                                for deep in all_uses(deep_text):
-                                    self.assertRegex(canonical_action(deep), PINNED)
-                            else:
-                                self.assertRegex(canonical_action(inner), PINNED)
+                        self.assert_local_closure_is_pinned(action, set())
                     elif action.startswith("./"):
                         self.assertRegex(action, r"^\./\.github/workflows/[a-z-]+\.yml$")
                     else:

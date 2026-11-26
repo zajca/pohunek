@@ -56,7 +56,7 @@ env:
   OFFLINE_HOSTS: >-
     github.com objects.githubusercontent.com release-assets.githubusercontent.com
     raw.githubusercontent.com ziglang.org get.nexte.st crates.io index.crates.io
-    static.crates.io static.rust-lang.org
+    static.crates.io static.rust-lang.org release.files.ghostty.org
   # A loopback connection is refused at once; this only bounds a hung one.
   OFFLINE_CONNECT_TIMEOUT_SECONDS: "5"
 
@@ -148,6 +148,61 @@ jobs:
       - name: Require a hit for every restore
         env:
           HITS: mold=${{ steps.mold.outputs.hit }} zig=${{ steps.zig.outputs.hit }} uv=${{ steps.uv.outputs.hit }} nextest=${{ steps.nextest.outputs.hit }} codex=${{ steps.codex-tree.outputs.hit }} claude=${{ steps.claude-tree.outputs.hit }}
+        run: |
+          set -euo pipefail
+          for hit in $HITS; do
+            [ "${hit#*=}" = true ] || { echo "::error::pinned-cache offline proof: ${hit%%=*} did not hit" >&2; exit 1; }
+          done
+          echo "every restore hit: $HITS"
+
+  # The libghostty-vt library (issue #2538): the built library restores from
+  # its entry, and a forced rebuild (no restore of the built library) runs the
+  # pinned Zig and the two pinned tarballs from their entries, so the miss path
+  # of the action needs no download host either. The entries come from the
+  # libghostty-vt.yml run on main (or, on a pull request that changes the
+  # build, from that workflow's run on the same ref).
+  libghostty-vt:
+    name: offline hit (libghostty-vt)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Take the miss-path download hosts offline
+        timeout-minutes: 5
+        run: |
+          sudo python3 -I .github/scripts/pinned-cache-offline apply \
+            --hosts-file /etc/hosts --connect-timeout "$OFFLINE_CONNECT_TIMEOUT_SECONDS" \
+            --apt-dir /etc/apt \
+            --npm-lock compat/pi/npm/package-lock.json \
+            --npm-lock compat/codex/npm/package-lock.json \
+            --npm-lock compat/claude/npm/package-lock.json \
+            $OFFLINE_HOSTS
+
+      - name: Restore the built libghostty-vt library
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 10
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+
+      - name: Rebuild libghostty-vt from the cached Zig and tarballs
+        id: rebuild
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 20
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+          force-build: "true"
+
+      - name: Require a hit for every restore
+        env:
+          HITS: library=${{ steps.library.outputs.hit }} zig=${{ steps.rebuild.outputs.zig-hit }} tarballs=${{ steps.rebuild.outputs.tarballs-hit }}
         run: |
           set -euo pipefail
           for hit in $HITS; do

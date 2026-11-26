@@ -99,6 +99,59 @@ jobs:
           version="$(scripts/release-workflow/version "$MODE" "$REF_NAME")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+  # The aarch64-apple-darwin libghostty-vt library, cross-built on Linux (the
+  # pinned Zig is an x86_64 Linux binary) for the macOS jobs of this workflow,
+  # which download it and record the layout of the mirrored types natively. The
+  # job also writes the supply-chain record of the pin (library, tarball and Zig
+  # sha256, signing key) as `libghostty-vt-evidence`; the evidence workflow
+  # attests it next to the archives. The Linux jobs build their own targets
+  # with the same action.
+  libghostty-darwin:
+    name: libghostty-vt for aarch64-apple-darwin
+    needs: [meta]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+          export-env: "false"
+
+      - name: Record the pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/libghostty-vt-evidence"
+          python3 -I scripts/build-libghostty-vt \
+            --evidence "$RUNNER_TEMP/libghostty-vt-evidence/libghostty-vt-evidence.json"
+
+      # A rerun of the job replaces the uploads of its failed attempt.
+      - name: Upload the library for the macOS jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-darwin-release-build
+          path: ${{ steps.library.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+      - name: Upload the pin record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-evidence
+          path: ${{ runner.temp }}/libghostty-vt-evidence
+          if-no-files-found: error
+          overwrite: true
+
   # One job per target. Each component keeps its own `cargo build`
   # invocation, so feature unification across components cannot change its
   # bytes, while the components of a target share the compiled dependencies.
@@ -159,6 +212,14 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           targets: ${{ matrix.target }}
+
+      # The pinned static library of the matrix target (cached, built with the
+      # pinned Zig on a miss); it exports LIBGHOSTTY_VT_DIR for the builds below.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: ${{ matrix.target }}
 
       # Every job links host binaries (build scripts, `cargo xtask docs site`)
       # with the job-level mold RUSTFLAGS; only the musl target link itself
@@ -363,6 +424,12 @@ jobs:
         with:
           targets: ${{ env.TARGET }}
 
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: ${{ env.TARGET }}
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -421,7 +488,7 @@ jobs:
   kit-macos:
     name: Build the plugin kit bundle for aarch64-apple-darwin
     if: ${{ inputs.mode == 'release' || inputs.nightly == 'true' }}
-    needs: [meta]
+    needs: [meta, libghostty-darwin]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -442,6 +509,11 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           targets: ${{ env.TARGET }}
+
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-release-build
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -523,6 +595,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
+
+      # xtask links the workspace crates the release binaries link.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -625,7 +704,7 @@ jobs:
   rehearsal-macos:
     name: Build and sign cli and daemon for aarch64-apple-darwin (rehearsal)
     if: ${{ inputs.mode == 'rehearsal' }}
-    needs: [meta]
+    needs: [meta, libghostty-darwin]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -643,6 +722,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
+
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-release-build
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
