@@ -200,7 +200,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
      ```
 
    - **Website.** pohunek.dev `follow-release` (every 3 hours, or a manual
-     dispatch; the core Release workflow does not notify it) records a
+     dispatch, see step 10b.1; the core Release workflow does not notify it) records a
      release's body the first time it sees the release and keeps that record
      when the body changes later: the marked block as `source:
      "release-notes"`, or, for a body without markers, a list of pull request
@@ -327,21 +327,27 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
     | Hosts that run pohunek for other services (the `pohunekd/autoreview` review hosts) | Their operator gets the version and whether the protocol window requires an upgrade; upgrade on their schedule. | The operator acknowledged. |
     | pohunek.dev | `follow-release` moves the `pohunek` pin in `releases.config.json` and records the post (step 8); a manual run is `gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek`. The roadmap is hand-written and is reconciled in step 10b. | The site shows vX.Y.Z with the post, the roadmap names vX.Y.Z as released (step 10b), and each downstream release above once it is out. |
 
-10b. **Website: changelog and roadmap.** Run this after step 8 shows the
-    published, approved post, because the site records a release body the first
-    time it sees it. The core Release workflow does not notify the site.
+10b. **Website: changelog and roadmap.** Start with 10b.1 once step 8 has
+    published the approved post (the Website check of step 8 needs it), because
+    the site records a release body the first time it sees it. The core
+    Release workflow does not notify the site.
 
     1. **Follow the release.** Dispatch the site's follow workflow for the new
        version and wait for it:
 
        ```bash
+       START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
        gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek -f version=X.Y.Z
-       gh run watch --repo pohunekd/pohunek.dev "$(gh run list --repo pohunekd/pohunek.dev --workflow=follow-release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+       RUN=$(gh run list --repo pohunekd/pohunek.dev --workflow=follow-release.yml --event workflow_dispatch --json databaseId,createdAt --jq "map(select(.createdAt >= \"$START\")) | first | .databaseId")
+       gh run watch --repo pohunekd/pohunek.dev --exit-status "$RUN"
        ```
 
-       Without `-f version` the run follows the newest release of every
-       product. A failed run is reported with its failing job; do not retry it
-       blindly.
+       The run is picked by event and creation time, so an earlier scheduled
+       run is never watched; rerun the `RUN=` line when it prints `null`, which
+       means the dispatched run is not listed yet. Without `-f version` the
+       run follows the newest release of the product named by `-f product`;
+       without `-f product` it follows every product. A failed run is reported
+       with its failing job; do not retry it blindly.
     2. **Verify the changelog page.** Re-query the live site, not the run:
        the recorded entry (`source` must be `release-notes`, see the Website
        check of step 8) and the rendered page:
@@ -364,9 +370,18 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
          epics that define it).
 
        The "Recent core releases" table of `/roadmap/` is derived from the
-       recorded changelog and needs no edit. Verify the page after its deploy:
-       `curl -fsS https://pohunek.dev/roadmap/ | grep -c 'vX.Y.Z'` prints at
-       least 1.
+       recorded changelog and needs no edit; it shows vX.Y.Z without a roadmap
+       update, so it proves nothing about this step. After the pull request is
+       merged, check the file on `main`:
+
+       ```bash
+       gh api -H 'Accept: application/vnd.github.raw' \
+         repos/pohunekd/pohunek.dev/contents/src/data/roadmap.ts \
+         | grep -c "roadmapRelease = 'vX.Y.Z'"   # 1
+       ```
+
+       The roadmap page carries the change once the deploy that follows the
+       merge has finished.
 
 11. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
@@ -382,7 +397,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
   locally.
 - Do not hand-edit versions or push a tag of this repository outside
   `scripts/release`. Step 9 edits and tags `pohunekd/plugin-assistant`, a
-  separate repository; step 10 changes other repositories only through their
+  separate repository; steps 10 and 10b change other repositories only through their
   own pull requests and releases.
 - Never publish a release post that still holds `TODO(release-post)` or that
   the coordinator or owner has not approved.
