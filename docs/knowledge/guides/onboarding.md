@@ -149,9 +149,10 @@ Proposals are read-only until applied under the mode rules.
    highest first. Report `dropped` and `limits_reached` as counts only.
 5. Propose `pohunek project add <repo_root> --name <name>`: the name is the
    last component of `repo_root`, made unique against existing project labels.
-   Add `--base-branch <branch>` only when
-   `git -C <repo_root> symbolic-ref --short refs/remotes/origin/HEAD` names one
-   (drop the `origin/` prefix); otherwise leave the default.
+   Add `--base-branch <branch>` only when the user names a base branch for that
+   repository; otherwise leave the default. Never run `git` to find it: no pohunek
+   command reports a repository's default branch and `git` is not in the
+   allowlist, so it would stop the session on a permission prompt.
 
 ### Groups
 
@@ -167,10 +168,12 @@ other key on another session.
 Profiles are created only through `pohunek plugin profile create`, never by
 writing files, and only for a clear extra-home signal:
 
-- The user names a second Claude or Codex config home, or a directory such as
-  `~/.claude-<name>` or `~/.codex-<name>` holds that runtime's settings file
-  (`settings.json` for Claude, `config.toml` for Codex). Test only that the
-  file exists; do not read it.
+- The user names a second Claude or Codex config home. Ask the user for it
+  (in automatic mode only with the `profiles` grant, together with the profile
+  confirmation; without it, propose no profile); never look for one on disk: no shell loop, glob, `ls`, `test` or `find` over
+  `~/.claude-*` or `~/.codex-*`, and no listing of the user's home directory.
+  Those commands are not in the allowlist, so each one stops the session on a
+  permission prompt.
 - The home is not a default home (`~/.claude`, `~/.codex`, or the runtime's own
   `CLAUDE_CONFIG_DIR` or `CODEX_HOME`) and is not already the home of a profile.
   `pohunek integration status --all-profiles --json` lists the homes existing
