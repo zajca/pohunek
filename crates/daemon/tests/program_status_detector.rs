@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
     ActivityTransition, DetectionConfig, Detector, DetectorConfig, LimitSighting, Manifest,
-    ManifestError, ProgramStatusConfig, MAX_JOURNALED_UNMAPPED_TUPLES, MAX_LIMIT_SIGHTINGS,
+    ManifestError, MarkerClass, ProgramStatusConfig, MAX_GENERIC_LIMIT_SIGHTINGS,
+    MAX_JOURNALED_UNMAPPED_TUPLES, MAX_SPECIFIC_LIMIT_SIGHTINGS,
 };
 use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
@@ -1924,19 +1925,31 @@ fn a_usage_limit_screen_is_sighted_once_with_the_held_record() {
     );
 }
 
-/// Alternating limit phrases are capped per detector: `MAX_LIMIT_SIGHTINGS`
-/// screens are journaled, the next one queues exactly one suppression line, and
-/// a lag resync or reconfigure keeps the budget spent (#2101 review).
-#[test]
-fn alternating_limit_screens_are_capped_with_one_suppression_line() {
-    let mut harness = Harness::claude();
+/// Feeds `phrase` as a limit banner after a screen that names no limit, so the
+/// sighting latch is re-armed, and takes what the detector queued.
+fn sight_banner(harness: &mut Harness, phrase: &str) -> Option<LimitSighting> {
     harness.feed(&captured("claude", "idle"));
-    let phrases = ["usage limit reached", "weekly limit"];
-    for index in 0..MAX_LIMIT_SIGHTINGS {
-        harness.feed(&usage_limit_banner(phrases[index % phrases.len()]));
-        let sighting = harness
-            .detector
-            .take_usage_limit_sighting()
+    harness.feed(&usage_limit_banner(phrase));
+    harness.detector.take_usage_limit_sighting()
+}
+
+/// Specific phrases are capped per detector: `MAX_SPECIFIC_LIMIT_SIGHTINGS`
+/// screens are journaled, the next one queues exactly one suppression line
+/// naming the class, and a lag resync or reconfigure keeps the budget spent
+/// (#2101 review). The bare phrases keep their own budget.
+#[test]
+fn specific_limit_screens_are_capped_with_one_suppression_line() {
+    let mut harness = Harness::claude();
+    let phrases = [
+        "usage limit reached",
+        "hit your usage limit",
+        "hit your limit",
+        "usage limit will reset",
+        "usage limit resets",
+        "5-hour limit",
+    ];
+    for index in 0..MAX_SPECIFIC_LIMIT_SIGHTINGS {
+        let sighting = sight_banner(&mut harness, phrases[index % phrases.len()])
             .unwrap_or_else(|| panic!("sighting {index} is under the cap"));
         assert!(
             matches!(sighting, LimitSighting::Screen(_)),
@@ -1944,21 +1957,22 @@ fn alternating_limit_screens_are_capped_with_one_suppression_line() {
         );
     }
 
-    harness.feed(&usage_limit_banner(
-        phrases[MAX_LIMIT_SIGHTINGS % phrases.len()],
-    ));
     assert_eq!(
-        harness.detector.take_usage_limit_sighting(),
+        sight_banner(&mut harness, "usage limit reached"),
         Some(LimitSighting::Suppressed {
-            sightings: MAX_LIMIT_SIGHTINGS
+            class: MarkerClass::Specific,
+            sightings: MAX_SPECIFIC_LIMIT_SIGHTINGS
         }),
         "one suppression line after the cap"
     );
+    assert!(
+        sight_banner(&mut harness, "usage limit reached").is_none(),
+        "no second suppression line"
+    );
 
     harness.detector.resync_after_lag();
-    harness.feed(&usage_limit_banner("usage limit resets"));
     assert!(
-        harness.detector.take_usage_limit_sighting().is_none(),
+        sight_banner(&mut harness, "usage limit resets").is_none(),
         "a lag resync does not start a second budget"
     );
 
@@ -1969,10 +1983,92 @@ fn alternating_limit_screens_are_capped_with_one_suppression_line() {
             InputReadiness::ScreenIdle,
         ),
     );
-    harness.feed(&usage_limit_banner("5-hour limit"));
+    assert!(
+        sight_banner(&mut harness, "5-hour limit").is_none(),
+        "a reconfigure does not start a second budget"
+    );
+
+    assert!(
+        matches!(
+            sight_banner(&mut harness, "weekly limit"),
+            Some(LimitSighting::Screen(_))
+        ),
+        "a spent specific budget leaves the bare phrases their own"
+    );
+}
+
+/// Transcript quotes of a bare phrase spend only the generic budget: after
+/// `MAX_GENERIC_LIMIT_SIGHTINGS` quotes and the one suppression line, a real
+/// `usage limit reached` screen is still recorded (#2527).
+#[test]
+fn bare_phrase_quotes_cannot_spend_the_budget_of_a_real_limit_hit() {
+    let mut harness = Harness::claude();
+    let phrases = ["usage limit", "weekly limit"];
+    for index in 0..MAX_GENERIC_LIMIT_SIGHTINGS {
+        let sighting = sight_banner(&mut harness, phrases[index % phrases.len()])
+            .unwrap_or_else(|| panic!("quote {index} is under the cap"));
+        assert!(
+            matches!(sighting, LimitSighting::Screen(_)),
+            "quote {index}: {sighting:?}"
+        );
+    }
+
+    assert_eq!(
+        sight_banner(&mut harness, "usage limit"),
+        Some(LimitSighting::Suppressed {
+            class: MarkerClass::Generic,
+            sightings: MAX_GENERIC_LIMIT_SIGHTINGS
+        }),
+        "one suppression line after the generic cap"
+    );
+    assert!(
+        sight_banner(&mut harness, "weekly limit").is_none(),
+        "no second suppression line"
+    );
+
+    let hit = sight_banner(&mut harness, "usage limit reached").expect("the real hit is recorded");
+    let LimitSighting::Screen(hit) = hit else {
+        panic!("expected a screen sighting, got {hit:?}");
+    };
+    assert_eq!(hit.marker, "usage limit reached");
+}
+
+/// One drawn screen is sighted once per class: a bare phrase followed by a
+/// specific one is sighted twice (the specific one is the upgrade), a specific
+/// phrase followed by a bare one is not sighted again.
+#[test]
+fn a_specific_phrase_upgrades_a_latched_bare_phrase_once() {
+    let mut harness = Harness::claude();
+    harness.feed(&captured("claude", "idle"));
+    harness.feed(&usage_limit_banner("usage limit"));
+    let bare = harness
+        .detector
+        .take_usage_limit_sighting()
+        .expect("the bare phrase is sighted");
+    assert!(
+        matches!(&bare, LimitSighting::Screen(sighting) if sighting.marker == "usage limit"),
+        "{bare:?}"
+    );
+
+    harness.feed(&usage_limit_banner("usage limit reached"));
+    let upgrade = harness
+        .detector
+        .take_usage_limit_sighting()
+        .expect("the specific phrase is sighted");
+    assert!(
+        matches!(&upgrade, LimitSighting::Screen(sighting) if sighting.marker == "usage limit reached"),
+        "{upgrade:?}"
+    );
+
+    harness.feed(&usage_limit_banner("weekly limit"));
     assert!(
         harness.detector.take_usage_limit_sighting().is_none(),
-        "a reconfigure does not start a second budget"
+        "a fall back to a bare phrase is no sighting"
+    );
+    harness.feed(&usage_limit_banner("hit your limit"));
+    assert!(
+        harness.detector.take_usage_limit_sighting().is_none(),
+        "a second specific phrase on the same screen is no sighting"
     );
 }
 

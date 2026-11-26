@@ -268,16 +268,18 @@ The daemon journals a usage-limit screen instead of a scenario capturing it.
 When the visible screen names a usage limit, the detector records one sighting
 and the session loop writes an info line under
 `session.program_status.limit_screen` to `~/.local/state/pohunek/logs/`, at
-most a bounded number of sightings per detector; after the cap it writes one
-`further usage-limit screen sightings suppressed` line and no further sighting.
-The
+most a bounded number of sightings per runtime launch for each marker class (the
+bare `usage limit` and `weekly limit` phrases have their own budget, so quoted
+text cannot spend the budget of the specific phrases); after a class budget it
+writes one `further usage-limit screen sightings suppressed` line naming the
+`marker_class` and no further sighting of that class. The
 line carries the matched marker, the held OSC 7501 record in canonical form,
 its age and staleness, the latest unmapped record's tokens (`state`, `kind`,
 `app`, whether it carried a message or a title) and the published activity;
 screen and message text never reach the log. A record the daemon cannot map is
 journaled at info under `session.program_status.unmapped`, once per distinct
 `(reason, state, kind, app)` tuple and only for a runtime that opted in to
-program status, up to a bounded set per session; after the set is full it writes
+program status, up to a bounded set per runtime launch; after the set is full it writes
 one suppression line.
 
 After a real limit hit, collect the evidence for #2101 from those two targets,

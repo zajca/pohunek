@@ -30,7 +30,7 @@ pub use osc::{
     OscEvidence, OscParser, ProgressReport, ProgressState, UnmappedProgramStatus,
     MAX_JOURNALED_UNMAPPED_TUPLES,
 };
-pub use usage_limit::MAX_LIMIT_SIGHTINGS;
+pub use usage_limit::{MarkerClass, MAX_GENERIC_LIMIT_SIGHTINGS, MAX_SPECIFIC_LIMIT_SIGHTINGS};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
 use package::version_probe::ProbeVersion;
@@ -158,12 +158,24 @@ pub enum StalenessChange {
 pub enum LimitSighting {
     /// A screen named a usage limit, with the OSC 7501 evidence held then.
     Screen(LimitScreenSighting),
-    /// The detector reached [`MAX_LIMIT_SIGHTINGS`]; this is the one line
-    /// saying later screens are not journaled.
+    /// The detector spent the sighting budget of one marker class; this is the
+    /// one line per class saying later screens naming that class are not
+    /// journaled.
     Suppressed {
+        /// The class whose budget is spent.
+        class: MarkerClass,
         /// The cap that produced this line.
         sightings: usize,
     },
+}
+
+/// The sightings one marker class has spent.
+#[derive(Debug, Default, Clone, Copy)]
+struct LimitBudget {
+    /// Screens journaled for the class.
+    sightings: usize,
+    /// Whether the one suppression line after the cap was queued.
+    capped: bool,
 }
 
 /// A usage-limit screen the detector saw, with the OSC 7501 evidence held at
@@ -184,8 +196,8 @@ pub struct LimitScreenSighting {
     pub record_age: Option<std::time::Duration>,
     /// Whether the held record was stale when the screen was seen.
     pub stale: bool,
-    /// The latest 7501 payload the parser could not map, when it is the
-    /// session's most recent program-status evidence.
+    /// The latest 7501 payload the parser could not map. A mapped root record
+    /// clears it; a child record or a root `clear` leaves it in place.
     pub unmapped: Option<UnmappedProgramStatus>,
     /// The published activity when the screen was seen.
     pub activity: Option<AgentActivity>,
@@ -534,19 +546,21 @@ pub struct Detector {
     stale: Option<StaleRecord>,
     /// The latest staleness change, for the session loop to journal.
     staleness_change: Option<StalenessChange>,
-    /// The phrase of the usage-limit screen currently on display, when one is.
-    /// It latches the diagnostic sighting: one journal line per sighting, not
-    /// one per redraw, and a fresh line only after the screen stopped naming
-    /// the limit.
-    usage_limit_marker: Option<&'static str>,
+    /// The class of the strongest phrase the usage-limit screen currently on
+    /// display named, when one is. It latches the diagnostic sighting: one
+    /// journal line per class per screen, not one per redraw, and a fresh line
+    /// only after the screen stopped naming the limit or named a more specific
+    /// phrase.
+    usage_limit_latch: Option<usage_limit::MarkerClass>,
     /// The latest usage-limit sighting, for the session loop to journal.
     usage_limit_sighting: Option<LimitSighting>,
-    /// Usage-limit screens this detector journaled. The count survives
-    /// reconfiguration and lag resync: the cap is per detector, not per
-    /// latch, so a re-armed screen cannot start a second budget.
-    limit_sightings: usize,
-    /// Whether the one suppression line after the cap was queued.
-    limit_sightings_capped: bool,
+    /// Budget of the generic phrases. The counts survive reconfiguration and
+    /// lag resync: the cap is per detector, not per latch, so a re-armed
+    /// screen cannot start a second budget.
+    generic_limit_budget: LimitBudget,
+    /// Budget of the specific phrases, kept apart so quoted bare phrases
+    /// cannot spend it.
+    specific_limit_budget: LimitBudget,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
     /// Whether terminal context or the active manifest changed since the last
@@ -600,10 +614,10 @@ impl Detector {
             disagreement_since: None,
             stale: None,
             staleness_change: None,
-            usage_limit_marker: None,
+            usage_limit_latch: None,
             usage_limit_sighting: None,
-            limit_sightings: 0,
-            limit_sightings_capped: false,
+            generic_limit_budget: LimitBudget::default(),
+            specific_limit_budget: LimitBudget::default(),
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
             context_dirty: true,
@@ -781,13 +795,14 @@ impl Detector {
     }
 
     /// Records one usage-limit sighting per screen, never per redraw, up to
-    /// [`MAX_LIMIT_SIGHTINGS`] per detector.
+    /// the budget of the phrase's class per detector.
     ///
     /// The diagnostic applies only to a runtime whose manifest opted in to
     /// program-status evidence: it names the record held at that moment, which
     /// is the 7501 evidence #2101 is missing. A screen that stopped naming the
-    /// limit re-arms the latch for the next hit; the cap suppresses the line
-    /// once the budget is spent.
+    /// limit re-arms the latch for the next hit; a screen that adds a specific
+    /// phrase to a latched generic one is sighted once more. Each class cap
+    /// suppresses its line once its own budget is spent.
     fn observe_usage_limit_screen(&mut self, now: Instant, text: Option<&str>) {
         if self
             .manifest
@@ -800,24 +815,32 @@ impl Detector {
         let Some(text) = text else {
             return;
         };
-        let Some(marker) = usage_limit::marker(text) else {
-            self.usage_limit_marker = None;
+        let Some((marker, class)) = usage_limit::marker(text) else {
+            self.usage_limit_latch = None;
             return;
         };
-        if self.usage_limit_marker == Some(marker) {
+        if self
+            .usage_limit_latch
+            .is_some_and(|latched| latched >= class)
+        {
             return;
         }
-        self.usage_limit_marker = Some(marker);
-        if self.limit_sightings >= MAX_LIMIT_SIGHTINGS {
-            if !self.limit_sightings_capped {
-                self.limit_sightings_capped = true;
+        self.usage_limit_latch = Some(class);
+        let budget = match class {
+            usage_limit::MarkerClass::Generic => &mut self.generic_limit_budget,
+            usage_limit::MarkerClass::Specific => &mut self.specific_limit_budget,
+        };
+        if budget.sightings >= class.budget() {
+            if !budget.capped {
+                budget.capped = true;
                 self.usage_limit_sighting = Some(LimitSighting::Suppressed {
-                    sightings: MAX_LIMIT_SIGHTINGS,
+                    class,
+                    sightings: class.budget(),
                 });
             }
             return;
         }
-        self.limit_sightings += 1;
+        budget.sightings += 1;
         self.usage_limit_sighting = Some(LimitSighting::Screen(LimitScreenSighting {
             marker,
             record: self
@@ -1290,7 +1313,7 @@ impl Detector {
         self.program_status = None;
         self.program_status_at = None;
         self.disagreement_since = None;
-        self.usage_limit_marker = None;
+        self.usage_limit_latch = None;
         self.osc.clear_unmapped();
         self.process_activity.reset();
         self.state.clear_pending();
@@ -1317,7 +1340,7 @@ impl Detector {
         self.program_status = None;
         self.program_status_at = None;
         self.disagreement_since = None;
-        self.usage_limit_marker = None;
+        self.usage_limit_latch = None;
         // No `now` is in scope here; the state machine stays, so its
         // `emitted_at` remains the honest refresh timestamp.
         if self.stale.take().is_some() {
