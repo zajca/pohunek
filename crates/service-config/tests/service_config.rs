@@ -16,6 +16,7 @@ use pohunek_service_config::{
     ServiceConfig, WaitTiming, DEFAULT_CREATE_DRAIN, DEFAULT_EVENT_RETENTION,
     DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE,
     DEFAULT_KEEPALIVE_TIMING, DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_REGISTRY_SHUTDOWN,
+    DEFAULT_SUBSCRIPTION_SETTINGS,
     DEFAULT_WAIT_TIMING, DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
     MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
     MIN_WORKER_ANSWER,
@@ -3443,6 +3444,79 @@ fn worker_journal_ages_outside_their_bounds_are_refused_by_key() {
         fixture
             .load(&with_worker_journals(&format!("max_age_days = {days}")))
             .expect("the bounds are inclusive");
+    }
+}
+
+/// Appends a `[subscriptions]` table with `lines` to the golden file, before `[limits]`.
+fn with_subscriptions(lines: &str) -> String {
+    replace(
+        GOLDEN,
+        "[limits]",
+        &format!("[subscriptions]\n{lines}\n\n[limits]"),
+    )
+}
+
+/// A file without `[subscriptions]` means the documented defaults, and a
+/// rewrite does not add the table; custom values load, are known keys, and are
+/// written back.
+#[test]
+fn subscription_settings_default_round_trip_and_are_known_keys() {
+    let fixture = Fixture::new();
+    let loaded = fixture.load(GOLDEN).expect("load the golden file");
+    assert_eq!(loaded.subscriptions(), DEFAULT_SUBSCRIPTION_SETTINGS);
+    assert!(!loaded.to_toml().contains("[subscriptions]"));
+
+    let custom = fixture
+        .load(&with_subscriptions(
+            "session_event_capacity = 4096\nheartbeat_min_ms = 250",
+        ))
+        .expect("load custom settings");
+    let settings = custom.subscriptions();
+    assert_eq!(settings.session_event_capacity, 4096);
+    assert_eq!(settings.heartbeat_min_ms, 250);
+    assert_eq!(
+        settings.heartbeat_max_ms,
+        DEFAULT_SUBSCRIPTION_SETTINGS.heartbeat_max_ms
+    );
+    assert!(
+        custom.unknown_keys().is_empty(),
+        "{:?}",
+        custom.unknown_keys()
+    );
+    let rendered = custom.to_toml();
+    assert!(rendered.contains("session_event_capacity = 4096"), "{rendered}");
+    assert!(
+        !rendered.contains("notification_event_capacity"),
+        "a key equal to its default is not written: {rendered}"
+    );
+    assert_eq!(fixture.load(&rendered).expect("reload"), custom);
+}
+
+/// A value outside its bounds, or an inverted heartbeat range, fails startup
+/// and names the key.
+#[test]
+fn subscription_settings_outside_their_bounds_are_refused_by_key() {
+    let fixture = Fixture::new();
+    for (line, key) in [
+        (
+            "session_event_capacity = 1",
+            "subscriptions.session_event_capacity",
+        ),
+        (
+            "notification_event_capacity = 65537",
+            "subscriptions.notification_event_capacity",
+        ),
+        ("heartbeat_min_ms = 9", "subscriptions.heartbeat_min_ms"),
+        ("heartbeat_max_ms = 3600001", "subscriptions.heartbeat_max_ms"),
+        (
+            "heartbeat_min_ms = 5000\nheartbeat_max_ms = 4000",
+            "subscriptions.heartbeat_min_ms",
+        ),
+    ] {
+        match fixture.load(&with_subscriptions(line)) {
+            Err(ConfigError::OutOfRange { key: found, .. }) => assert_eq!(found, key, "{line}"),
+            other => panic!("{line} must be refused, got {other:?}"),
+        }
     }
 }
 
