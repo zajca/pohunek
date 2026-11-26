@@ -111,7 +111,7 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT" = workflow_dispatch ] || git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
-            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|config/|fixtures/claude.trace|src/(config|trace|report|ffi|ghostty|ghostty_model|vt100_model|registry).rs|src/bin/(size-probe|throughput).rs)|.github/workflows/libghostty-spike.yml)'; then
+            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|config/|fixtures/claude.trace|src/(config|trace|expect|model|replay|report|ffi|ghostty|ghostty_model|vt100_model|registry).rs|fixtures/[^/]*.expect.toml|src/bin/(size-probe|throughput).rs)|.github/workflows/libghostty-spike.yml)'; then
             echo run=true >> "$GITHUB_OUTPUT"
           else
             echo run=false >> "$GITHUB_OUTPUT"

@@ -1,18 +1,177 @@
 {
   "schema_version": 1,
   "targets": {
+    "aarch64-apple-darwin": {
+      "host": {
+        "cpu": "Apple M1 (Virtual)",
+        "logical_cpus": 3,
+        "machine": "arm64",
+        "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+        "system": "Darwin"
+      },
+      "library": {
+        "archive_bytes": 2978968,
+        "version": "1.0.2",
+        "zig_build_seconds_cold": 175.1,
+        "zig_target": "aarch64-macos.14.0",
+        "zig_version": "0.17.0"
+      },
+      "link_checks": {
+        "minos": "14.0"
+      },
+      "runner": "macos-15",
+      "schema_version": 1,
+      "size_probe": {
+        "delta_build_seconds": -0.2,
+        "delta_stripped_bytes": 1010464,
+        "delta_unstripped_bytes": 1031520,
+        "with_feature": {
+          "build_seconds": 24.4,
+          "stripped_bytes": 1811784,
+          "unstripped_bytes": 2038112
+        },
+        "without_feature": {
+          "build_seconds": 24.6,
+          "stripped_bytes": 801320,
+          "unstripped_bytes": 1006592
+        }
+      },
+      "target": "aarch64-apple-darwin",
+      "throughput": [
+        {
+          "bytes": 39288832,
+          "median_mib_per_second": 67.40305712977616,
+          "median_seconds": 0.555890958,
+          "model": "vt100",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.558042667,
+            0.625047708,
+            0.510657958,
+            0.544420416,
+            0.555890958
+          ],
+          "workload": "agent"
+        },
+        {
+          "bytes": 67108864,
+          "median_mib_per_second": 77.29007313581624,
+          "median_seconds": 0.828049417,
+          "model": "vt100",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.874094625,
+            0.773173125,
+            0.880406,
+            0.828049417,
+            0.750732625
+          ],
+          "workload": "flood"
+        },
+        {
+          "bytes": 39288832,
+          "median_mib_per_second": 85.55087772774586,
+          "median_seconds": 0.437970375,
+          "model": "vt100-parser",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.495972875,
+            0.437970375,
+            0.372701459,
+            0.5375045,
+            0.374049334
+          ],
+          "workload": "agent"
+        },
+        {
+          "bytes": 67108864,
+          "median_mib_per_second": 81.98592549922809,
+          "median_seconds": 0.780621791,
+          "model": "vt100-parser",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.955529,
+            0.780621791,
+            0.686296083,
+            0.642492458,
+            0.794284417
+          ],
+          "workload": "flood"
+        },
+        {
+          "bytes": 39288832,
+          "median_mib_per_second": 88.30207837056996,
+          "median_seconds": 0.424324667,
+          "model": "vt100-scrollback",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.436731209,
+            0.487262416,
+            0.377948708,
+            0.379025958,
+            0.424324667
+          ],
+          "workload": "agent"
+        },
+        {
+          "bytes": 67108864,
+          "median_mib_per_second": 77.78322665485334,
+          "median_seconds": 0.8227995,
+          "model": "vt100-scrollback",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.885837417,
+            0.676350666,
+            0.749496542,
+            0.872573875,
+            0.8227995
+          ],
+          "workload": "flood"
+        },
+        {
+          "bytes": 39288832,
+          "median_mib_per_second": 196.44882496771595,
+          "median_seconds": 0.190730334,
+          "model": "libghostty",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.150863417,
+            0.174920625,
+            0.190730334,
+            0.204805042,
+            0.198646833
+          ],
+          "workload": "agent"
+        },
+        {
+          "bytes": 67108864,
+          "median_mib_per_second": 138.3053131018996,
+          "median_seconds": 0.462744334,
+          "model": "libghostty",
+          "resident_delta_kib": null,
+          "runs_seconds": [
+            0.526932916,
+            0.450643542,
+            0.462744334,
+            0.449892375,
+            0.510050917
+          ],
+          "workload": "flood"
+        }
+      ]
+    },
     "x86_64-unknown-linux-gnu": {
       "host": {
-        "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
-        "logical_cpus": 24,
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "logical_cpus": 4,
         "machine": "x86_64",
         "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
         "system": "Linux"
       },
       "library": {
-        "archive_bytes": 5481062,
+        "archive_bytes": 5479846,
         "version": "1.0.2",
-        "zig_build_seconds_cold": 98.4,
+        "zig_build_seconds_cold": 175.2,
         "zig_target": "x86_64-linux-gnu.2.39",
         "zig_version": "0.17.0"
       },
@@ -20,142 +179,142 @@
         "cxx_runtime_symbols_added": 0,
         "highest_glibc_version": "2.36"
       },
-      "runner": "local workstation",
+      "runner": "ubuntu-24.04",
       "schema_version": 1,
       "size_probe": {
-        "delta_build_seconds": 0.2,
-        "delta_stripped_bytes": 1996504,
-        "delta_unstripped_bytes": 2064992,
+        "delta_build_seconds": 0.1,
+        "delta_stripped_bytes": 1996360,
+        "delta_unstripped_bytes": 2065104,
         "with_feature": {
-          "build_seconds": 4.8,
-          "stripped_bytes": 2865720,
-          "unstripped_bytes": 3225048
+          "build_seconds": 12.4,
+          "stripped_bytes": 2865760,
+          "unstripped_bytes": 3225368
         },
         "without_feature": {
-          "build_seconds": 4.6,
-          "stripped_bytes": 869216,
-          "unstripped_bytes": 1160056
+          "build_seconds": 12.3,
+          "stripped_bytes": 869400,
+          "unstripped_bytes": 1160264
         }
       },
       "target": "x86_64-unknown-linux-gnu",
       "throughput": [
         {
           "bytes": 39288832,
-          "median_mib_per_second": 180.36552594077108,
-          "median_seconds": 0.207737869,
+          "median_mib_per_second": 111.75247266708625,
+          "median_seconds": 0.335283409,
           "model": "vt100",
-          "resident_delta_kib": 492,
+          "resident_delta_kib": 500,
           "runs_seconds": [
-            0.214466564,
-            0.206759974,
-            0.204162595,
-            0.208398849,
-            0.207737869
+            0.332527511,
+            0.338355853,
+            0.33640225,
+            0.335283409,
+            0.333404888
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 155.20190478909743,
-          "median_seconds": 0.412366073,
+          "median_mib_per_second": 98.29514987586766,
+          "median_seconds": 0.651100284,
           "model": "vt100",
           "resident_delta_kib": 100,
           "runs_seconds": [
-            0.415668982,
-            0.411069502,
-            0.412366073,
-            0.411086828,
-            0.420060323
+            0.647930814,
+            0.651100284,
+            0.65153685,
+            0.657706145,
+            0.648604396
           ],
           "workload": "flood"
         },
         {
           "bytes": 39288832,
-          "median_mib_per_second": 215.06645106344035,
-          "median_seconds": 0.174219409,
+          "median_mib_per_second": 135.20121760642425,
+          "median_seconds": 0.277133229,
           "model": "vt100-parser",
-          "resident_delta_kib": 164,
+          "resident_delta_kib": 172,
           "runs_seconds": [
-            0.171830178,
-            0.174134409,
-            0.174219409,
-            0.174600323,
-            0.176484937
+            0.277133229,
+            0.277599759,
+            0.27660152,
+            0.277803345,
+            0.276119716
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 164.09843260894928,
-          "median_seconds": 0.390009819,
+          "median_mib_per_second": 110.88237002195332,
+          "median_seconds": 0.57718824,
           "model": "vt100-parser",
           "resident_delta_kib": 100,
           "runs_seconds": [
-            0.370794356,
-            0.375506975,
-            0.390458438,
-            0.390009819,
-            0.402825751
+            0.574113552,
+            0.577180378,
+            0.578711537,
+            0.57718824,
+            0.577649303
           ],
           "workload": "flood"
         },
         {
           "bytes": 39288832,
-          "median_mib_per_second": 183.92495839117362,
-          "median_seconds": 0.203717594,
+          "median_mib_per_second": 122.43287486012795,
+          "median_seconds": 0.306035042,
           "model": "vt100-scrollback",
-          "resident_delta_kib": 32096,
+          "resident_delta_kib": 32100,
           "runs_seconds": [
-            0.227284891,
-            0.207004455,
-            0.192094621,
-            0.203717594,
-            0.192383963
+            0.306035042,
+            0.305422031,
+            0.307291238,
+            0.306580552,
+            0.305682443
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 156.86759453669092,
-          "median_seconds": 0.407987387,
+          "median_mib_per_second": 104.71130075083926,
+          "median_seconds": 0.611204326,
           "model": "vt100-scrollback",
-          "resident_delta_kib": 32032,
+          "resident_delta_kib": 32028,
           "runs_seconds": [
-            0.434424335,
-            0.416081424,
-            0.407987387,
-            0.404297533,
-            0.40361889
+            0.62156297,
+            0.610871324,
+            0.609808928,
+            0.611204326,
+            0.616870284
           ],
           "workload": "flood"
         },
         {
           "bytes": 39288832,
-          "median_mib_per_second": 461.3975435591914,
-          "median_seconds": 0.081207086,
+          "median_mib_per_second": 264.7948399085468,
+          "median_seconds": 0.141501058,
           "model": "libghostty",
-          "resident_delta_kib": 9284,
+          "resident_delta_kib": 9368,
           "runs_seconds": [
-            0.081207086,
-            0.081848539,
-            0.080284307,
-            0.080457041,
-            0.084530529
+            0.142076573,
+            0.14097611,
+            0.141320437,
+            0.141501058,
+            0.142815112
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 221.2813592378984,
-          "median_seconds": 0.289224543,
+          "median_mib_per_second": 154.01531449354476,
+          "median_seconds": 0.415543092,
           "model": "libghostty",
-          "resident_delta_kib": 9068,
+          "resident_delta_kib": 9328,
           "runs_seconds": [
-            0.275499635,
-            0.276311958,
-            0.290674219,
-            0.289224543,
-            0.289678594
+            0.433018635,
+            0.414139884,
+            0.41481053,
+            0.415543092,
+            0.416442923
           ],
           "workload": "flood"
         }
@@ -163,16 +322,16 @@
     },
     "x86_64-unknown-linux-musl": {
       "host": {
-        "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
-        "logical_cpus": 24,
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "logical_cpus": 4,
         "machine": "x86_64",
         "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
         "system": "Linux"
       },
       "library": {
-        "archive_bytes": 5477614,
+        "archive_bytes": 5476414,
         "version": "1.0.2",
-        "zig_build_seconds_cold": 88.7,
+        "zig_build_seconds_cold": 168.8,
         "zig_target": "x86_64-linux-musl",
         "zig_version": "0.17.0"
       },
@@ -180,142 +339,142 @@
         "cxx_runtime_symbols_added": 0,
         "static": true
       },
-      "runner": "local workstation",
+      "runner": "ubuntu-24.04",
       "schema_version": 1,
       "size_probe": {
-        "delta_build_seconds": 0.0,
+        "delta_build_seconds": -0.1,
         "delta_stripped_bytes": 2003096,
-        "delta_unstripped_bytes": 2071976,
+        "delta_unstripped_bytes": 2071872,
         "with_feature": {
-          "build_seconds": 4.8,
-          "stripped_bytes": 2945976,
-          "unstripped_bytes": 3270864
+          "build_seconds": 12.2,
+          "stripped_bytes": 2945960,
+          "unstripped_bytes": 3270792
         },
         "without_feature": {
-          "build_seconds": 4.8,
-          "stripped_bytes": 942880,
-          "unstripped_bytes": 1198888
+          "build_seconds": 12.3,
+          "stripped_bytes": 942864,
+          "unstripped_bytes": 1198920
         }
       },
       "target": "x86_64-unknown-linux-musl",
       "throughput": [
         {
           "bytes": 39288832,
-          "median_mib_per_second": 165.9506537706143,
-          "median_seconds": 0.225782479,
+          "median_mib_per_second": 101.78396654598477,
+          "median_seconds": 0.368120356,
           "model": "vt100",
           "resident_delta_kib": 528,
           "runs_seconds": [
-            0.227645861,
-            0.229222487,
-            0.223101942,
-            0.223488818,
-            0.225782479
+            0.36555979,
+            0.368120356,
+            0.376982424,
+            0.364955803,
+            0.368621599
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 137.14939701388988,
-          "median_seconds": 0.466644414,
+          "median_mib_per_second": 77.92736623001706,
+          "median_seconds": 0.821277596,
           "model": "vt100",
           "resident_delta_kib": 172,
           "runs_seconds": [
-            0.465398139,
-            0.472394722,
-            0.460112402,
-            0.467438302,
-            0.466644414
+            0.818544661,
+            0.827367917,
+            0.821485318,
+            0.815322904,
+            0.821277596
           ],
           "workload": "flood"
         },
         {
           "bytes": 39288832,
-          "median_mib_per_second": 207.90550230418808,
-          "median_seconds": 0.180220098,
+          "median_mib_per_second": 121.16144064342616,
+          "median_seconds": 0.309246488,
           "model": "vt100-parser",
           "resident_delta_kib": 268,
           "runs_seconds": [
-            0.185898495,
-            0.180220098,
-            0.179823514,
-            0.179727604,
-            0.181893626
+            0.308724975,
+            0.306944371,
+            0.309246488,
+            0.322501173,
+            0.31075904
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 144.1516341851366,
-          "median_seconds": 0.44397693,
+          "median_mib_per_second": 88.8020045143276,
+          "median_seconds": 0.720704452,
           "model": "vt100-parser",
           "resident_delta_kib": 172,
           "runs_seconds": [
-            0.415497202,
-            0.417335779,
-            0.44397693,
-            0.452901346,
-            0.451077297
+            0.73823687,
+            0.720287526,
+            0.720249058,
+            0.720704452,
+            0.728385775
           ],
           "workload": "flood"
         },
         {
           "bytes": 39288832,
-          "median_mib_per_second": 177.9944347877012,
-          "median_seconds": 0.210505177,
+          "median_mib_per_second": 115.5539907427094,
+          "median_seconds": 0.324253189,
           "model": "vt100-scrollback",
           "resident_delta_kib": 32804,
           "runs_seconds": [
-            0.214232314,
-            0.239511147,
-            0.205749546,
-            0.20678584,
-            0.210505177
+            0.323832898,
+            0.326889799,
+            0.324253189,
+            0.323851226,
+            0.327235778
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 133.87564572407547,
-          "median_seconds": 0.478055584,
+          "median_mib_per_second": 95.50290532447364,
+          "median_seconds": 0.670136681,
           "model": "vt100-scrollback",
           "resident_delta_kib": 32716,
           "runs_seconds": [
-            0.623387095,
-            0.475232075,
-            0.492786563,
-            0.478055584,
-            0.477726136
+            0.674775807,
+            0.671876404,
+            0.664666547,
+            0.665833719,
+            0.670136681
           ],
           "workload": "flood"
         },
         {
           "bytes": 39288832,
-          "median_mib_per_second": 448.0113491385819,
-          "median_seconds": 0.083633484,
+          "median_mib_per_second": 254.81691789968414,
+          "median_seconds": 0.147041846,
           "model": "libghostty",
-          "resident_delta_kib": 9392,
+          "resident_delta_kib": 9388,
           "runs_seconds": [
-            0.087938808,
-            0.084687161,
-            0.083100535,
-            0.083633484,
-            0.08269758
+            0.147892544,
+            0.146917479,
+            0.147041846,
+            0.146247513,
+            0.147255918
           ],
           "workload": "agent"
         },
         {
           "bytes": 67108864,
-          "median_mib_per_second": 228.5547334644159,
-          "median_seconds": 0.280020453,
+          "median_mib_per_second": 155.1801108018482,
+          "median_seconds": 0.412423987,
           "model": "libghostty",
           "resident_delta_kib": 9284,
           "runs_seconds": [
-            0.280972146,
-            0.275868846,
-            0.280020453,
-            0.277535764,
-            0.307693519
+            0.412221694,
+            0.411412859,
+            0.412423987,
+            0.412656868,
+            0.41324015
           ],
           "workload": "flood"
         }

@@ -15,9 +15,9 @@ so it outlives workflow artifacts.
 ## Summary
 
 - libghostty-vt passes every spec assertion that `vt100` passes (59 of 59
-  against 49 of 59) and parses 1.4 to 2.7 times faster, at +1.8 MiB of
-  stripped `pohunek-sessiond` on Linux and 1.5 to 2.5 minutes of cold Zig build per
-  target. It links statically on musl, adds no C++ runtime symbol, stays under
+  against 49 of 59) and parses 1.4 to 2.9 times faster, at +1.8 MiB of
+  stripped `pohunek-sessiond` on Linux and 1.5 to 1.6 minutes of cold Zig build
+  locally (2.8 to 2.9 minutes on the CI runners). It links statically on musl, adds no C++ runtime symbol, stays under
   the glibc ceiling and links on macOS arm64 with `minos 14.0`.
 - It is not adoptable yet because adoption criteria 2 and 3 fail. For criterion 3, the repaint that
   attach depends on does not round-trip on 5 of 13 traces (emoji clusters,
@@ -78,10 +78,12 @@ workload. The workloads are the recorded agent trace replayed 16 384 times
 headless terminal. `pohunek-sessiond` was measured once on an unmerged local
 branch that links libghostty into `TerminalTracker`.
 
-All numbers below were taken on one workstation (AMD Ryzen 9 9900X, 24 logical
-CPUs, Linux 7.3.5, rustc 1.99.0). They are indicative: shared CI runners are
-slower and noisier. Library build times and the macOS link result also exist
-from the CI runners and are given with their run URL.
+Numbers marked local were taken on one workstation (AMD Ryzen 9 9900X, 24
+logical CPUs, Linux 7.3.5, rustc 1.99.0). Numbers marked CI come from the spike
+workflow run [45804222731](https://github.com/zajca/pohunek/actions/runs/45804222731)
+(`report/measurements.json`: ubuntu-24.04 AMD EPYC 9V74 with 4 logical CPUs,
+macos-15 Apple M1 with 3). Shared CI runners are slower and noisier, so every
+number is indicative.
 
 ## D2: assertions and differences
 
@@ -159,10 +161,12 @@ emoji content, so it neither confirms nor refutes the emoji width differences.
 | `libghostty-vt.a` (local build) | 5 481 062 B | 5 477 614 B | not built locally |
 | `libghostty-vt.a` (CI build) | 5 479 846 B | 5 476 414 B | 2 978 968 B |
 | `zig build`, cold cache, local | 98.4 s | 88.7 s | |
-| `zig build`, cold cache, CI ubuntu-24.04 | 145.1 s | 147.3 s | 146.6 s (cross) |
+| `zig build`, cold cache, CI ubuntu-24.04 | 175.2 s | 168.8 s | 175.1 s (cross build on Linux) |
 | Link | no duplicate symbol; 0 C++ runtime symbols added; highest `GLIBC_` 2.36 (`size-probe`), 2.39 (`pohunek-sessiond`, also without the feature) | static-pie; 0 C++ runtime symbols added; no duplicate symbol | no linker warning; `minos 14.0`, Xcode 16.4, `macos-15` |
 
 The CI figures come from workflow run
+[45804222731](https://github.com/zajca/pohunek/actions/runs/45804222731) (head `7868d5165` of this pull request);
+the link results were identical in run
 [45794204949](https://github.com/zajca/pohunek/actions/runs/45794204949) (head
 `53f7b1619` of the S1 to S5 pull request). The local musl links use
 Rust's self-contained musl linking; the workflow links with `musl-gcc` like
@@ -175,8 +179,11 @@ Rust's self-contained musl linking; the workflow links with `musl-gcc` like
 | glibc x86_64 | 869 216 B | 2 865 720 B | +1 996 504 B (1.90 MiB) | +2 064 992 B |
 | musl x86_64 | 942 880 B | 2 945 976 B | +2 003 096 B (1.91 MiB) | |
 
-Cold `cargo build --release` of the probe takes 4.6 to 4.8 s with and without
-the feature: the library is prebuilt, so its cost is the Zig build above.
+Cold `cargo build --release` of the probe takes 4.6 to 4.8 s locally and 12.2 to
+12.4 s on the Linux CI runners (24.4 to 24.6 s on macos-15) with and without the
+feature: the library is prebuilt, so its cost is the Zig build above. On macOS
+arm64 the stripped delta is +1 010 464 B (0.96 MiB); the CI deltas on Linux are
++1 996 360 B (glibc) and +2 003 096 B (musl).
 
 ### `pohunek-sessiond` (one measurement, local only)
 
@@ -208,6 +215,20 @@ Throughput of libghostty is 2.6x (2.7x) on the agent trace and 1.4x (1.7x) on
 the flood relative to `TerminalTracker`. These are single-process, single-core
 parse speeds without PTY or network.
 
+On the CI runners (median of 5, MiB/s, agent trace / flood):
+
+| Subject | glibc x86_64 | musl x86_64 | macOS arm64 |
+|---|---|---|---|
+| `vt100` | 111.8 / 98.3 | 101.8 / 77.9 | 67.4 / 77.3 |
+| `vt100-parser` | 135.2 / 110.9 | 121.2 / 88.8 | 85.6 / 82.0 |
+| `vt100-scrollback` | 122.4 / 104.7 | 115.6 / 95.5 | 88.3 / 77.8 |
+| `libghostty` | 264.8 / 154.0 | 254.8 / 155.2 | 196.4 / 138.3 |
+
+libghostty is 2.4x, 2.5x and 2.9x `TerminalTracker` on the agent trace and 1.6x,
+2.0x and 1.8x on the flood. The resident delta on Linux is 9.1 MiB for
+libghostty and 31.3 MiB for `vt100-scrollback`; the macOS runner does not
+report it.
+
 ## Adoption criteria
 
 | # | Criterion | Result | Evidence |
@@ -216,8 +237,8 @@ parse speeds without PTY or network.
 | 2 | Measured wins on the motivating cases | **Not met.** Wide and emoji: 3 width-method wins, but only count together with criterion 4, and the agent trace has no such content. Combining marks: no win, both pass. Soft-wrap reflow: libghostty reflows, but no neutral assertion exists, so it is a difference, not a measured win. Scrollback: libghostty passes, and so does `vt100-scrollback`, so scrollback alone does not justify adoption. | D2 tables |
 | 3 | Repaint fidelity | **Not met.** Zero differences on every fixture is required; libghostty differs on 5 of 13 traces excluding titles. | repaint table |
 | 4 | Agent TUI parity | **Met for the one trace**: the visible text is identical; the only difference is the title. | `claude` pairwise section |
-| 5 | Linking | **Met.** musl static, no C++ runtime symbol, no duplicate symbol, glibc 2.39 at most (ceiling 2.41), macOS arm64 with `minos 14.0` and no warning. | link table, run 45794204949 |
-| 6 | Cost thresholds (owner, 2026-11-26) | **Met on the measured targets; open for macOS arm64 `pohunek-sessiond` size.** Size +1.82 MiB per Linux target (limit +3 MiB). Cold build: Zig build 1.6 min locally and 2.5 min on the CI runner plus 0 to 4 s of Cargo, under +5 min per target. Throughput better than `vt100` on the agent trace and the flood. macOS arm64: Zig build 146.6 s on CI, `pohunek-sessiond` size not measured. | tables above |
+| 5 | Linking | **Met.** musl static, no C++ runtime symbol, no duplicate symbol, glibc 2.39 at most (ceiling 2.41), macOS arm64 with `minos 14.0` and no warning. | link table, runs 45794204949 and 45804222731 |
+| 6 | Cost thresholds (owner, 2026-11-26) | **Met on the measured targets; open for macOS arm64 `pohunek-sessiond` size.** Size +1.82 MiB per Linux target (limit +3 MiB). Cold build: Zig build 1.5 to 1.6 min locally and 2.8 to 2.9 min on the CI runners (macOS arm64: 2.9 min, cross build on Linux), plus 0 to 4 s of Cargo, under +5 min per target. Throughput better than `vt100` on the agent trace and the flood on every target. macOS arm64 `size-probe` +0.96 MiB; `pohunek-sessiond` size not measured. | tables above |
 
 The second `vte` parser can go only if libghostty's dirty-row reporting covers
 every positive-width print observation on the agent trace. That check is not
@@ -242,9 +263,7 @@ Revisit when these are done, in this order:
    widths.
 3. Add the print-observation check (`vte` replacement) if removing the second
    parser matters.
-4. Take the macOS arm64 `size-probe`, build-time and throughput numbers from
-   the spike workflow run of the pull request that adds this report, and
-   build the local measurement branch on a Mac for the macOS
+4. Build the local measurement branch on a Mac for the macOS
    `pohunek-sessiond` size: the workflow measures `size-probe` only.
 5. Add a spec-based assertion for the cursor after mode 1049 and decide what
    `vt100` should do about it independently of this spike.
@@ -259,9 +278,9 @@ already differs on `scrollback` and `resize-wrap` (1 each).
 
 - `pohunek-sessiond` on macOS arm64: no workflow step builds it, so the
   size threshold of criterion 6 is open for macOS.
-- CI-runner throughput and cold Cargo time of `size-probe`: they come from the
-  `Measure` steps of the spike workflow (`spike-measurements-linux` and
-  `spike-measurements-macos` artifacts), not from this report.
+- A native Zig build time on macos-15: the macOS library is cross-built on
+  Linux, so 175.1 s is the cross-build time.
+- Resident memory on macOS (the runner does not report it).
 - Whether libghostty formatter options or mode 2027 close the repaint
   differences.
 - The `vte` print-observation coverage.
@@ -289,5 +308,6 @@ python3 -I spikes/libghostty-vt/scripts/measure --target x86_64-unknown-linux-gn
 ```
 
 `report.json` and `report.md` are deterministic: two runs over the committed
-fixtures produce byte-identical files. `measurements.json` and `sessiond.json`
-are numbers of the host named in them.
+fixtures produce byte-identical files. `measurements.json` (CI runners) and `sessiond.json` (workstation)
+are numbers of the host named in them; the local figures in the tables above
+are not committed as a file.
