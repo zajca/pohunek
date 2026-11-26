@@ -688,8 +688,14 @@ where
             Dispatch::Reply(response_line) => {
                 framed.send(response_line).await.map_err(codec_to_io)?;
             }
-            Dispatch::Subscribe(ack_line, version) => {
-                serve_subscription(&mut framed, &state, (ack_line, version), &connection).await?;
+            Dispatch::Subscribe(ack_line, version, heartbeat) => {
+                serve_subscription(
+                    &mut framed,
+                    &state,
+                    (ack_line, version, heartbeat),
+                    &connection,
+                )
+                .await?;
                 // The connection is consumed by the subscription stream.
                 return Ok(());
             }
@@ -714,7 +720,7 @@ where
 async fn serve_subscription<S>(
     framed: &mut Framed<S, LinesCodec>,
     state: &DaemonState,
-    (ack_line, version): (String, ProtocolVersion),
+    (ack_line, version, heartbeat): (String, ProtocolVersion, Option<std::time::Duration>),
     connection: &Connection,
 ) -> Result<(), io::Error>
 where
@@ -736,6 +742,7 @@ where
         framed,
         (&mut session_events, &mut notification_events),
         version,
+        heartbeat,
         connection.token(),
     )
     .await
@@ -1441,7 +1448,11 @@ where
 /// Each received [`Event`] is written as one JSON line. Further input from the
 /// client is ignored (a subscription is one-way in this milestone); a closed or
 /// broken connection ends the stream. A lagging subscriber (slow reader) drops
-/// the oldest events with a warning rather than tearing down the connection.
+/// the oldest events and is told with a `subscription_lagged` event before any
+/// later event, rather than having the connection torn down.
+///
+/// With a `heartbeat` interval the stream sends a `heartbeat` event whenever
+/// that long passes without a line written to the client.
 async fn run_event_subscription<S>(
     framed: &mut Framed<S, LinesCodec>,
     (session_events, notification_events): (
@@ -1449,46 +1460,66 @@ async fn run_event_subscription<S>(
         &mut broadcast::Receiver<Arc<Event>>,
     ),
     version: protocol::ProtocolVersion,
+    heartbeat: Option<std::time::Duration>,
     stopping: &CancellationToken,
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // The sleep is armed only when a heartbeat was requested; otherwise the
+    // select branch below is disabled and this deadline is never polled.
+    let quiet = tokio::time::sleep(heartbeat.unwrap_or_default());
+    tokio::pin!(quiet);
     loop {
-        tokio::select! {
+        let outgoing = tokio::select! {
             biased;
             () = stopping.cancelled() => break,
             incoming = framed.next() => match incoming {
                 // Client closed the connection or sent an unframeable line.
                 None | Some(Err(_)) => break,
                 // Ignore any further input on a one-way subscription in M3.
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => continue,
             },
             evt = session_events.recv() => match evt {
-                Ok(event) => {
-                    if !forward_until_stopped(framed, event, version, stopping).await? {
-                        break;
-                    }
-                }
+                Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "event subscriber lagged; some events were dropped");
+                    lagged_event(protocol::SubscriptionChannel::Session, skipped)
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             evt = notification_events.recv() => match evt {
-                Ok(event) => {
-                    if !forward_until_stopped(framed, event, version, stopping).await? {
-                        break;
-                    }
-                }
+                Ok(event) => event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "event subscriber lagged; some events were dropped");
+                    lagged_event(protocol::SubscriptionChannel::Notification, skipped)
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
+            },
+            () = &mut quiet, if heartbeat.is_some() => {
+                Arc::new(crate::events::event(protocol::event::HEARTBEAT, serde_json::json!({})))
             }
+        };
+        if !forward_until_stopped(framed, outgoing, version, stopping).await? {
+            break;
+        }
+        if let Some(interval) = heartbeat {
+            quiet.as_mut().reset(tokio::time::Instant::now() + interval);
         }
     }
     Ok(())
+}
+
+/// The `subscription_lagged` event for `skipped` events dropped from `channel`.
+fn lagged_event(channel: protocol::SubscriptionChannel, skipped: u64) -> Arc<Event> {
+    warn!(
+        ?channel,
+        skipped, "event subscriber lagged; some events were dropped"
+    );
+    let payload = serde_json::to_value(protocol::SubscriptionLaggedEvent { channel, skipped })
+        .expect("lag payload serialization is infallible");
+    Arc::new(crate::events::event(
+        protocol::event::SUBSCRIPTION_LAGGED,
+        payload,
+    ))
 }
 
 /// Forwards `event` unless `stopping` is cancelled first; returns whether the

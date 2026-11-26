@@ -698,12 +698,15 @@ async fn run() -> Result<(), DaemonError> {
         session.retention_lost_ttl_secs = retention_policy.lost_ttl_secs,
         "loaded session retention policy"
     );
-    let notifications =
-        NotificationService::open_with_settings(&paths.data_dir, sessions.notification_settings())
-            .map_err(|source| DaemonError::Directory {
-                path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
-                source: std::io::Error::other(source),
-            })?;
+    let notifications = NotificationService::open_with_event_capacity(
+        &paths.data_dir,
+        sessions.notification_settings(),
+        sessions.subscription_settings().notification_channel_size(),
+    )
+    .map_err(|source| DaemonError::Directory {
+        path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
+        source: std::io::Error::other(source),
+    })?;
 
     // 7. Start the append-only event log before anything emits, so worker
     //    reconciliation events are captured too. The log drains
@@ -999,6 +1002,7 @@ fn apply_service_settings(config: &mut SessionRegistryConfig, service: &ServiceC
     config.inventory_probe = service.inventory_probe();
     config.worker_journal_max_age = service.worker_journal_max_age();
     config.notification_settings = service.notifications();
+    config.subscriptions = service.subscriptions();
 }
 
 /// Applies the validated `session.wait_turn` default and ceiling and the

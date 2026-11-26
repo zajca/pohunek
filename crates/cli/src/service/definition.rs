@@ -116,6 +116,7 @@ pub(crate) fn config_with_search_path(
         inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
         worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
         notifications: pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS,
+        subscriptions: pohunek_service_config::DEFAULT_SUBSCRIPTION_SETTINGS,
         open_files: settings::OPEN_FILES,
     })?)
 }

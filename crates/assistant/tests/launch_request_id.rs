@@ -371,6 +371,7 @@ fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabili
         session_retention_selector_supported: true,
         session_remove_tree_supported: false,
         session_adopt_supported: false,
+        subscribe_heartbeat: None,
         package_install_commands_supported: true,
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,

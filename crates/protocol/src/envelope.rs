@@ -603,6 +603,19 @@ impl Event {
     pub const fn payload(&self) -> &Value {
         &self.payload
     }
+
+    /// Decodes the payload of a `subscription_lagged` event.
+    ///
+    /// Returns `None` for any other event, and for a `subscription_lagged`
+    /// event whose payload does not decode. A channel this build does not know
+    /// decodes as [`SubscriptionChannel::Unknown`](crate::SubscriptionChannel::Unknown).
+    #[must_use]
+    pub fn subscription_lagged(&self) -> Option<crate::SubscriptionLaggedEvent> {
+        if self.name != crate::event::SUBSCRIPTION_LAGGED {
+            return None;
+        }
+        crate::tolerant::from_value(self.payload.clone()).ok()
+    }
 }
 
 impl<'de> Deserialize<'de> for Event {

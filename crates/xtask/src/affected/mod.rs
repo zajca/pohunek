@@ -360,6 +360,11 @@ const RULES: &[Rule] = &[
         &[Reminder::SdkGates],
         "lifecycle response budgets that pohunek-client's lifecycle_budgets test compares with its own and the SDK's lifecycle-budgets test compares with its constants",
     ),
+    rule(
+        Pattern::File("crates/paths/fixtures/runtime-paths.json"),
+        Effect::Packages(&["pohunek-client"]),
+        "runtime path contract that pohunek-client's local_socket_path test embeds",
+    ),
     reminding(
         Pattern::Dir("crates/protocol/tests/fixtures/compat"),
         Effect::Packages(&["pohunek-protocol", "pohunek-client", "pohunek-cli"]),

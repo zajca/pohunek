@@ -3,6 +3,7 @@
 import type { AgentRuntime } from "./AgentRuntime";
 import type { HostHookScripts } from "./HostHookScripts";
 import type { ProtocolVersion } from "./ProtocolVersion";
+import type { SubscribeHeartbeatCapability } from "./SubscribeHeartbeatCapability";
 
 /**
  * Live capability snapshot returned by `host.inspect`.
@@ -191,6 +192,15 @@ export type HostCapabilities = {
    * the wire.
    */
   session_adopt_supported?: boolean;
+  /**
+   * The `heartbeat_ms` bounds `subscribe` accepts, when the daemon serves
+   * heartbeats.
+   *
+   * A daemon that predates the field omits it, which decodes as `None`; its
+   * `subscribe` ignores params, so a client sends `heartbeat_ms` only when
+   * this is present. `None` is likewise omitted on the wire.
+   */
+  subscribe_heartbeat?: SubscribeHeartbeatCapability;
   /**
    * Whether `package.install` and `package.link` accept `accept_commands`
    * and install packages that declare commands.

@@ -53,6 +53,8 @@ mod session_tree;
 mod spawned_by;
 #[path = "health_socket/store_memo.rs"]
 mod store_memo;
+#[path = "health_socket/subscription_signals.rs"]
+mod subscription_signals;
 mod support;
 
 use std::collections::BTreeMap;

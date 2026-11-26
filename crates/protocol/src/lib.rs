@@ -45,6 +45,7 @@ mod session;
 mod session_tree;
 mod setup;
 mod store;
+mod subscription;
 pub mod tolerant;
 mod turn_wait;
 mod version;
@@ -79,13 +80,14 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
-    AGENT_OPTION_CHOICE_MISSING_CODE, GIT_HOOKS_ENV_CONFLICT_CODE, HOOK_REQUIRED_SKIPPED_CODE,
-    SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE, SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE,
-    SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE, SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE,
-    SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
-    SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE, SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
-    SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
-    SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE,
+    AGENT_OPTION_CHOICE_MISSING_CODE, GIT_HOOKS_ENV_CONFLICT_CODE, HEARTBEAT_OUT_OF_RANGE_CODE,
+    HOOK_REQUIRED_SKIPPED_CODE, SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE,
+    SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE, SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE,
+    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
+    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE,
+    SESSION_REMOVE_TREE_UNSUPPORTED_CODE, SESSION_REQUEST_CONFLICT_CODE,
+    SESSION_REQUEST_IN_PROGRESS_CODE, SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE,
+    SUBSCRIBE_HEARTBEAT_UNSUPPORTED_CODE,
 };
 #[doc(inline)]
 pub use governance::{
@@ -209,6 +211,11 @@ pub use setup::{SetupInfo, SetupResolveParams, SetupResolveResult};
 #[doc(inline)]
 pub use store::{StoreRejectedLine, STORE_REJECTED_TEXT_MAX_BYTES};
 #[doc(inline)]
+pub use subscription::{
+    HeartbeatEvent, SubscribeHeartbeatCapability, SubscribeParams, SubscriptionChannel,
+    SubscriptionLaggedEvent,
+};
+#[doc(inline)]
 pub use turn_wait::{
     SessionTurnCursor, SessionTurnEvent, SessionTurnEventKind, SessionTurnProgress,
     SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult, TurnWaitParamsError,
@@ -285,6 +292,8 @@ pub mod event {
         SESSION_RUNTIME_CONFLICT, "session_runtime_conflict", crate::SessionEvent, "SessionEvent";
         SESSION_RUNTIME_DISCOVERED, "session_runtime_discovered", crate::RuntimeInventoryEvent, "RuntimeInventoryEvent";
         SESSION_NATIVE_RECOVERED, "session_native_recovered", crate::SessionNativeRecoveredEvent, "SessionNativeRecoveredEvent";
+        SUBSCRIPTION_LAGGED, "subscription_lagged", crate::SubscriptionLaggedEvent, "SubscriptionLaggedEvent";
+        HEARTBEAT, "heartbeat", crate::HeartbeatEvent, "HeartbeatEvent";
     );
 
     #[cfg(test)]

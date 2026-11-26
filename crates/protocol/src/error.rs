@@ -59,6 +59,12 @@ pub const SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE: &str =
     "session_retention_selector_unsupported";
 /// Error code a client raises when the daemon cannot honor `session.remove_tree`.
 pub const SESSION_REMOVE_TREE_UNSUPPORTED_CODE: &str = "session_remove_tree_unsupported";
+/// Error code a client raises when the daemon does not serve `subscribe`
+/// heartbeats.
+pub const SUBSCRIBE_HEARTBEAT_UNSUPPORTED_CODE: &str = "subscribe_heartbeat_unsupported";
+/// Error code of a `subscribe` whose `heartbeat_ms` lies outside the daemon's
+/// configured bounds.
+pub const HEARTBEAT_OUT_OF_RANGE_CODE: &str = "heartbeat_out_of_range";
 /// Error code a client raises when the daemon cannot honor
 /// `context_package_digest`.
 pub const SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE: &str = "session_new_context_pin_unsupported";
@@ -1845,6 +1851,38 @@ impl ProtocolError {
             SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
             format!("{target} predates session.remove_tree; nothing was sent"),
             Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/subscribe_heartbeat_unsupported` error a client raises
+    /// before it sends `heartbeat_ms` to a daemon that does not serve
+    /// heartbeats.
+    #[must_use]
+    pub fn subscribe_heartbeat_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SUBSCRIBE_HEARTBEAT_UNSUPPORTED_CODE,
+            format!("{target} does not serve subscribe heartbeats; nothing was subscribed"),
+            Some("upgrade the daemon, or subscribe without heartbeat_ms".to_owned()),
+        )
+    }
+
+    /// The `daemon/heartbeat_out_of_range` error a daemon answers a `subscribe`
+    /// whose `heartbeat_ms` is outside `min_ms..=max_ms`.
+    #[must_use]
+    pub fn heartbeat_out_of_range(min_ms: u32, max_ms: u32) -> Self {
+        Self::new(
+            ErrorClass::Daemon,
+            HEARTBEAT_OUT_OF_RANGE_CODE,
+            format!("heartbeat_ms must be within {min_ms}..={max_ms}"),
+            Some(
+                "read the bounds from host.inspect subscribe_heartbeat, or omit heartbeat_ms"
+                    .to_owned(),
+            ),
         )
     }
 
