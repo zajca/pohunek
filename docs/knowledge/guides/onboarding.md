@@ -167,10 +167,11 @@ other key on another session.
 Profiles are created only through `pohunek plugin profile create`, never by
 writing files, and only for a clear extra-home signal:
 
-- The user names a second Claude or Codex config home, or a directory such as
-  `~/.claude-<name>` or `~/.codex-<name>` holds that runtime's settings file
-  (`settings.json` for Claude, `config.toml` for Codex). Test only that the
-  file exists; do not read it.
+- The user names a second Claude or Codex config home. Ask the user for it;
+  never look for one on disk: no shell loop, glob, `ls`, `test` or `find` over
+  `~/.claude-*` or `~/.codex-*`, and no listing of the user's home directory.
+  Those commands are not in the allowlist, so each one stops the session on a
+  permission prompt.
 - The home is not a default home (`~/.claude`, `~/.codex`, or the runtime's own
   `CLAUDE_CONFIG_DIR` or `CODEX_HOME`) and is not already the home of a profile.
   `pohunek integration status --all-profiles --json` lists the homes existing
