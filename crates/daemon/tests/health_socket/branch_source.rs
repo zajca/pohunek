@@ -772,9 +772,14 @@ async fn a_branch_that_moves_after_a_reset_still_names_the_backup() {
 async fn a_failure_after_the_worktree_is_bound_still_names_the_backup() {
     // The post-create hook deletes the worktree it runs in, so the agent cannot
     // start there and the create fails after the bind.
+    let record_dir = temp_dir("bs-reset-spawn-fails-record");
+    let removed_record = record_dir.join("removed-worktree");
     let mut rig = Rig::start_with_post_create(
         "bs-reset-spawn-fails",
-        Some("#!/bin/sh\nrm -rf \"$(pwd -P)\"\nexit 0\n"),
+        Some(&format!(
+            "#!/bin/sh\npwd -P > '{}'\nrm -rf \"$(pwd -P)\"\nexit 0\n",
+            removed_record.display()
+        )),
     )
     .await;
     let main = rig.main.clone();
@@ -786,6 +791,19 @@ async fn a_failure_after_the_worktree_is_bound_still_names_the_backup() {
 
     let backup = Rig::backup_name(&local);
     assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
+    let removed =
+        std::fs::read_to_string(&removed_record).expect("the hook recorded its directory");
+    assert_eq!(
+        error.recover.as_deref(),
+        Some(
+            format!(
+                "the working directory {} does not exist; nothing was started",
+                removed.trim_end()
+            )
+            .as_str()
+        ),
+        "{error:?}"
+    );
     assert!(error.msg.contains(&backup), "{}", error.msg);
     assert_eq!(rig.rev("refs/heads/feat"), Some(remote));
     assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));

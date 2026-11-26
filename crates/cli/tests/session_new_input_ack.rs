@@ -11,6 +11,8 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -21,6 +23,13 @@ use std::thread;
 use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
+
+#[cfg(target_os = "linux")]
+#[path = "support/connect_redirect.rs"]
+mod connect_redirect;
+#[cfg(target_os = "linux")]
+#[path = "support/pin_overlay.rs"]
+mod pin_overlay;
 
 /// Mode of the runtime and state directories the client expects private.
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -40,6 +49,8 @@ struct Daemon {
     ack_supported: bool,
     branch_source_supported: bool,
     prompt_delivered: Option<bool>,
+    /// Activity the created session reports, when the daemon reports one.
+    activity: Option<&'static str>,
 }
 
 fn capabilities(daemon: Daemon) -> Value {
@@ -81,6 +92,9 @@ fn session_new_result(request: &Request, daemon: Daemon) -> Value {
     });
     if let Some(delivered) = daemon.prompt_delivered {
         value["prompt_delivered"] = json!(delivered);
+    }
+    if let Some(activity) = daemon.activity {
+        value["activity"] = json!(activity);
     }
     if request.params()["branch_source"] == "remote" {
         value["worktree_source"] = json!({"ref": "origin/feat", "commit": REMOTE_COMMIT});
@@ -227,6 +241,7 @@ const ACK_DAEMON: Daemon = Daemon {
     ack_supported: true,
     branch_source_supported: true,
     prompt_delivered: Some(true),
+    activity: None,
 };
 
 #[test]
@@ -284,6 +299,114 @@ fn an_acknowledged_start_prints_the_outcome_for_humans() {
     }
 }
 
+/// A kept create whose agent waits on a dialog tells the user where to answer
+/// it; an undelivered prompt on any other activity, and a delivered prompt on
+/// a blocked one, carry no such line.
+#[test]
+fn an_undelivered_prompt_behind_a_dialog_names_where_to_answer_it() {
+    let line = "waiting on a dialog: see `pohunek session screen s-ack-1`, answer it with `pohunek attach s-ack-1`";
+    let acknowledged: &[&str] = &["--input-ack-timeout-ms", "100"];
+    // The daemon keeps a blocked create and answers `prompt_delivered: false`
+    // whether or not the caller asked for the acknowledgement.
+    let plain: &[&str] = &[];
+    for (args, delivered, activity, expected) in [
+        (acknowledged, false, Some("blocked"), true),
+        (acknowledged, false, Some("idle"), false),
+        (acknowledged, false, None, false),
+        (acknowledged, true, Some("blocked"), false),
+        (plain, false, Some("blocked"), true),
+        (plain, false, Some("idle"), false),
+        (plain, true, Some("blocked"), false),
+    ] {
+        let run = run_local(
+            args,
+            Daemon {
+                prompt_delivered: Some(delivered),
+                activity,
+                ..ACK_DAEMON
+            },
+        );
+
+        assert!(run.output.status.success(), "{}", run.stdout());
+        assert_eq!(
+            run.stdout().contains(line),
+            expected,
+            "args={args:?} delivered={delivered} activity={activity:?}: {}",
+            run.stdout()
+        );
+    }
+}
+
+/// A kept create on another host names the session as `<host>/<id>`: a bare id
+/// would select the local daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dialog_line_for_a_remote_session_names_the_host() {
+    let env = private_environment();
+    let root = env.root().to_path_buf();
+    let (library, capture) = connect_redirect::build(&root);
+    let status = pin_overlay::status(
+        None,
+        &[pin_overlay::Peer::new(
+            "peer-a.netbird.test",
+            "100.64.0.11",
+            "key-first",
+        )],
+    );
+    let path = pin_overlay::install(&root.join("bin"), &capture, &status, &status);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let served = Served::default();
+    let recorded = Arc::clone(&served);
+    let daemon = Daemon {
+        prompt_delivered: Some(false),
+        activity: Some("blocked"),
+        ..ACK_DAEMON
+    };
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept a fixture connection");
+            let served = Arc::clone(&recorded);
+            thread::spawn(move || serve_connection(stream, &served, daemon));
+        }
+    });
+
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .env("PATH", &path)
+        .env("LD_PRELOAD", &library)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &capture)
+        .env("POHUNEK_REMOTE_PORT", port.to_string())
+        .args([
+            "--host",
+            "peer-a",
+            "session",
+            "new",
+            "--agent",
+            "shell",
+            "--project",
+            "demo",
+            "--input",
+            "hello",
+            "--yes",
+        ])
+        .output()
+        .expect("run pohunek session new");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(
+            "waiting on a dialog: see `pohunek session screen peer-a/s-ack-1`, answer it with `pohunek attach peer-a/s-ack-1`"
+        ),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn a_start_without_the_flag_reports_no_outcome_and_checks_no_capability() {
     let run = run_local(&["--json"], ACK_DAEMON);
@@ -312,6 +435,7 @@ fn a_host_without_the_capability_is_refused_before_a_session_is_created() {
             ack_supported: false,
             branch_source_supported: true,
             prompt_delivered: None,
+            activity: None,
         },
     );
 

@@ -84,7 +84,7 @@ On a host without the package nothing serves `claude`:
 
 ## What the package declares
 
-The package is version `2.3.0`. Every descriptor fact below equals the
+The package is version `2.3.1`. Every descriptor fact below equals the
 built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
 except the version probe, the transcript tree (`[transcripts]`), the input
 readiness (`[input] ready`) and the session name arguments (`[naming]`), which

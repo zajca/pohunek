@@ -204,7 +204,8 @@ write_wrapper() {
         printf "CLAUDE_BIN='%s'\n" "$claude_path"
         awk 'f { print } /^# BEGIN-TEMPLATE$/ { f = 1 }' "$template"
     } > "$TMP_FILE"
-    chmod 755 -- "$TMP_FILE"
+    # BSD chmod reads a `--` after the mode as a file name, so it comes first.
+    chmod -- 755 "$TMP_FILE"
     mv -f -- "$TMP_FILE" "$WRAPPER"
     TMP_FILE=''
 }
@@ -214,9 +215,9 @@ write_wrapper() {
 write_options() {
     names=$(account_names)
     default=''
-    for name in $names; do
-        if [ -e "$ACCOUNTS_DIR/$name.login" ]; then
-            default=$name
+    for account in $names; do
+        if [ -e "$ACCOUNTS_DIR/$account.login" ]; then
+            default=$account
         fi
     done
     if [ -z "$default" ]; then
@@ -227,8 +228,8 @@ write_options() {
         printf '[options.account]\n'
         printf 'label = "Account"\n'
         printf 'default = "%s"\n' "$default"
-        for name in $names; do
-            printf 'choices.%s = { label = "%s", env = { CLAUDE_ACCOUNT = "%s" } }\n' "$name" "$name" "$name"
+        for account in $names; do
+            printf 'choices.%s = { label = "%s", env = { CLAUDE_ACCOUNT = "%s" } }\n' "$account" "$account" "$account"
         done
     } > "$OPTIONS_FILE"
 }
@@ -287,13 +288,13 @@ regenerate_profiles() {
         "$POHUNEK_BIN" plugin profile create "$PARENT_PROFILE" --base claude \
             --program "$WRAPPER" --options-file "$OPTIONS_FILE" >/dev/null
     fi
-    for name in $(account_names); do
-        preset=$PRESET_PREFIX$name
+    for account in $(account_names); do
+        preset=$PRESET_PREFIX$account
         if profile_listed "$listing" "$preset"; then
             continue
         fi
         "$POHUNEK_BIN" plugin profile create "$preset" --preset-of "$PARENT_PROFILE" \
-            --opt "account=$name" --locked >/dev/null
+            --opt "account=$account" --locked >/dev/null
     done
 }
 

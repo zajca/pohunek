@@ -135,7 +135,7 @@ start, worktree included, since the prompt was never stored.
 A session never starts outside its working directory. Before the worker spawns
 the agent, it checks that the launch cwd is still a directory; when the worktree
 was removed after binding, the launch is refused with `session_cwd_missing`,
-nothing is started, and the failed create is compensated as above. The daemon
+nothing is started, the hint names the missing directory, and the failed create is compensated as above. The daemon
 logs the bind, each removal with its reason, and a failed or timed-out
 post-create or pre-remove hook at WARN, without the hook's output. Every hook
 run also logs `hook started` and `hook finished` at INFO with the session id,

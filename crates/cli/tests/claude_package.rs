@@ -99,7 +99,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "2.3.0";
+const PACKAGE_VERSION: &str = "2.3.1";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -5953,4 +5953,141 @@ async fn capture_the_real_claude_named_screens() {
     fixture.capture(&directory, &marker, "marker_idle").await;
     fixture.stop(&marker).await;
     fixture.finish().await;
+}
+
+/// Prompt `claude-accounts add` prints before it reads the hidden token.
+const ACCOUNTS_TOKEN_PROMPT: &str = "Paste the token (input hidden), then press Enter: ";
+
+/// Runs `claude-accounts add <name>` on a pseudo terminal with the stub
+/// `claude` and `pohunek` programs in `stubs` first on `PATH`, types `token`
+/// at the hidden prompt, and returns the exit code and the transcript.
+fn run_accounts_add(
+    home: &Path,
+    stubs: &Path,
+    log: &Path,
+    name: &str,
+    token: &str,
+) -> (u32, String) {
+    use std::io::{Read as _, Write as _};
+
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open a pty");
+    let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+    command.env_clear();
+    command.env("PATH", format!("{}:/usr/bin:/bin", stubs.display()));
+    command.env("HOME", home);
+    command.env("STUB_LOG", log);
+    command.arg(
+        workspace_root()
+            .join(PACKAGE_DIR)
+            .join("bin/claude-accounts"),
+    );
+    command.args(["add", name]);
+    command.cwd(home);
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("start claude-accounts");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("pty reader");
+    let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&collected);
+    let transcript = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        // The read fails with EIO once the child has closed the terminal.
+        while let Ok(read) = reader.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            sink.lock()
+                .expect("transcript lock")
+                .extend_from_slice(&chunk[..read]);
+        }
+    });
+    let mut writer = pair.master.take_writer().expect("pty writer");
+    pohunek_test_support::wait::poll_until("the token prompt", || {
+        let seen = collected.lock().expect("transcript lock");
+        String::from_utf8_lossy(&seen)
+            .contains(ACCOUNTS_TOKEN_PROMPT)
+            .then_some(())
+    });
+    writer
+        .write_all(format!("{token}\n").as_bytes())
+        .expect("type the token");
+    writer.flush().expect("flush the terminal");
+    let status = pohunek_test_support::wait::poll_until("claude-accounts to exit", || {
+        child.try_wait().expect("poll claude-accounts")
+    });
+    // The reader ends when the terminal reports the closed slave (EIO on Linux,
+    // end of file elsewhere); the wait is bounded so a reader that stays
+    // blocked fails the test instead of hanging it.
+    pohunek_test_support::wait::poll_until("the transcript reader to end", || {
+        transcript.is_finished().then_some(())
+    });
+    transcript.join().expect("transcript thread");
+    let output = collected.lock().expect("transcript lock").clone();
+    (
+        status.exit_code(),
+        String::from_utf8_lossy(&output).replace("\r\n", "\n"),
+    )
+}
+
+/// The success message of `claude-accounts add` names the account it just
+/// added, also when an account that sorts later already exists; the profiles
+/// it registers and the files it stores are unaffected.
+#[test]
+fn accounts_add_names_the_account_it_added() {
+    let root = pohunek_test_support::tempdir().expect("tempdir");
+    let home = root.path().join("home");
+    let stubs = root.path().join("stubs");
+    let log = root.path().join("pohunek.log");
+    fs::create_dir(&home).expect("create the home");
+    fs::create_dir(&stubs).expect("create the stub directory");
+    write_executable(
+        stubs.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.318 (Claude Code)'; fi\n",
+    )
+    .expect("write the claude stub");
+    write_executable(
+        stubs.join("pohunek"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STUB_LOG\"\nif [ \"$*\" = 'plugin profile list --json --all' ]; then echo '{\"profiles\": []}'; fi\n",
+    )
+    .expect("write the pohunek stub");
+
+    for (name, token) in [
+        ("zeta", "zeta-token-0123456789-0123456789-0123456789-abcdef"),
+        (
+            "alpha",
+            "alpha-token-0123456789-0123456789-0123456789-abcde",
+        ),
+    ] {
+        let (code, transcript) = run_accounts_add(&home, &stubs, &log, name, token);
+        assert_eq!(code, 0, "{transcript}");
+        assert!(
+            transcript.contains(&format!(
+                "Account {name} saved. Start a session with: pohunek session new --agent claude-{name}\n"
+            )),
+            "{transcript}"
+        );
+    }
+
+    let accounts = home.join(".config/pohunek/claude-accounts");
+    for name in ["zeta", "alpha"] {
+        assert!(accounts.join(format!("{name}.token")).is_file());
+    }
+    let calls = fs::read_to_string(&log).expect("read the pohunek stub log");
+    for name in ["zeta", "alpha"] {
+        assert!(
+            calls.contains(&format!(
+                "plugin profile create claude-{name} --preset-of claude-acct --opt account={name} --locked"
+            )),
+            "{calls}"
+        );
+    }
 }

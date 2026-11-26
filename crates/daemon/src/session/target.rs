@@ -1505,6 +1505,7 @@ impl SessionRegistry {
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let worker_session_id = WorkerSessionId::new(&id.0)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let launch_cwd = command.cwd.clone();
         let worker_instance_id = worker
             .initialize(Initialize {
                 session_id: worker_session_id,
@@ -1545,7 +1546,23 @@ impl SessionRegistry {
                 handshake_file: command.worker_file,
             })
             .await
-            .map_err(super::worker_error_to_protocol)?;
+            .map_err(|error| match error {
+                super::WorkerError::Rejected {
+                    code: pohunek_worker_protocol::ControlCode::LaunchCwdMissing,
+                    ..
+                } => super::launch_cwd_missing_error(
+                    &launch_cwd,
+                    // The metadata store lives directly in the data directory.
+                    self.inner
+                        .config
+                        .store_path
+                        .as_deref()
+                        .and_then(std::path::Path::parent)
+                        .map(|data_dir| data_dir.join(pohunek_paths::ASSISTANT_WORKDIR_SUBDIR))
+                        .as_deref(),
+                ),
+                other => super::worker_error_to_protocol(other),
+            })?;
         let snapshot = worker
             .inspect()
             .await

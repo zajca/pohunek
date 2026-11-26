@@ -294,6 +294,10 @@ reports whether the agent started working on it within that window as
 the session is kept either way, and a delivery that fails before the submit is
 written rolls the create back as above. A host whose daemon does not advertise
 `session_new_input_ack_supported` is refused before the session is created.
+A kept create whose agent is `blocked` on a dialog and whose initial input is not
+yet delivered prints a `waiting on a dialog` line in the human output, with or
+without `--input-ack-timeout-ms`; it names `pohunek session screen <id>` and
+`pohunek attach <id>` (`<host>/<id>` for a session on another host).
 
 A session launched from a profile that declares options records the choice of
 every option it launched with, defaults included: `agent_options` on

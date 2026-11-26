@@ -24729,6 +24729,79 @@ async fn non_strict_create_blocked_at_the_grace_expiry_still_writes_its_input() 
     registry.stop(&id).await.expect("stop the session");
 }
 
+/// A strict create refused at the grace expiry reports the activity its
+/// blocked-or-not decision saw: an agent that turns `blocked` after that
+/// decision is not reported as blocked next to the "raise the grace" hint.
+#[tokio::test]
+async fn strict_refusal_reports_the_activity_the_blocked_decision_read() {
+    let daemon = RestartableDaemon::new("wt-strict-label");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        // timing-allowed: #2406 the grace expiry is the behavior under test.
+        initial_input_startup_grace: Duration::from_millis(50),
+        ..daemon.config.clone()
+    });
+    let create_gate = hold_initial_input(&registry);
+    let outcome_gate = hold_initial_input_outcome(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("go".to_owned()),
+            ..daemon.params("feat/strict-label")
+        };
+        async move { registry.create(params).await }
+    });
+    create_gate.entered.notified().await;
+    // The test owns the readiness channel, so the wait times out.
+    let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(false);
+    let id = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.values_mut().next().expect("committed session");
+        entry.input_ready = readiness_rx;
+        entry.default_detector_config.input_readiness =
+            crate::agent::host::InputReadiness::ScreenIdle;
+        entry.info.activity = Some(AgentActivity::Working);
+        entry.info.id.clone()
+    };
+    create_gate.release.notify_one();
+    outcome_gate.entered.notified().await;
+    // The decision already read `working`; a later `blocked` must not leak
+    // into the refusal.
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&id)
+        .expect("session entry")
+        .info
+        .activity = Some(AgentActivity::Blocked);
+    outcome_gate.release.notify_one();
+
+    let error = creating
+        .await
+        .expect("create task joins")
+        .expect_err("a strict create that timed out is refused");
+    drop(readiness_tx);
+    assert_eq!(error.code, "session_input_not_ready");
+    assert!(
+        error.msg.contains("last activity: working"),
+        "the label is the activity the decision read: {}",
+        error.msg
+    );
+    assert!(
+        error
+            .msg
+            .contains("raise input.initial_startup_grace_ms if the agent starts slowly"),
+        "a non-blocked timeout keeps the grace hint: {}",
+        error.msg
+    );
+    assert!(
+        !error.msg.contains("blocked"),
+        "a blocked label never sits next to the grace hint: {}",
+        error.msg
+    );
+}
+
 /// A `ScreenIdle` create whose wait ends by daemon shutdown is refused even
 /// when its readiness turns true after that outcome was decided.
 #[tokio::test]

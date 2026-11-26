@@ -955,6 +955,13 @@ pub(crate) async fn run_new(
                 replayed,
             )
         );
+        // The daemon answers `prompt_delivered` for a kept create without the
+        // acknowledgement flag too.
+        if let Some(line) =
+            waiting_on_dialog_line(host, info, result.prompt_delivered == Some(false))
+        {
+            print!("{line}");
+        }
     }
     Ok(())
 }
@@ -2345,6 +2352,29 @@ fn render_new_human(
     }
     write_warnings(&mut output, &info.warnings);
     output
+}
+
+/// The line telling where to answer the dialog a kept create is blocked on.
+/// It is the last line of the human output, so a warning above it does not
+/// bury it.
+///
+/// A session on another host is named `<host>/<id>`: a bare id selects the
+/// local daemon.
+fn waiting_on_dialog_line(
+    host: &str,
+    info: &SessionInfo,
+    prompt_undelivered: bool,
+) -> Option<String> {
+    (prompt_undelivered && info.activity == Some(AgentActivity::Blocked)).then(|| {
+        let target = if is_local_host(host) {
+            info.id.0.clone()
+        } else {
+            format!("{host}/{}", info.id.0)
+        };
+        format!(
+            "  waiting on a dialog: see `pohunek session screen {target}`, answer it with `pohunek attach {target}`; the prompt is sent once the agent is ready\n"
+        )
+    })
 }
 
 fn render_list_human(sessions: &[SessionInfo]) -> String {

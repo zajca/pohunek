@@ -30,6 +30,10 @@ pub const KNOWLEDGE_CACHE_SUBDIR: &str = "knowledge";
 pub const SESSION_TMP_SUBDIR: &str = "session-tmp";
 /// Assistant runtime subdirectory under the app runtime directory.
 pub const ASSISTANT_RUNTIME_SUBDIR: &str = "assistant";
+/// Assistant working directory name under [`BasePaths::data_dir`]. The
+/// assistant launcher creates it; the daemon names it in a missing-directory
+/// refusal.
+pub const ASSISTANT_WORKDIR_SUBDIR: &str = "assistant";
 /// Daemon metadata store filename under [`BasePaths::data_dir`].
 pub const METADATA_STORE_NAME: &str = "metadata.jsonl";
 /// Infix between a metadata store name and its pre-migration backup suffix.
