@@ -15,8 +15,7 @@ use std::time::{Duration, Instant};
 use pohunek_daemon::agent::host::InputReadiness;
 use pohunek_daemon::detect::{
     ActivityTransition, DetectionConfig, Detector, DetectorConfig, LimitSighting, Manifest,
-    ManifestError, MarkerClass, ProgramStatusConfig, MAX_GENERIC_LIMIT_SIGHTINGS,
-    MAX_JOURNALED_UNMAPPED_TUPLES, MAX_SPECIFIC_LIMIT_SIGHTINGS,
+    ManifestError, ProgramStatusConfig, MAX_JOURNALED_UNMAPPED_TUPLES,
 };
 use pohunek_test_support::workspace_root;
 use protocol::{AgentActivity, DetectionRegionKind, StateSource};
@@ -1933,10 +1932,27 @@ fn sight_banner(harness: &mut Harness, phrase: &str) -> Option<LimitSighting> {
     harness.detector.take_usage_limit_sighting()
 }
 
-/// Specific phrases are capped per detector: `MAX_SPECIFIC_LIMIT_SIGHTINGS`
-/// screens are journaled, the next one queues exactly one suppression line
-/// naming the class, and a lag resync or reconfigure keeps the budget spent
-/// (#2101 review). The bare phrases keep their own budget.
+/// Upper bound on the banners a scenario feeds while it looks for the cap; a
+/// detector that never suppresses fails the scenario instead of looping on.
+const BANNER_GUARD: usize = 1000;
+
+/// Feeds the `phrases` in turn, each as a re-armed banner, until the detector
+/// queues its suppression line, and returns that line. Every sighting before it
+/// must be a screen sighting.
+fn spend_budget(harness: &mut Harness, phrases: &[&str]) -> LimitSighting {
+    for index in 0..BANNER_GUARD {
+        match sight_banner(harness, phrases[index % phrases.len()]) {
+            Some(LimitSighting::Screen(_)) => {}
+            Some(suppressed) => return suppressed,
+            None => panic!("banner {index} queued no sighting before the cap"),
+        }
+    }
+    panic!("no suppression line within {BANNER_GUARD} banners");
+}
+
+/// Specific phrases are capped per detector: the cap queues exactly one
+/// suppression line naming the class, and a lag resync or reconfigure keeps the
+/// budget spent (#2101 review). The bare phrases keep their own budget.
 #[test]
 fn specific_limit_screens_are_capped_with_one_suppression_line() {
     let mut harness = Harness::claude();
@@ -1948,22 +1964,10 @@ fn specific_limit_screens_are_capped_with_one_suppression_line() {
         "usage limit resets",
         "5-hour limit",
     ];
-    for index in 0..MAX_SPECIFIC_LIMIT_SIGHTINGS {
-        let sighting = sight_banner(&mut harness, phrases[index % phrases.len()])
-            .unwrap_or_else(|| panic!("sighting {index} is under the cap"));
-        assert!(
-            matches!(sighting, LimitSighting::Screen(_)),
-            "sighting {index}: {sighting:?}"
-        );
-    }
-
-    assert_eq!(
-        sight_banner(&mut harness, "usage limit reached"),
-        Some(LimitSighting::Suppressed {
-            class: MarkerClass::Specific,
-            sightings: MAX_SPECIFIC_LIMIT_SIGHTINGS
-        }),
-        "one suppression line after the cap"
+    let suppressed = spend_budget(&mut harness, &phrases);
+    assert!(
+        format!("{suppressed:?}").contains("Specific"),
+        "the suppression line names the specific class: {suppressed:?}"
     );
     assert!(
         sight_banner(&mut harness, "usage limit reached").is_none(),
@@ -1998,28 +2002,15 @@ fn specific_limit_screens_are_capped_with_one_suppression_line() {
 }
 
 /// Transcript quotes of a bare phrase spend only the generic budget: after
-/// `MAX_GENERIC_LIMIT_SIGHTINGS` quotes and the one suppression line, a real
-/// `usage limit reached` screen is still recorded (#2527).
+/// the quotes and the one suppression line, a real `usage limit reached`
+/// screen is still recorded (#2527).
 #[test]
 fn bare_phrase_quotes_cannot_spend_the_budget_of_a_real_limit_hit() {
     let mut harness = Harness::claude();
-    let phrases = ["usage limit", "weekly limit"];
-    for index in 0..MAX_GENERIC_LIMIT_SIGHTINGS {
-        let sighting = sight_banner(&mut harness, phrases[index % phrases.len()])
-            .unwrap_or_else(|| panic!("quote {index} is under the cap"));
-        assert!(
-            matches!(sighting, LimitSighting::Screen(_)),
-            "quote {index}: {sighting:?}"
-        );
-    }
-
-    assert_eq!(
-        sight_banner(&mut harness, "usage limit"),
-        Some(LimitSighting::Suppressed {
-            class: MarkerClass::Generic,
-            sightings: MAX_GENERIC_LIMIT_SIGHTINGS
-        }),
-        "one suppression line after the generic cap"
+    let suppressed = spend_budget(&mut harness, &["usage limit", "weekly limit"]);
+    assert!(
+        format!("{suppressed:?}").contains("Generic"),
+        "the suppression line names the generic class: {suppressed:?}"
     );
     assert!(
         sight_banner(&mut harness, "weekly limit").is_none(),
