@@ -4473,14 +4473,34 @@ async fn real_claude_prompt_suggestion_stops_create_no_subagent_row() {
     for (index, prompt) in FOLLOW_UP_PROMPTS.iter().enumerate() {
         let helpers = index + 1;
         fixture.input(&id, prompt).await;
-        let (ignored, rows) = wait_until(&format!("helper stop {helpers}"), || async {
-            let ignored = helper_stops(&fixture.worker_events(&id));
-            let rows = fixture.subagents(&id).await;
-            (ignored.len() >= helpers || !rows.is_empty()).then_some((ignored, rows))
-        })
+        // The helper's request reaches the loopback endpoint before its stop is
+        // reported, so a missing request names Claude as the missing side and a
+        // missing stop after it names the reporting path.
+        wait_until(
+            &format!("prompt-suggestion request {helpers} (Claude never started the helper)"),
+            || async {
+                (fixture
+                    .stub
+                    .last_messages_containing(messages_stub::SUGGESTION_OPENING)
+                    >= helpers)
+                    .then_some(())
+            },
+        )
+        .await;
+        let (ignored, rows) = wait_until(
+            &format!("helper stop {helpers} (reported after its request)"),
+            || async {
+                let ignored = helper_stops(&fixture.worker_events(&id));
+                let rows = fixture.subagents(&id).await;
+                (ignored.len() >= helpers || !rows.is_empty()).then_some((ignored, rows))
+            },
+        )
         .await;
         assert!(rows.is_empty(), "a helper stop creates no row: {rows:#?}");
         assert_eq!(ignored.len(), helpers, "{ignored:?}");
+        // A turn typed while the previous one still runs is queued into it and
+        // cancels the pending suggestion.
+        fixture.wait_activity(&id, "idle").await;
     }
     let ignored = helper_stops(&fixture.worker_events(&id));
     assert_ne!(ignored[0], ignored[1], "each helper run has its own id");

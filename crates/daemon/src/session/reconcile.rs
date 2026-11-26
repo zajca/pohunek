@@ -22973,6 +22973,34 @@ generation "$1"
                     .lock()
                     .expect("report hold is never poisoned") = hold;
             };
+            // The worker watcher polls the worker connection every
+            // `WORKER_CONNECT_RETRY`; a poll on the wire when the worker stops
+            // holds the connection, so the forward would time out before its
+            // request is written and leave nothing tracked. Parked after a
+            // snapshot, the watcher has no request in flight.
+            let watcher_runs = !fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .expect("the session")
+                .runtime_watch_cancel
+                .is_cancelled();
+            let parked_watcher = if answer == Answer::Timeout && watcher_runs {
+                let parked = fixture
+                    .registry
+                    .hold_next_input(&created.id, "worker_snapshot");
+                pohunek_test_support::wait::guard(
+                    "the worker watcher to park after a snapshot",
+                    parked.entered.notified(),
+                )
+                .await;
+                Some(parked)
+            } else {
+                None
+            };
             arm(Some(gate.clone()));
             let operation = tokio::spawn(operation);
             for point in 0..points {
@@ -23017,6 +23045,9 @@ generation "$1"
                 .await
                 .expect("the operation ends at the worker bound")
                 .expect("the operation finishes");
+            if let Some(parked) = parked_watcher {
+                parked.release.notify_one();
+            }
             (result, stopped)
         }
 
