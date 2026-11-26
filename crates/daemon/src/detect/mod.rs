@@ -196,8 +196,9 @@ pub struct LimitScreenSighting {
     pub record_age: Option<std::time::Duration>,
     /// Whether the held record was stale when the screen was seen.
     pub stale: bool,
-    /// The latest 7501 payload the parser could not map. A mapped root record
-    /// clears it; a child record or a root `clear` leaves it in place.
+    /// The latest 7501 payload the parser could not map; a later unmapped
+    /// payload replaces it. A mapped root record, a lag resync and a
+    /// reconfigure clear it; a child record or a root `clear` leaves it in place.
     pub unmapped: Option<UnmappedProgramStatus>,
     /// The published activity when the screen was seen.
     pub activity: Option<AgentActivity>,
@@ -548,7 +549,7 @@ pub struct Detector {
     staleness_change: Option<StalenessChange>,
     /// The class of the strongest phrase the usage-limit screen currently on
     /// display named, when one is. It latches the diagnostic sighting: one
-    /// journal line per class per screen, not one per redraw, and a fresh line
+    /// journal line per class at most per screen, not one per redraw, and a fresh line
     /// only after the screen stopped naming the limit or named a more specific
     /// phrase.
     usage_limit_latch: Option<usage_limit::MarkerClass>,

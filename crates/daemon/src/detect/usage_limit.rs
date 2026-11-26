@@ -33,7 +33,7 @@ pub const MAX_SPECIFIC_LIMIT_SIGHTINGS: usize = 16;
 pub enum MarkerClass {
     /// A bare phrase (`usage limit`, `weekly limit`) a transcript quotes easily.
     Generic,
-    /// A phrase that states the limit was hit or when it resets.
+    /// A phrase that names the limit as hit, its reset, or its window.
     Specific,
 }
 
