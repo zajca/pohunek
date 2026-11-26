@@ -550,6 +550,7 @@ fn screen_fixtures(runtime: &SessionRuntimeIdentity) -> Result<Vec<NamedFixture>
                     title: Some("fixture terminal".to_owned()),
                     progress: None,
                     visible_lines: vec!["pohunek fixture".to_owned()],
+                    links: Vec::new(),
                 })?,
             )
             .expect("fixture response id is valid"),

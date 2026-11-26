@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::links::{screen_links, AnchorLog, Hyperlink, ScreenLink};
 use crate::program_status::{ProbeSpan, PROGRAM_STATUS_COMMAND};
 
 // Rust guideline compliant 2026-07-23
@@ -43,6 +44,7 @@ pub struct TerminalSnapshot {
 pub struct TerminalTracker {
     parser: vt100::Parser,
     osc: OscTracker,
+    anchors: AnchorLog,
 }
 
 impl std::fmt::Debug for TerminalTracker {
@@ -50,6 +52,7 @@ impl std::fmt::Debug for TerminalTracker {
         f.debug_struct("TerminalTracker")
             .field("size", &self.parser.screen().size())
             .field("osc", &self.osc)
+            .field("anchors", &self.anchors)
             .finish()
     }
 }
@@ -61,13 +64,42 @@ impl TerminalTracker {
         Self {
             parser: vt100::Parser::new(rows, cols, 0),
             osc: OscTracker::new(),
+            anchors: AnchorLog::default(),
         }
     }
 
     /// Applies the next ordered PTY output bytes.
+    ///
+    /// The VT parser is advanced up to the end of each OSC 8 sequence and of
+    /// each buffer-switch sequence before it is applied, so an anchor records
+    /// the cursor cell the hyperlink takes effect at, and a buffer switch drops
+    /// the anchors wherever the output is split into chunks.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-        self.osc.feed(bytes);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (used, event) = self.osc.feed_until_event(rest);
+            self.parser.process(&rest[..used]);
+            rest = &rest[used..];
+            match event {
+                Some(TrackerEvent::Hyperlink(hyperlink)) => {
+                    self.anchors.apply(self.parser.screen(), hyperlink);
+                }
+                Some(TrackerEvent::BufferSwitch) => self.anchors.clear(),
+                None => {}
+            }
+        }
+    }
+
+    /// Returns the links on the visible screen, in reading order, none with a
+    /// URL longer than `max_url_bytes`.
+    ///
+    /// OSC 8 anchors are reported while the text they covered is still in the
+    /// cells where it was printed; a scroll, clear, overwrite, resize or
+    /// buffer switch drops them, because the VT model keeps no per-cell
+    /// hyperlink state. Nothing is restored when the buffer is switched back.
+    #[must_use]
+    pub fn links(&self, max_url_bytes: usize) -> Vec<ScreenLink> {
+        screen_links(self.parser.screen(), &self.anchors, max_url_bytes)
     }
 
     /// Takes the OSC 7501 probes completed since the previous call.
@@ -80,6 +112,7 @@ impl TerminalTracker {
     /// Updates the modeled terminal dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
+        self.anchors.clear();
     }
 
     /// Captures a complete state and ANSI repaint at `watermark`.
@@ -128,6 +161,26 @@ struct OscTracker {
     /// Index of the `ESC` that introduced the current OSC.
     osc_start: u64,
     probes: Vec<ProbeSpan>,
+    /// Event completed by the byte just advanced, not yet taken.
+    event: Option<TrackerEvent>,
+    /// Value of the private-mode CSI parameter being read.
+    csi_param: u32,
+    /// Whether an earlier parameter of that CSI names an alternate screen.
+    csi_selects: bool,
+}
+
+/// Something the tracker applies between two parser runs.
+#[derive(Debug)]
+enum TrackerEvent {
+    /// An OSC 8 sequence completed.
+    Hyperlink(Hyperlink),
+    /// A set or reset of an alternate-screen mode (`?47`, `?1047`, `?1049`).
+    BufferSwitch,
+}
+
+/// Whether a private mode number selects an alternate screen buffer.
+fn is_alternate_screen_mode(mode: u32) -> bool {
+    matches!(mode, 47 | 1047 | 1049)
 }
 
 impl OscTracker {
@@ -142,13 +195,55 @@ impl OscTracker {
             escape_at: 0,
             osc_start: 0,
             probes: Vec::new(),
+            event: None,
+            csi_param: 0,
+            csi_selects: false,
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
+    /// Advances over `bytes` up to and including the byte that completes an
+    /// OSC 8 sequence or a buffer switch, or over all of them when none does.
+    ///
+    /// Returns the number of bytes consumed and the completed event.
+    fn feed_until_event(&mut self, bytes: &[u8]) -> (usize, Option<TrackerEvent>) {
+        for (index, &byte) in bytes.iter().enumerate() {
             self.advance(byte);
             self.consumed += 1;
+            if let Some(event) = self.event.take() {
+                return (index + 1, Some(event));
+            }
+        }
+        (bytes.len(), None)
+    }
+
+    /// Reads one byte of a private-mode CSI the way the VT parser does: a
+    /// decimal parameter that saturates, and C0 controls inside the sequence do
+    /// not end it.
+    fn advance_private_mode(&mut self, byte: u8) {
+        match byte {
+            b'0'..=b'9' => {
+                self.csi_param = self
+                    .csi_param
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(byte - b'0'));
+            }
+            b';' => {
+                self.csi_selects |= is_alternate_screen_mode(self.csi_param);
+                self.csi_param = 0;
+            }
+            b'h' | b'l' => {
+                if self.csi_selects || is_alternate_screen_mode(self.csi_param) {
+                    self.event = Some(TrackerEvent::BufferSwitch);
+                }
+                self.state = OscState::Ground;
+            }
+            0x1b => {
+                self.escape_at = self.consumed;
+                self.state = OscState::Escape;
+            }
+            0x18 | 0x1a => self.state = OscState::Ground,
+            0x00..=0x1f => {}
+            _ => self.state = OscState::Ground,
         }
     }
 
@@ -161,15 +256,36 @@ impl OscTracker {
                 }
             }
             OscState::Escape => {
-                self.state = if byte == b']' {
-                    self.osc_start = self.escape_at;
-                    self.command.clear();
-                    self.payload.clear();
-                    OscState::Command
-                } else {
-                    OscState::Ground
+                self.state = match byte {
+                    b']' => {
+                        self.osc_start = self.escape_at;
+                        self.command.clear();
+                        self.payload.clear();
+                        OscState::Command
+                    }
+                    b'[' => OscState::Csi,
+                    0x1b => {
+                        self.escape_at = self.consumed;
+                        OscState::Escape
+                    }
+                    _ => OscState::Ground,
                 };
             }
+            OscState::Csi => {
+                self.state = match byte {
+                    b'?' => {
+                        self.csi_param = 0;
+                        self.csi_selects = false;
+                        OscState::CsiPrivate
+                    }
+                    0x1b => {
+                        self.escape_at = self.consumed;
+                        OscState::Escape
+                    }
+                    _ => OscState::Ground,
+                };
+            }
+            OscState::CsiPrivate => self.advance_private_mode(byte),
             OscState::Command => match byte {
                 b';' => self.state = OscState::Payload,
                 0x07 => self.finish(),
@@ -219,6 +335,9 @@ impl OscTracker {
         match command {
             Some("0" | "2") => self.title = Some(payload),
             Some("9") => self.progress = Some(payload),
+            Some("8") => {
+                self.event = Hyperlink::parse(&self.payload).map(TrackerEvent::Hyperlink);
+            }
             Some(number)
                 if number.as_bytes() == PROGRAM_STATUS_COMMAND
                     && self.payload.first() == Some(&b'?') =>
@@ -240,6 +359,10 @@ impl OscTracker {
 enum OscState {
     Ground,
     Escape,
+    /// After `ESC [`.
+    Csi,
+    /// After `ESC [ ?`, reading private-mode parameters.
+    CsiPrivate,
     Command,
     Payload,
     PayloadEscape,

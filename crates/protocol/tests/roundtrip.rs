@@ -2669,6 +2669,7 @@ fn session_screen_contract_has_exact_wire_shape() {
         title: Some("Build".to_owned()),
         progress: None,
         visible_lines: vec!["one".to_owned(), "two".to_owned()],
+        links: Vec::new(),
     };
     let expected = json!({
         "session_id": "s-42",
@@ -2695,6 +2696,29 @@ fn session_screen_contract_has_exact_wire_shape() {
         "unknown": true
     }))
     .expect_err("unknown screen field must fail");
+}
+
+#[test]
+fn session_screen_links_have_exact_wire_shape() {
+    let wire = json!({
+        "session_id": "s-42",
+        "worker_id": "worker-1",
+        "worker_instance_id": "runtime-1",
+        "runtime_generation": "2",
+        "watermark": "9",
+        "dimensions": {"cols": 120, "rows": 40},
+        "cursor": {"row": 3, "col": 7, "visible": true},
+        "alternate_screen": false,
+        "visible_lines": ["open http://localhost:5173"],
+        "links": [
+            {"url": "http://localhost:5173", "source": "text", "row": 0, "col": 5},
+            {"url": "https://example.test/a", "source": "osc8", "row": 1, "col": 0}
+        ]
+    });
+    let result = serde_json::from_value::<SessionScreenResult>(wire.clone()).expect("parse");
+    assert_eq!(result.links.len(), 2);
+    assert_eq!(serde_json::to_value(&result).expect("serialize"), wire);
+    assert!(!format!("{:?}", result.links[0]).contains("localhost"));
 }
 
 #[test]
@@ -3945,6 +3969,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_retention_selector_supported: true,
         session_remove_tree_supported: false,
         session_adopt_supported: false,
+        session_screen_links_supported: false,
         subscribe_heartbeat: None,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,

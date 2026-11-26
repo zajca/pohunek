@@ -1892,6 +1892,10 @@ mod tests {
     /// not discard the consumed bytes: the bridge keeps its pending read and
     /// still delivers that frame intact after forwarding the input.
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one scenario builds the worker frames, the bridge and the socket pair inline"
+    )]
     async fn worker_attach_bridge_keeps_a_partly_read_frame_across_public_input() {
         let identity = WorkerFrameIdentity {
             version: Version::new(1).expect("version"),
@@ -1927,6 +1931,7 @@ mod tests {
                         title: None,
                         progress: None,
                         visible_lines: Vec::new(),
+                        links: Vec::new(),
                     },
                 },
                 b"repaint-before-input",

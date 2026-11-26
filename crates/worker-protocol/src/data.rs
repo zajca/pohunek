@@ -63,6 +63,43 @@ pub struct TerminalSnapshot {
     pub progress: Option<String>,
     /// Current visible terminal rows without ANSI control bytes.
     pub visible_lines: Vec<String>,
+    /// Links on the screen; filled only for a screen observation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TerminalLink>,
+}
+
+/// Where a [`TerminalLink`] was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalLinkSource {
+    /// A URL matched in the visible text.
+    Text,
+    /// An OSC 8 hyperlink anchor.
+    Osc8,
+}
+
+/// One link on the visible screen.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalLink {
+    /// The URL, free of control characters.
+    pub url: String,
+    /// How the link was found.
+    pub source: TerminalLinkSource,
+    /// Zero-based row of the first cell.
+    pub row: u16,
+    /// Zero-based column of the first cell.
+    pub column: u16,
+}
+
+impl Debug for TerminalLink {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalLink")
+            .field("url", &"<redacted>")
+            .field("source", &self.source)
+            .field("row", &self.row)
+            .field("column", &self.column)
+            .finish()
+    }
 }
 
 impl Debug for TerminalSnapshot {
@@ -76,6 +113,7 @@ impl Debug for TerminalSnapshot {
             .field("progress", &self.progress.as_ref().map(|_| "<redacted>"))
             .field("visible_line_count", &self.visible_lines.len())
             .field("visible_lines", &"<redacted>")
+            .field("link_count", &self.links.len())
             .finish()
     }
 }
@@ -705,6 +743,12 @@ mod tests {
                     title: Some(secret.to_owned()),
                     progress: Some(secret.to_owned()),
                     visible_lines: vec![secret.to_owned()],
+                    links: vec![TerminalLink {
+                        url: format!("https://example.test/?q={secret}"),
+                        source: TerminalLinkSource::Text,
+                        row: 0,
+                        column: 0,
+                    }],
                 },
             }),
             secret.as_bytes().to_vec(),

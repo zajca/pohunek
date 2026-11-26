@@ -193,6 +193,15 @@ export type HostCapabilities = {
    */
   session_adopt_supported?: boolean;
   /**
+   * Whether `session.screen` reports `links`.
+   *
+   * A daemon that predates the field omits the flag, which decodes as
+   * `false`; its screen result has no `links`, so a client cannot tell a
+   * screen without links from a daemon that does not look for them without
+   * this flag. `false` is likewise omitted on the wire.
+   */
+  session_screen_links_supported?: boolean;
+  /**
    * The `heartbeat_ms` bounds `subscribe` accepts, when the daemon serves
    * heartbeats.
    *

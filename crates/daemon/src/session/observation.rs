@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use protocol::{
-    ErrorClass, OutputOffset, ProtocolError, RuntimeGeneration, SessionInfo, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionRuntimeIdentity, SessionScreenResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, TerminalCursor, TerminalDimensions,
-    TerminalWatermark,
+    ErrorClass, OutputOffset, ProtocolError, RuntimeGeneration, ScreenLink, ScreenLinkSource,
+    SessionInfo, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionRuntimeIdentity, SessionScreenResult, SessionWaitParams, SessionWaitReason,
+    SessionWaitResult, TerminalCursor, TerminalDimensions, TerminalWatermark,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -91,7 +91,9 @@ impl SessionRegistry {
         let managed = self.managed_session(id).await?;
         let snapshot = managed
             .worker
-            .terminal_snapshot()
+            .terminal_snapshot_with_links(
+                u32::try_from(self.inner.config.observation_screen_link_bytes).unwrap_or(u32::MAX),
+            )
             .await
             .map_err(observation_worker_error)?;
         self.verify_managed_identity(id, &managed).await?;
@@ -120,13 +122,29 @@ impl SessionRegistry {
             title: snapshot.title,
             progress: snapshot.progress,
             visible_lines: snapshot.visible_lines,
+            links: Vec::new(),
         };
-        let serialized = serde_json::to_vec(&result).map_err(|_error| {
-            runtime_error(
-                "screen_serialize_failed",
-                "terminal snapshot serialization failed",
-            )
-        })?;
+        let serialize = |result: &SessionScreenResult| {
+            serde_json::to_vec(result).map_err(|_error| {
+                runtime_error(
+                    "screen_serialize_failed",
+                    "terminal snapshot serialization failed",
+                )
+            })
+        };
+        let mut serialized = serialize(&result)?;
+        let mut result = result;
+        if serialized.len() <= self.inner.config.observation_screen_bytes {
+            result.links = bounded_links(
+                snapshot.links,
+                self.inner.config.observation_screen_links,
+                self.inner.config.observation_screen_link_bytes,
+                self.inner.config.observation_screen_bytes - serialized.len(),
+            );
+            if !result.links.is_empty() {
+                serialized = serialize(&result)?;
+            }
+        }
         if serialized.len() > self.inner.config.observation_screen_bytes {
             tracing::warn!(
                 session_id = %id.0,
@@ -142,6 +160,7 @@ impl SessionRegistry {
             rows = result.dimensions.rows(),
             columns = result.dimensions.cols(),
             response_bytes = serialized.len(),
+            links = result.links.len(),
             "session screen observation completed"
         );
         Ok(result)
@@ -581,6 +600,52 @@ impl SessionRegistry {
             session_id: id.clone(),
         })
     }
+}
+
+/// Serialized bytes the `,"links":[]` member adds to a screen result.
+const LINKS_MEMBER_BYTES: usize = 11;
+
+/// Applies the configured caps to the worker's links.
+///
+/// A link whose URL exceeds `max_url_bytes` is dropped whole, since a
+/// truncated URL is a different URL. Links are kept in the worker's reading
+/// order while their serialized size fits `budget_bytes` and `max_links`; the
+/// first link that does not fit ends the list, so a result never skips ahead
+/// of an earlier link.
+fn bounded_links(
+    links: Vec<pohunek_worker_protocol::TerminalLink>,
+    max_links: usize,
+    max_url_bytes: usize,
+    budget_bytes: usize,
+) -> Vec<ScreenLink> {
+    let mut remaining = budget_bytes.saturating_sub(LINKS_MEMBER_BYTES);
+    let mut bounded = Vec::new();
+    for link in links
+        .into_iter()
+        .filter(|link| link.url.len() <= max_url_bytes)
+        .take(max_links)
+    {
+        let link = ScreenLink {
+            url: link.url,
+            source: match link.source {
+                pohunek_worker_protocol::TerminalLinkSource::Text => ScreenLinkSource::Text,
+                pohunek_worker_protocol::TerminalLinkSource::Osc8 => ScreenLinkSource::Osc8,
+            },
+            row: link.row,
+            col: link.column,
+        };
+        // One byte for the separating comma.
+        let Some(cost) = serde_json::to_vec(&link)
+            .ok()
+            .map(|bytes| bytes.len() + 1)
+            .filter(|cost| *cost <= remaining)
+        else {
+            break;
+        };
+        remaining -= cost;
+        bounded.push(link);
+    }
+    bounded
 }
 
 fn log_wait_completed(params: &SessionWaitParams, result: &SessionWaitResult, started: Instant) {

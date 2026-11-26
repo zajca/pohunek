@@ -1365,6 +1365,10 @@ pub enum RequestKind {
     TerminalSnapshot {
         /// Exact leased runtime scope.
         scope: RuntimeScope,
+        /// Longest URL, in bytes, of the links to return. Links are computed
+        /// only when this is set; an older daemon omits it and gets none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_url_bytes: Option<u32>,
     },
     /// Returns one bounded retained-output page without attaching a data stream.
     ReadOutput {

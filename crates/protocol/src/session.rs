@@ -1712,6 +1712,52 @@ pub struct SessionScreenResult {
     pub progress: Option<String>,
     /// Visible terminal lines with control sequences removed.
     pub visible_lines: Vec<String>,
+    /// Links found on the visible screen, in reading order.
+    ///
+    /// Omitted when the screen has none, and by a daemon that does not report
+    /// links (`HostCapabilities::session_screen_links_supported`). The links
+    /// are data only: nothing opens a URL because it was reported.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<Vec<ScreenLink>>"))]
+    pub links: Vec<ScreenLink>,
+}
+
+/// Where a [`ScreenLink`] was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ScreenLinkSource.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenLinkSource {
+    /// A URL matched in the visible text.
+    Text,
+    /// An OSC 8 hyperlink anchor.
+    Osc8,
+}
+
+/// One link on the visible terminal screen.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ScreenLink.ts"))]
+pub struct ScreenLink {
+    /// The URL, free of control characters.
+    pub url: String,
+    /// How the link was found.
+    pub source: ScreenLinkSource,
+    /// Zero-based row of the link's first cell.
+    pub row: u16,
+    /// Zero-based column of the link's first cell.
+    pub col: u16,
+}
+
+impl std::fmt::Debug for ScreenLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScreenLink")
+            .field("url", &"<redacted>")
+            .field("source", &self.source)
+            .field("row", &self.row)
+            .field("col", &self.col)
+            .finish()
+    }
 }
 
 /// Parameters for `session.output`.
