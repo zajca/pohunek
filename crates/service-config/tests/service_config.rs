@@ -16,10 +16,9 @@ use pohunek_service_config::{
     ServiceConfig, WaitTiming, DEFAULT_CREATE_DRAIN, DEFAULT_EVENT_RETENTION,
     DEFAULT_HOOK_STDERR_TAIL_BYTES, DEFAULT_INPUT_TIMING, DEFAULT_INVENTORY_PROBE,
     DEFAULT_KEEPALIVE_TIMING, DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_REGISTRY_SHUTDOWN,
-    DEFAULT_SUBSCRIPTION_SETTINGS,
-    DEFAULT_WAIT_TIMING, DEFAULT_WORKER_JOURNAL_MAX_AGE, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
-    MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
-    MIN_WORKER_ANSWER,
+    DEFAULT_SUBSCRIPTION_SETTINGS, DEFAULT_WAIT_TIMING, DEFAULT_WORKER_JOURNAL_MAX_AGE,
+    MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_HOOK_STDERR_TAIL_BYTES,
+    MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES, MIN_WORKER_ANSWER,
 };
 use tempfile::TempDir;
 
@@ -3484,7 +3483,10 @@ fn subscription_settings_default_round_trip_and_are_known_keys() {
         custom.unknown_keys()
     );
     let rendered = custom.to_toml();
-    assert!(rendered.contains("session_event_capacity = 4096"), "{rendered}");
+    assert!(
+        rendered.contains("session_event_capacity = 4096"),
+        "{rendered}"
+    );
     assert!(
         !rendered.contains("notification_event_capacity"),
         "a key equal to its default is not written: {rendered}"
@@ -3507,7 +3509,10 @@ fn subscription_settings_outside_their_bounds_are_refused_by_key() {
             "subscriptions.notification_event_capacity",
         ),
         ("heartbeat_min_ms = 9", "subscriptions.heartbeat_min_ms"),
-        ("heartbeat_max_ms = 3600001", "subscriptions.heartbeat_max_ms"),
+        (
+            "heartbeat_max_ms = 3600001",
+            "subscriptions.heartbeat_max_ms",
+        ),
         (
             "heartbeat_min_ms = 5000\nheartbeat_max_ms = 4000",
             "subscriptions.heartbeat_min_ms",

@@ -132,9 +132,7 @@ async fn read_rename_without_heartbeat(
             event::HEARTBEAT,
             "no heartbeat while events keep arriving within the interval"
         );
-        if event.event() == event::SESSION_UPDATED
-            && event.payload()["session"]["name"] == Value::from(name)
-        {
+        if event.event() == event::SESSION_UPDATED && event.payload()["session"]["name"] == name {
             return;
         }
     }

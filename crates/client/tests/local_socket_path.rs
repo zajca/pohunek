@@ -76,7 +76,9 @@ fn runtime_env(runtime_root: &Path) -> PathEnv {
 }
 
 fn effective_uid(path: &Path) -> u32 {
-    std::fs::metadata(path).expect("inspect the test root").uid()
+    std::fs::metadata(path)
+        .expect("inspect the test root")
+        .uid()
 }
 
 fn set_mode(path: &Path, mode: u32) {
@@ -219,7 +221,9 @@ fn a_symlinked_runtime_directory_is_refused() {
     set_mode(&elsewhere, PRIVATE_DIR_MODE);
     std::os::unix::fs::symlink(&elsewhere, runtime.dir()).expect("link the runtime directory");
 
-    let error = runtime.resolve().expect_err("a symlinked directory is unsafe");
+    let error = runtime
+        .resolve()
+        .expect_err("a symlinked directory is unsafe");
     assert_eq!(unsafe_reason(&error), UnsafeEndpointReason::Symlink);
 }
 

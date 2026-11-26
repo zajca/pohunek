@@ -2643,18 +2643,34 @@ fn default_heartbeat_max_ms() -> u32 {
     DEFAULT_SUBSCRIPTION_SETTINGS.heartbeat_max_ms
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
 fn is_default_session_event_capacity(value: &u64) -> bool {
     *value == default_session_event_capacity()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
 fn is_default_notification_event_capacity(value: &u64) -> bool {
     *value == default_notification_event_capacity()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
 fn is_default_heartbeat_min_ms(value: &u32) -> bool {
     *value == default_heartbeat_min_ms()
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
 fn is_default_heartbeat_max_ms(value: &u32) -> bool {
     *value == default_heartbeat_max_ms()
 }

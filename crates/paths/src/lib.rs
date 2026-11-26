@@ -403,11 +403,7 @@ enum EntryKind {
     Socket,
 }
 
-fn verify_private_entry(
-    path: &Path,
-    kind: EntryKind,
-    effective_uid: u32,
-) -> Result<(), PathError> {
+fn verify_private_entry(path: &Path, kind: EntryKind, effective_uid: u32) -> Result<(), PathError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let unsafe_entry = |reason| PathError::UnsafeSocketEndpoint {

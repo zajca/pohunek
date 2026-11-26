@@ -81,4 +81,8 @@ pub struct SubscriptionLaggedEvent {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HeartbeatEvent.ts"))]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "an empty named-field struct serializes as the JSON object `{}`, which the wire payload requires"
+)]
 pub struct HeartbeatEvent {}

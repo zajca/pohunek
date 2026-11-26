@@ -26,9 +26,9 @@ mod notification;
 mod package;
 mod project;
 mod session;
-mod subscribe;
 #[cfg(test)]
 mod stale_attention_tests;
+mod subscribe;
 #[cfg(test)]
 #[cfg(test)]
 mod turn_wait_tests;
