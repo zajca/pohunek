@@ -1083,6 +1083,29 @@ async fn a_check_of_an_upgrade_refuses_a_previous_schema_file_under_a_pending_re
     );
     assert_eq!(config_bytes(harness), bytes, "the file is untouched");
     assert_eq!(record_bytes(harness), record, "the record is kept");
+
+    // A live session the new daemon would not adopt is judged before the file
+    // is read, by the check as by the upgrade.
+    seed_at_risk(harness);
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("the check is refused at risk");
+    let upgraded = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the upgrade is refused at risk");
+    assert_eq!(
+        checked.code(),
+        "service_upgrade_sessions_at_risk",
+        "{checked}"
+    );
+    assert_eq!(upgraded.code(), checked.code(), "{upgraded}");
 }
 
 #[tokio::test]

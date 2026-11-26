@@ -823,7 +823,9 @@ fn pending_refresh(config: &Path, state: &Path, source: &[u8]) {
             .and_then(Path::parent)
             .expect("fixture root")
             .join("prefix"),
-        previous_version: Some("0.36.0".to_owned()),
+        // The checked version itself, so the rollback swaps no daemon and the
+        // adoption preflight, which needs a service manager, is not asked.
+        previous_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
         version_dir_preexisted: true,
         config_backup: None,
         step: Step::Started,
@@ -877,13 +879,22 @@ fn check_refuses_a_pending_refresh_over_a_schema_seven_config_like_the_upgrade()
 #[test]
 fn check_does_not_refuse_a_pending_refresh_over_a_current_schema_config() {
     let host = Host::current_with_waits(120_000, 2_700_000);
-    let (_success, envelope) = check_with_setup(&host, pending_refresh);
+    let (success, envelope) = check_with_setup(&host, pending_refresh);
     let code = envelope
         .get("err")
         .and_then(|refusal| refusal.get("code"))
         .and_then(Value::as_str);
     assert_ne!(code, Some("service_refresh_config_schema"), "{envelope}");
     assert_ne!(code, Some("service_config_invalid"), "{envelope}");
+    if success {
+        let report = &envelope["ok"];
+        assert_eq!(report["operation"], "upgrade", "{envelope}");
+        assert_eq!(report["pending_action"], "roll_back", "{envelope}");
+        assert_eq!(
+            report["pending_transaction"]["operation"], "refresh_path",
+            "{envelope}"
+        );
+    }
 }
 
 /// A command that never writes the file reads a schema-7 file whatever the

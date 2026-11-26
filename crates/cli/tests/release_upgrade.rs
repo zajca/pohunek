@@ -452,11 +452,15 @@ fn assert_assistant_opted_out(report: &Value, to: &str) {
         "the upgrade carries the assistant package state: {report}"
     );
     assert_eq!(assistant["core_version"], to, "{report}");
-    assert!(
-        ["current", "outdated", "absent", "unselected"]
-            .iter()
-            .any(|status| assistant["status"] == *status),
+    assert_ne!(
+        assistant["status"], "unchecked",
         "the upgraded daemon answered, so the state is not `unchecked`: {report}"
+    );
+    // The harness stages no assistant package, so the upgraded daemon lists none.
+    assert_eq!(assistant["status"], "absent", "{report}");
+    assert!(
+        assistant["version"].is_null(),
+        "no version is staged: {report}"
     );
     let install = &assistant["install"];
     assert_eq!(
@@ -2809,6 +2813,22 @@ mod tests {
     fn an_unchecked_assistant_state_is_refused() {
         let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
         report["assistant"]["status"] = Value::from("unchecked");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "\"absent\"")]
+    fn a_staged_state_other_than_absent_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report["assistant"]["status"] = Value::from("current");
+        assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
+    }
+
+    #[test]
+    #[should_panic(expected = "no version is staged")]
+    fn a_version_in_the_unstaged_assistant_state_is_refused() {
+        let mut report = parse_envelope(HEAD_UPGRADE, true).expect("upgrade envelope");
+        report["assistant"]["version"] = Value::from("0.46.0");
         assert_upgrade_report(&report, "0.45.0", "0.46.0", AssistantRow::OptedOut);
     }
 

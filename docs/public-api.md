@@ -3187,9 +3187,9 @@ not apply are `null`. `result` is one of:
 - `installed`: the listed version is installed and selected in one registry commit;
   the old version stays installed. The daemon verifies the signed index and the
   archive digest for it, as for `pohunek setup`. It is also the result for a
-  selected version that does not serve (a damaged root, a revoked digest) and is
-  not older than the listing: setup and the upgrade replace it with the listed
-  version;
+  selected version that does not serve (a damaged root, or a revoked digest other
+  than the listed one) and is not older than the listing: setup and the upgrade
+  replace it with the listed version. A revoked listed digest is `failed`;
 - `not_published`: the index lists no version newer than the selected, serving one for the
   new core and this host's platform (the package is published after the core
   release, and the official index lists it only once it is admitted), so the old

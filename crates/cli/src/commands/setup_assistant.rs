@@ -139,35 +139,39 @@ pub(crate) async fn plan_with_cause(
         if let Err(error) = require_context_install(client).await {
             return (AssistantStep::gap(error.to_string()), Some(GapCause::Other));
         }
-        if let Ok(listed) = plugin::list(client).await {
-            match decide(&listed.packages, &resolved) {
-                Decision::Keep(kept) => {
-                    return (
-                        AssistantStep::Present {
-                            package_id,
-                            version: kept.package.version.to_string(),
-                            digest: kept.digest.as_str().to_owned(),
-                        },
-                        None,
-                    );
-                }
-                Decision::Revoked(detail) => {
-                    return (AssistantStep::gap(detail), Some(GapCause::Other));
-                }
-                Decision::Held(hold) => {
-                    return (
-                        AssistantStep::Gap {
-                            detail: format!("{}, which setup leaves as it is", hold.detail),
-                            command: hold.command,
-                        },
-                        Some(GapCause::Other),
-                    );
-                }
-                Decision::Install {
-                    replaces: selection,
-                } => {
-                    replaces = selection.map(|info| info.package.version.to_string());
-                }
+        // A daemon that cannot list its packages leaves the plan unable to
+        // tell what an install would replace.
+        let listed = match plugin::list(client).await {
+            Ok(listed) => listed,
+            Err(error) => return (AssistantStep::gap(error.to_string()), Some(GapCause::Other)),
+        };
+        match decide(&listed.packages, &resolved) {
+            Decision::Keep(kept) => {
+                return (
+                    AssistantStep::Present {
+                        package_id,
+                        version: kept.package.version.to_string(),
+                        digest: kept.digest.as_str().to_owned(),
+                    },
+                    None,
+                );
+            }
+            Decision::Revoked(detail) => {
+                return (AssistantStep::gap(detail), Some(GapCause::Other));
+            }
+            Decision::Held(hold) => {
+                return (
+                    AssistantStep::Gap {
+                        detail: format!("{}, which setup leaves as it is", hold.detail),
+                        command: hold.command,
+                    },
+                    Some(GapCause::Other),
+                );
+            }
+            Decision::Install {
+                replaces: selection,
+            } => {
+                replaces = selection.map(|info| info.package.version.to_string());
             }
         }
     }

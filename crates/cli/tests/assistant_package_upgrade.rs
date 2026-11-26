@@ -796,6 +796,76 @@ async fn the_step_without_an_index_url_resolves_the_official_index() {
     );
 }
 
+/// An index that lists nothing for this core, a listed package that is not
+/// installed and a listed package that is installed and selected end the same
+/// way in the upgrade step and in the plan `pohunek assistant` makes: refused
+/// as not published, installed through the daemon, and left alone.
+#[tokio::test]
+async fn the_upgrade_and_setup_agree_on_an_unlisted_a_missing_and_a_kept_package() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    // Nothing listed for the core.
+    let rig = Rig::start().await;
+    rig.publish_nothing();
+    let document = document_of_upgrade(&rig).await;
+    assert_eq!(
+        install_of(&document)["result"],
+        "not_published",
+        "{document}"
+    );
+    let (code, setup, stderr) = rig.setup();
+    assert_ne!(code, 0, "{setup} / {stderr}");
+    assert_eq!(
+        setup["err"]["code"], "assistant_package_missing",
+        "{setup} / {stderr}"
+    );
+    assert!(rig.listed().await.is_empty(), "nothing installed");
+
+    // Listed and not installed: the upgrade installs it.
+    let upgraded = Rig::start().await;
+    let archive = upgraded.publish(VERSION);
+    let document = document_of_upgrade(&upgraded).await;
+    let install = install_of(&document);
+    assert_eq!(install["result"], "installed", "{document}");
+    assert_eq!(install["digest"], archive.digest.as_str(), "{document}");
+
+    // Listed and not installed: setup installs it.
+    let set_up = Rig::start().await;
+    let archive = set_up.publish(VERSION);
+    let (code, setup, stderr) = set_up.setup();
+    assert_eq!(code, 0, "{setup} / {stderr}");
+    let selected = set_up.selected().await.expect("setup selects the package");
+    assert_eq!(selected.digest, archive.digest.as_str());
+    assert_eq!(selected.version, VERSION);
+    assert_eq!(
+        rig_selection(&upgraded).await,
+        (selected.version, selected.digest),
+        "both end with the listed version selected"
+    );
+
+    // Listed, installed and selected: both leave it alone.
+    let before = set_up.listed().await;
+    let requests = set_up.server.requests().len();
+    let document = document_of_upgrade(&set_up).await;
+    assert_eq!(document["assistant"]["status"], "current", "{document}");
+    assert!(document["assistant"].get("install").is_none(), "{document}");
+    assert_eq!(
+        set_up.server.requests().len(),
+        requests,
+        "a current package asks no index"
+    );
+    let (code, setup, stderr) = set_up.setup();
+    assert_eq!(code, 0, "{setup} / {stderr}");
+    assert_eq!(set_up.listed().await, before, "setup changes nothing");
+}
+
+/// The selected version and digest of `rig`.
+async fn rig_selection(rig: &Rig) -> (String, String) {
+    let selected = rig.selected().await.expect("a version is selected");
+    (selected.version, selected.digest)
+}
+
 /// A listed digest the daemon holds revoked is refused by the upgrade step
 /// and by the plan `pohunek assistant` makes, with the same text, and nothing
 /// is installed or selected.

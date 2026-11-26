@@ -438,6 +438,16 @@ async fn finish_check(
         checked.report.warnings.extend(warnings);
         checked.report.warnings.extend(gated.warnings);
     }
+    // The upgrade judges the adoption preflight before it rolls the refresh
+    // back, so a file of another schema is refused after that gate, as install
+    // and upgrade refuse it.
+    if checked
+        .pending
+        .as_ref()
+        .is_some_and(|record| record.operation == record::Operation::RefreshPath)
+    {
+        refresh::load_installed_config(context)?;
+    }
     Ok(checked.report)
 }
 
@@ -1241,14 +1251,6 @@ pub(crate) fn check_local(
                 definition::unknown_keys_warning(config),
             )
         };
-    // Rolling back a pending `refresh-path` reads the installed file with the
-    // strict current-schema reader, so a file of another schema is refused here
-    // exactly as install and upgrade refuse it.
-    if let engine::Plan::RollBack(record) = &plan {
-        if record.operation == record::Operation::RefreshPath {
-            refresh::load_installed_config(context)?;
-        }
-    }
     let fresh_install =
         operation == record::Operation::Install && !matches!(plan, engine::Plan::Resume(_));
     let pending = plan.record().cloned();
