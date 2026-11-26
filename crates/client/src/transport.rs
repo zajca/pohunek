@@ -1204,6 +1204,7 @@ impl Client {
         let mut page_params = params;
         let mut page_size = protocol::SESSION_LIST_PAGE_SIZE;
         let mut sessions: Vec<protocol::SessionInfo> = Vec::new();
+        let mut bytes = 0_usize;
         loop {
             page_params.limit = Some(page_size);
             let page = match self
@@ -1224,32 +1225,38 @@ impl Client {
             if sessions.is_empty() && page_len > usize::try_from(page_size).unwrap_or(usize::MAX) {
                 return Ok(page);
             }
-            let Some(last) = page.last().map(|session| session.id.0.clone()) else {
+            let (Some(first), Some(last)) = (
+                page.first().map(|session| session.id.0.clone()),
+                page.last().map(|session| session.id.0.clone()),
+            ) else {
                 break;
             };
-            if page_params
-                .cursor
-                .as_deref()
-                .is_some_and(|cursor| last.as_str() <= cursor)
-            {
-                // A daemon that ignores `cursor` answered the whole set on the
-                // first request and repeats it; the first page is complete.
-                if sessions.len() == page_len {
-                    return Ok(sessions);
+            if let Some(cursor) = page_params.cursor.as_deref() {
+                // A daemon that pages never answers a session at or before the
+                // cursor. One does when it ignores `cursor` and answered the
+                // whole set again: this page is the current complete set.
+                if first.as_str() <= cursor {
+                    return Ok(page);
                 }
-                return Err(ClientError::Protocol(protocol::ProtocolError::new(
-                    protocol::ErrorClass::Daemon,
-                    "session_list_cursor_repeated",
-                    "the daemon answered a session.list page that does not follow its cursor",
-                    Some("upgrade the daemon and client together".to_owned()),
-                )));
+                if last.as_str() <= cursor {
+                    return Err(ClientError::Protocol(protocol::ProtocolError::new(
+                        protocol::ErrorClass::Daemon,
+                        "session_list_cursor_repeated",
+                        "the daemon answered a session.list page that does not follow its cursor",
+                        Some("upgrade the daemon and client together".to_owned()),
+                    )));
+                }
             }
+            bytes =
+                bytes.saturating_add(serde_json::to_vec(&page).map_or(0, |encoded| encoded.len()));
             sessions.extend(page);
-            if sessions.len() > protocol::SESSION_LIST_WALK_MAX_SESSIONS {
+            if sessions.len() > protocol::LIST_WALK_MAX_ITEMS
+                || bytes > protocol::LIST_WALK_MAX_BYTES
+            {
                 return Err(ClientError::Protocol(protocol::ProtocolError::new(
                     protocol::ErrorClass::Daemon,
                     "session_list_walk_limit",
-                    "the session.list walk exceeded the number of sessions a client collects",
+                    "the session.list walk exceeded the sessions or bytes a client collects",
                     Some("narrow the listing with filters".to_owned()),
                 )));
             }

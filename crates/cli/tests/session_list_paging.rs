@@ -27,12 +27,13 @@ mod plugin_harness;
 use plugin_harness::Harness;
 
 /// Metadata keys of each large session and the bytes of each value.
-const METADATA_KEYS: usize = 3;
+/// Four values of 4000 bytes fill the 16 KiB metadata budget of a session.
+const METADATA_KEYS: usize = 4;
 const METADATA_VALUE_BYTES: usize = 4_000;
 
-/// Large sessions: they need more than one control line together, while a
-/// page of the client's size is still one request.
-const LARGE_SESSIONS: usize = 100;
+/// Large sessions: with records of the largest size the metadata allows, few
+/// sessions need more than one control line together.
+const LARGE_SESSIONS: usize = 70;
 
 const _: () =
     assert!(LARGE_SESSIONS * METADATA_KEYS * METADATA_VALUE_BYTES > MAX_CONTROL_LINE_BYTES);
@@ -141,19 +142,9 @@ async fn a_session_set_larger_than_one_response_is_listed_completely_by_the_cli(
         .map(|session| session["id"].as_str().expect("session id").to_owned())
         .collect();
     assert_eq!(listed_ids, ids);
-}
 
-#[tokio::test]
-async fn a_page_whose_sessions_exceed_one_response_is_a_typed_error() {
-    let harness = Harness::start().await;
-    start_sessions(
-        &harness,
-        LARGE_SESSIONS,
-        METADATA_KEYS,
-        METADATA_VALUE_BYTES,
-    )
-    .await;
-
+    // The same set asked for in one request is a typed error, not a frame the
+    // client refuses.
     let response = raw_list(&harness, json!({ "limit": LARGE_SESSIONS }));
 
     let error = response

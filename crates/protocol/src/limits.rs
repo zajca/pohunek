@@ -227,8 +227,15 @@ pub const MAX_SESSION_READ_LINES: u32 = 1_000;
 /// a caller halves the page when the daemon answers `session_list_too_large`.
 pub const SESSION_LIST_PAGE_SIZE: u32 = 200;
 
-/// Most sessions one client-side `session.list` walk collects before it stops.
+/// Most records one client-side list walk collects before it stops.
 ///
-/// A daemon that keeps answering full pages with increasing ids cannot make the
-/// client grow without bound; a real host holds far fewer sessions.
-pub const SESSION_LIST_WALK_MAX_SESSIONS: usize = 100_000;
+/// A daemon that keeps answering full pages with increasing keys cannot make the
+/// client grow without bound; a real host holds far fewer records.
+pub const LIST_WALK_MAX_ITEMS: usize = 100_000;
+
+/// Most serialized bytes one client-side list walk collects before it stops.
+///
+/// Bounds the memory of a walk whose records are large, which the record count
+/// alone does not: a daemon that answers one record of nearly a control line
+/// per page stays under [`LIST_WALK_MAX_ITEMS`] while holding gigabytes.
+pub const LIST_WALK_MAX_BYTES: usize = 64 * 1024 * 1024;

@@ -105,10 +105,12 @@ as the set fits one response. A caller that omits `limit` and must list a
 growing set pages: the SDK `session_list` (and so `pohunek session list`)
 follows `cursor` with pages of 200 sessions and halves the page size when the
 daemon answers `session_list_too_large`. A daemon that predates paging ignores
-`limit` and answers the whole set at once, which the client takes as complete.
-The walk is bounded on the client: `session_list_cursor_repeated` (a page that
-does not follow its cursor) and `session_list_walk_limit` (more than 100000
-sessions collected) are client-raised `daemon`-class errors, never daemon replies.
+`limit` and answers the whole set at once; the client recognizes it by a page
+that starts at or before the cursor and takes that page as the complete, current
+set. The walk is bounded on the client: `session_list_cursor_repeated` (a page
+that ends at or before its cursor) and `session_list_walk_limit` (more than
+100000 sessions or 64 MiB collected) are client-raised `daemon`-class errors,
+never daemon replies.
 
 The window is bounded. When a later bump adds a previous version to it, the
 adapters translate shape only (renames and moved fields, and withholding events
