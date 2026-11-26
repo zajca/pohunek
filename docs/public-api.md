@@ -4868,6 +4868,8 @@ subscriber loses the oldest events when its channel overflows; the daemon then
 sends a `subscription_lagged` event for that channel before any later event of that channel,
 and the subscriber re-seeds by calling `session.list` (and `session.inspect`)
 for the `session` channel or `notification.list` for the `notification` channel.
+The order is per channel: an event of the other channel may arrive before the
+notice.
 The channel capacities are the `[subscriptions]` keys `session_event_capacity`
 and `notification_event_capacity` of `service.toml` (default 128 events each).
 Both new events are additive: a client that ignores events it does not know is
