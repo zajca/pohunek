@@ -47,11 +47,7 @@ fn classify(source: PathError) -> ClientError {
         | PathError::SocketPathParentComponent { .. }
         | PathError::SocketPathTooLong { .. } => ClientError::LocalSocketPathInvalid { source },
         PathError::UnsafeSocketEndpoint { .. } => ClientError::LocalSocketUnsafe { source },
-        PathError::MissingEnv { .. }
-        | PathError::InvalidEnv { .. }
-        | PathError::InvalidInstallPrefix { .. }
-        | PathError::UnsupportedPlatform { .. } => ClientError::LocalSocketUnresolvable { source },
-        // `PathError` grows; an unclassified failure is a configuration problem.
+        // `PathError` grows; any other failure is a configuration problem.
         _ => ClientError::LocalSocketUnresolvable { source },
     }
 }
