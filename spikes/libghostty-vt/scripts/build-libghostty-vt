@@ -3,13 +3,16 @@
 
 usage: python3 -I scripts/build-libghostty-vt <rust-target> <out-dir>
            (--tarball-dir DIR | --fetch) [--zig ZIG] [--pin FILE]
+       python3 -I scripts/build-libghostty-vt <rust-target> <out-dir> --probe-native
 
 The only code that fetches or compiles libghostty. It reads the pins from
 `libghostty-vt.pin.toml`, checks `zig version`, verifies the sha256 of both
 tarballs (taken from --tarball-dir, or downloaded with --fetch), unpacks them
 side by side into a fresh temporary directory and runs an offline `zig build`
 with a new, empty ZIG_GLOBAL_CACHE_DIR. The output directory receives
-`lib/libghostty-vt.a`, `include/ghostty/`, `abi-layout.txt` and `BUILD_INFO`.
+`lib/libghostty-vt.a`, `include/ghostty/`, `abi-layout.txt` and `BUILD_INFO`. `--probe-native` only rewrites
+`abi-layout.txt` with the host C compiler, for a library cross-built on a host
+that cannot run the target (the macOS job).
 """
 
 import argparse
@@ -27,7 +30,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SPIKE = HERE.parent
-DOWNLOAD_TIMEOUT_SECONDS = 300
 
 
 def fail(message: str) -> "None":
@@ -43,7 +45,10 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def obtain(entry: dict, name: str, tarball_dir: Path | None, fetch: bool, work: Path) -> Path:
+def obtain(
+    entry: dict, name: str, tarball_dir: Path | None, fetch: bool, work: Path,
+    download_timeout: int, max_download_bytes: int,
+) -> Path:
     """Return the verified tarball `name`; fail on a hash mismatch."""
     if tarball_dir is not None:
         path = tarball_dir / name
@@ -52,8 +57,13 @@ def obtain(entry: dict, name: str, tarball_dir: Path | None, fetch: bool, work: 
     elif fetch:
         path = work / name
         request = urllib.request.Request(entry["url"])
-        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
-            path.write_bytes(response.read())
+        with urllib.request.urlopen(request, timeout=download_timeout) as response:
+            # The sha256 is checked after the download; the read is bounded so a
+            # hostile response cannot fill the disk first.
+            data = response.read(max_download_bytes + 1)
+        if len(data) > max_download_bytes:
+            fail(f"{name} is larger than the pinned limit of {max_download_bytes} bytes")
+        path.write_bytes(data)
     else:
         fail("pass --tarball-dir DIR or --fetch")
     actual = sha256_of(path)
@@ -115,10 +125,12 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="libghostty-vt-") as scratch_name:
         scratch = Path(scratch_name)
         source_tar = obtain(
-            pins["source"], Path(pins["source"]["url"]).name, args.tarball_dir, args.fetch, scratch
+            pins["source"], Path(pins["source"]["url"]).name, args.tarball_dir, args.fetch, scratch,
+            pins["build"]["download_timeout_seconds"], pins["build"]["max_download_bytes"],
         )
         deps_tar = obtain(
-            pins["deps"], Path(pins["deps"]["url"]).name, args.tarball_dir, args.fetch, scratch
+            pins["deps"], Path(pins["deps"]["url"]).name, args.tarball_dir, args.fetch, scratch,
+            pins["build"]["download_timeout_seconds"], pins["build"]["max_download_bytes"],
         )
         unpack(source_tar, scratch)
         unpack(deps_tar, scratch)
@@ -137,9 +149,9 @@ def main() -> None:
             [
                 args.zig, "build",
                 "--system", str(deps_dir),
-                "-Doptimize=ReleaseFast",
-                "-Dcpu=baseline",
-                "-Dstrip=true",
+                f"-Doptimize={pins['build']['optimize']}",
+                f"-Dcpu={pins['build']['cpu']}",
+                f"-Dstrip={pins['build']['strip']}",
                 f"-Dvt-features={pins['build']['vt_features']}",
                 f"-Dtarget={zig_target}",
                 "--prefix", str(prefix),
@@ -171,16 +183,18 @@ def main() -> None:
             check=True,
             env=environment,
         )
-        # The probe prints a layout table; a target that cannot run it (a
-        # cross build) still records the compile-time asserted layout as
-        # `_Static_assert` successes, so only the run is optional.
-        layout = HERE / "abi_probe.c"
-        probe = subprocess.run(
-            [str(probe_binary)], check=False, capture_output=True, text=True
-        )
-        (out / "abi-layout.txt").write_text(
-            probe.stdout if probe.returncode == 0 else f"# probe not runnable on this host\n# source: {layout.name}\n"
-        )
+        # The probe prints the layout table. A cross-built probe cannot run on
+        # this host; abi-layout.txt then holds only a comment, `build.rs`
+        # refuses it, and `--probe-native` rewrites it on a host that runs the
+        # target.
+        try:
+            probe = subprocess.run(
+                [str(probe_binary)], check=True, capture_output=True, text=True
+            )
+            layout_text = probe.stdout
+        except (OSError, subprocess.CalledProcessError):
+            layout_text = "# probe not runnable on this host; run --probe-native on the target\n"
+        (out / "abi-layout.txt").write_text(layout_text)
 
         zig_exe = shutil.which(args.zig) or args.zig
         total = time.monotonic() - started

@@ -48,8 +48,8 @@ impl GridModel for GhosttyModel {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        // A rejected size stays visible: the dump then keeps the old size and
-        // the report's dimension guard names the mismatch.
+        // A rejected size leaves the terminal at its old size; the pairwise
+        // differences and the final-size guard of the report show it.
         let _ = self.terminal.resize(rows, cols);
     }
 

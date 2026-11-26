@@ -93,7 +93,10 @@ struct CallbackState {
 /// A libghostty-vt terminal with the headless settings above.
 pub struct HeadlessTerminal {
     handle: ffi::Terminal,
-    state: Box<CallbackState>,
+    /// Owned allocation from `Box::into_raw`, freed in `Drop` after the
+    /// terminal; the C callbacks hold this exact pointer, so it must never be
+    /// derived from a moved `Box`.
+    state: *mut CallbackState,
     cell_px: u32,
 }
 
@@ -185,7 +188,7 @@ impl HeadlessTerminal {
         })?;
         let mut terminal = Self {
             handle,
-            state: Box::default(),
+            state: Box::into_raw(Box::default()),
             cell_px: config.ghostty_cell_px,
         };
         terminal.configure(config)?;
@@ -193,11 +196,10 @@ impl HeadlessTerminal {
     }
 
     fn configure(&mut self, config: &ModelConfig) -> Result<(), GhosttyError> {
-        let state: *mut CallbackState = &raw mut *self.state;
         // SAFETY: `handle` is live; USERDATA stores the pointer, which stays
-        // valid because `state` is boxed and outlives the terminal (see `Drop`).
+        // valid because `state` is freed only after the terminal (see `Drop`).
         check("set userdata", unsafe {
-            ffi::ghostty_terminal_set(self.handle, ffi::OPT_USERDATA, state.cast())
+            ffi::ghostty_terminal_set(self.handle, ffi::OPT_USERDATA, self.state.cast())
         })?;
         // SAFETY: the option takes a callback of exactly this type.
         check("set clipboard write", unsafe {
@@ -383,13 +385,15 @@ impl HeadlessTerminal {
     /// The latest progress report in OSC 9;4 payload form.
     #[must_use]
     pub fn progress(&self) -> Option<&str> {
-        self.state.progress.as_deref()
+        // SAFETY: `state` is live until `Drop`, and no callback runs during `&self`.
+        unsafe { (*self.state).progress.as_deref() }
     }
 
     /// Decoded byte length of every clipboard write the program made.
     #[must_use]
     pub fn clipboard_writes(&self) -> &[usize] {
-        &self.state.clipboard_writes
+        // SAFETY: as in `progress`.
+        unsafe { &(*self.state).clipboard_writes }
     }
 
     fn grid_ref(&self, row: u16, col: u16) -> Result<ffi::GridRef, GhosttyError> {
@@ -599,9 +603,13 @@ impl HeadlessTerminal {
 
 impl Drop for HeadlessTerminal {
     fn drop(&mut self) {
-        // SAFETY: `handle` is live and owned; `state` is dropped after it, so
-        // no callback can run on a freed state.
-        unsafe { ffi::ghostty_terminal_free(self.handle) };
+        // SAFETY: `handle` is live and owned. `state` came from `Box::into_raw`
+        // and is freed only after the terminal, so no callback can run on a
+        // freed state.
+        unsafe {
+            ffi::ghostty_terminal_free(self.handle);
+            drop(Box::from_raw(self.state));
+        }
     }
 }
 

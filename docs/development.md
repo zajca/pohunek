@@ -50,9 +50,20 @@ uses it) and through libghostty-vt?
   Claude Code recording are in `fixtures/sources/` (`record-all.sh`,
   `record-claude.sh`). Each trace has a `*.expect.toml` of spec-derived
   assertions, each with its source.
+  `record-trace --out FILE --rows N --cols N --home DIR [--resize ROWSxCOLS]...
+  [--on PATTERN=INPUT]... [--env KEY=VALUE]... [--cwd DIR] [--config FILE] -- COMMAND ...`
+  gives the child an empty environment plus `HOME`, the XDG directories under
+  `--home`, `TERM`, `LANG`, `PATH` and the `--env` entries. A script that
+  prints the config's resize marker and reads a line gets the next `--resize`
+  applied and recorded; `--on` writes INPUT (escapes `\r \n \t \e \\`) once
+  PATTERN appears in the output since the previous step. The recording fails
+  when the child exits non-zero, outlives `record_timeout_seconds`, or leaves a
+  `--resize` or `--on` step unused. Every bound and setting is a required key
+  of `spikes/libghostty-vt/config/model.toml`.
 - **Compare.** `cargo run --manifest-path spikes/libghostty-vt/Cargo.toml --bin spike-report -- --models vt100 --out DIR`
   replays every fixture and writes `report.json` and `report.md`. The report
-  lists each assertion per model, every cell, row and metadata difference
+  (also `--fixtures DIR`, `--config FILE`; `--models vt100,libghostty` needs the
+  feature) lists each assertion per model, every cell, row and metadata difference
   between each model pair (trace, record index, row, column), and a repaint
   round trip per model: the model's repaint is fed to a fresh instance of the
   same model and the two screens are diffed. Assertions whose width depends on
@@ -65,7 +76,10 @@ uses it) and through libghostty-vt?
   (or `--fetch`) build the pinned libghostty-vt 1.0.2 from its two sha256-checked
   tarballs with an offline `zig build` and a fresh `ZIG_GLOBAL_CACHE_DIR`.
   `LIBGHOSTTY_VT_DIR=<out-dir> cargo build --features libghostty` links it;
-  `build.rs` never downloads anything and never runs Zig. Kitty graphics are
+  `build.rs` never downloads anything and never runs Zig. `--zig` and `--pin`
+  select another Zig binary or pin file; `--probe-native` rewrites only
+  `abi-layout.txt` with the host C compiler, for a library cross-built on a host
+  that cannot run the target (the macOS job). Kitty graphics are
   compiled out, and the headless terminal installs no reply callback.
 - **CI.** `.github/workflows/libghostty-spike.yml` runs on dispatch and on pull
   requests that touch the spike. It is not part of `ci.yml`.

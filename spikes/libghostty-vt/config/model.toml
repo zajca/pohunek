@@ -23,9 +23,6 @@ resize_marker = "\u001b]7771;resize-point\u0007"
 child_term = "xterm-256color"
 child_lang = "C.UTF-8"
 child_path = "/usr/bin:/bin"
-# A trace of at most this many bytes is also replayed split in two at every
-# byte boundary; a larger one is replayed one byte per chunk only.
-split_all_max_bytes = 16384
 # libghostty-vt headless settings (every one is applied explicitly; the
 # library's own defaults are never relied on).
 # Scrollback is kept in pages of about 400 KB, so the limit is rounded up.

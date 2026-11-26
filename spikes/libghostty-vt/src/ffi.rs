@@ -22,7 +22,7 @@
 )]
 #![allow(
     unreachable_pub,
-    reason = "the declarations are public for the wrapper module only; the crate re-exports none of them"
+    reason = "the declarations are public for the wrapper module; nothing outside the crate is meant to call them"
 )]
 
 use std::ffi::{c_char, c_int, c_void};

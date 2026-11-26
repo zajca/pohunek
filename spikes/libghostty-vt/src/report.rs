@@ -298,20 +298,26 @@ fn diff_dumps(record: usize, left: &GridDump, right: &GridDump) -> Vec<Differenc
         left.scrollback_rows.to_string(),
         right.scrollback_rows.to_string(),
     );
-    push(
-        "kitty keyboard flags",
-        None,
-        None,
-        format!("{:?}", left.kitty_keyboard_flags),
-        format!("{:?}", right.kitty_keyboard_flags),
-    );
-    push(
-        "clipboard writes",
-        None,
-        None,
-        format!("{:?}", left.clipboard_writes),
-        format!("{:?}", right.clipboard_writes),
-    );
+    // A property one model cannot observe is reported by the assertions, not
+    // as a difference.
+    if let (Some(l), Some(r)) = (left.kitty_keyboard_flags, right.kitty_keyboard_flags) {
+        push(
+            "kitty keyboard flags",
+            None,
+            None,
+            l.to_string(),
+            r.to_string(),
+        );
+    }
+    if let (Some(l), Some(r)) = (&left.clipboard_writes, &right.clipboard_writes) {
+        push(
+            "clipboard writes",
+            None,
+            None,
+            format!("{l:?}"),
+            format!("{r:?}"),
+        );
+    }
     for row in 0..left.cells.len().min(right.cells.len()) {
         push(
             "row wrapped",

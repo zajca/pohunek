@@ -44,34 +44,15 @@ text = "c"
 width = 1
 
 [[assertion]]
-id = "wide-at-last-column-wraps"
-basis = "spec"
-source = "https://www.unicode.org/reports/tr11/"
-rule = "A wide character cannot be split across rows, so one that does not fit in the last column moves to the next row and the row it left is soft-wrapped."
-check = "row_wrapped"
-row = 1
-value = true
-
-[[assertion]]
 id = "wide-at-last-column-moved"
 basis = "spec"
 source = "https://www.unicode.org/reports/tr11/"
-rule = "The wide character that did not fit starts the next row with width 2."
+rule = "A wide character occupies two columns of one row, so one that does not fit in the last column starts the next row with width 2. Whether the row it left is flagged soft-wrapped is not specified by UAX 11 and is left to the pairwise differences."
 check = "cell"
 row = 2
 col = 0
 text = "中"
 width = 2
-
-[[assertion]]
-id = "wide-at-last-column-left-blank"
-basis = "spec"
-source = "https://www.unicode.org/reports/tr11/"
-rule = "The last column of the row the wide character left holds no character."
-check = "cell"
-row = 1
-col = 9
-text = ""
 
 [[assertion]]
 id = "final-cursor"

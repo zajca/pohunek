@@ -18,12 +18,31 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use pohunek_libghostty_spike::config::ModelConfig;
 use pohunek_libghostty_spike::trace::{Record, Trace};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+/// `EIO`, the error a PTY master reports once the child side is closed
+/// (the same value on Linux and macOS).
+const RAW_EIO: i32 = 5;
+
+/// Usage text printed by `--help`.
+const USAGE: &str = "usage: record-trace --out FILE --rows N --cols N --home DIR \
+[--resize ROWSxCOLS]... [--on PATTERN=INPUT]... [--env KEY=VALUE]... [--cwd DIR] [--config FILE] -- COMMAND [ARG]...
+
+  --out FILE        trace file to write
+  --rows/--cols N   initial PTY size
+  --home DIR        isolated HOME; XDG directories are created under it
+  --resize RxC      size applied at the next resize marker the child prints (repeatable, in order)
+  --on PAT=INPUT    write INPUT to the PTY when PAT appears in the output since the previous step
+                    (repeatable, in order; INPUT understands \\r \\n \\t \\e \\\\)
+  --env KEY=VALUE   extra environment variable of the child (repeatable)
+  --cwd DIR         working directory of the child (default: --home)
+  --config FILE     config file (default: config/model.toml)";
 
 struct Args {
     out: PathBuf,
@@ -70,6 +89,9 @@ fn parse_args() -> Result<Args, String> {
     let mut steps = Vec::new();
     let mut command = Vec::new();
     while let Some(flag) = argv.next() {
+        if flag == "--help" {
+            return Err(USAGE.to_owned());
+        }
         if flag == "--" {
             command = argv.by_ref().collect();
             break;
@@ -188,8 +210,11 @@ fn run(args: &Args, config: &ModelConfig) -> Result<(), String> {
     let mut killer = child.clone_killer();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let limit = Duration::from_secs(config.record_timeout_seconds);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let watchdog_flag = Arc::clone(&timed_out);
     let watchdog = std::thread::spawn(move || {
         if done_rx.recv_timeout(limit) == Err(mpsc::RecvTimeoutError::Timeout) {
+            watchdog_flag.store(true, Ordering::SeqCst);
             let _ = killer.kill();
         }
     });
@@ -202,10 +227,14 @@ fn run(args: &Args, config: &ModelConfig) -> Result<(), String> {
     let mut since_step: Vec<u8> = Vec::new();
     let mut tail: Vec<u8> = Vec::new();
     let mut buffer = vec![0_u8; config.read_chunk_bytes];
-    loop {
+    let mut abort_handle = child.clone_killer();
+    let outcome: Result<(), String> = (|| loop {
+        // A PTY whose child has exited reports end of input or EIO.
         let read = match reader.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return Ok(()),
             Ok(read) => read,
+            Err(error) if error.raw_os_error() == Some(RAW_EIO) => return Ok(()),
+            Err(error) => return Err(format!("reading the PTY: {error}")),
         };
         let chunk = &buffer[..read];
         trace.records.push(Record::Output(chunk.to_vec()));
@@ -244,10 +273,24 @@ fn run(args: &Args, config: &ModelConfig) -> Result<(), String> {
             writer.write_all(b"\n").map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
         }
+    })();
+    if outcome.is_err() {
+        // A failed recording must not leave the child running.
+        let _ = abort_handle.kill();
     }
     let _ = done_tx.send(());
     let status = child.wait().map_err(|e| e.to_string())?;
     let _ = watchdog.join();
+    outcome?;
+    if timed_out.load(Ordering::SeqCst) {
+        return Err(format!(
+            "the child outlived record_timeout_seconds ({}) and was killed",
+            config.record_timeout_seconds
+        ));
+    }
+    if !status.success() {
+        return Err(format!("the child exited with {status:?}"));
+    }
     if pending.next().is_some() {
         return Err("the script ended before every --resize was applied".to_owned());
     }

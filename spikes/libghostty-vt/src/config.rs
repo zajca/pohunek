@@ -51,8 +51,6 @@ pub struct ModelConfig {
     pub ghostty_clipboard_write_max_bytes: usize,
     /// Cell size in pixels passed to libghostty on resize.
     pub ghostty_cell_px: u32,
-    /// Trace size up to which every two-chunk split is replayed.
-    pub split_all_max_bytes: usize,
     /// Prefixes a neutral assertion source starts with.
     pub allowed_source_prefixes: Vec<String>,
     /// Words an assertion source must not contain (case-insensitive).

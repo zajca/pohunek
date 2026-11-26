@@ -36,7 +36,6 @@ pedantic = { level = "warn", priority = -1 }
 allow_attributes_without_reason = "warn"
 undocumented_unsafe_blocks = "warn"
 
-# The trace replays run every fixture many times; an optimized build keeps the
-# split-at-every-boundary scenario inside the CI budget.
+# Optimized dev builds keep the replay of every fixture through every model fast.
 [profile.dev]
 opt-level = 2

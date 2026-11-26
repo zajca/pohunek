@@ -47,6 +47,9 @@ fn run() -> Result<(), String> {
     let mut config = PathBuf::from(format!("{manifest}/config/model.toml"));
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
+        if flag == "--help" {
+            return Err("usage: spike-report [--models vt100[,libghostty]] [--fixtures DIR] [--out DIR] [--config FILE]\n\n  --models    comma list of models (default: vt100; libghostty needs the feature)\n  --fixtures  directory of *.trace and *.expect.toml (default: the spike's fixtures/)\n  --out       directory for report.json and report.md (default: .)\n  --config    config file (default: config/model.toml)".to_owned());
+        }
         let value = argv.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--models" => models = value,

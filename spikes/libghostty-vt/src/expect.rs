@@ -214,6 +214,22 @@ impl Expect {
             path: path.to_path_buf(),
             kind,
         };
+        // `deny_unknown_fields` cannot be combined with the flattened check,
+        // so the keys are validated on the raw document.
+        let raw: toml::Value = toml::from_str(text).map_err(|error| {
+            fail(ExpectErrorKind::Syntax {
+                line: error
+                    .span()
+                    .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1),
+                message: error.message().to_owned(),
+            })
+        })?;
+        if let Some((key, line)) = unknown_key(&raw, text) {
+            return Err(fail(ExpectErrorKind::Syntax {
+                line,
+                message: format!("unknown key `{key}`"),
+            }));
+        }
         let expect: Self = toml::from_str(text).map_err(|error| {
             let line = error
                 .span()
@@ -252,6 +268,53 @@ impl Expect {
         }
         Ok(expect)
     }
+}
+
+/// Every key an assertion table may hold, across all checks.
+const ASSERTION_KEYS: &[&str] = &[
+    "id",
+    "basis",
+    "source",
+    "rule",
+    "after_record",
+    "after_resize",
+    "before_resize",
+    "width_method",
+    "mode_2027",
+    "check",
+    "row",
+    "col",
+    "text",
+    "width",
+    "value",
+    "rows",
+    "cols",
+    "uri",
+    "bytes",
+];
+
+/// The first key of the document that is not part of the sidecar format, and
+/// the line it is on.
+fn unknown_key(raw: &toml::Value, text: &str) -> Option<(String, Option<usize>)> {
+    let line_of = |key: &str| {
+        text.lines()
+            .position(|line| line.trim_start().starts_with(key))
+            .map(|index| index + 1)
+    };
+    let top = raw.as_table()?;
+    if let Some(key) = top.keys().find(|key| key.as_str() != "assertion") {
+        return Some((key.clone(), line_of(key)));
+    }
+    for assertion in top.get("assertion")?.as_array()? {
+        let table = assertion.as_table()?;
+        if let Some(key) = table
+            .keys()
+            .find(|key| !ASSERTION_KEYS.contains(&key.as_str()))
+        {
+            return Some((key.clone(), line_of(key)));
+        }
+    }
+    None
 }
 
 fn source_problem(assertion: &Assertion, config: &ModelConfig) -> Option<&'static str> {
