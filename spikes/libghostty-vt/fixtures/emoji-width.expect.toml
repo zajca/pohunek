@@ -1,0 +1,97 @@
+# Source: sources/emoji-width.sh (8x20).
+#
+# No neutral standard fixes the cell width of emoji ZWJ sequences, VS16
+# sequences or regional-indicator flags. Every assertion here states the width
+# method and the mode 2027 state it assumes; the report keeps them in their own
+# group.
+
+[[assertion]]
+id = "family-per-codepoint"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "Mode 2027 off: each code point has its own width (emoji presentation wide, ZWJ zero), so the family occupies six columns and the next character starts at column 6."
+width_method = "UAX 11 East_Asian_Width with Emoji_Presentation = wide, one code point at a time, ZWJ width 0"
+mode_2027 = false
+check = "cell"
+row = 0
+col = 6
+text = "x"
+width = 1
+
+[[assertion]]
+id = "family-cluster"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr29/"
+rule = "Mode 2027 on: the ZWJ sequence is one grapheme cluster (rule GB11) drawn as one wide emoji, so the next character starts at column 2."
+width_method = "UAX 29 extended grapheme cluster, width of its emoji presentation = 2"
+mode_2027 = true
+check = "cell"
+row = 1
+col = 2
+text = "x"
+width = 1
+
+[[assertion]]
+id = "vs16-heart-cluster"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr29/"
+rule = "Mode 2027 on: U+2764 U+FE0F is one cluster with emoji presentation, two columns wide."
+width_method = "UAX 29 extended grapheme cluster, emoji presentation sequence width = 2"
+mode_2027 = true
+check = "cell"
+row = 2
+col = 2
+text = "x"
+width = 1
+
+[[assertion]]
+id = "vs16-heart-per-codepoint"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "Mode 2027 off: U+2764 is East_Asian_Width N (one column) and U+FE0F has width 0, so the next character starts at column 1."
+width_method = "UAX 11 East_Asian_Width, one code point at a time, variation selectors width 0"
+mode_2027 = false
+check = "cell"
+row = 3
+col = 1
+text = "x"
+width = 1
+
+[[assertion]]
+id = "vs15-heart"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "U+2764 U+FE0E is text presentation, one column wide, so the next character starts at column 1."
+width_method = "UAX 11 East_Asian_Width, text presentation sequence width = 1"
+mode_2027 = false
+check = "cell"
+row = 4
+col = 1
+text = "x"
+width = 1
+
+[[assertion]]
+id = "flag-per-codepoint"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "Mode 2027 off: each regional indicator is Emoji_Presentation and wide, so the flag occupies four columns."
+width_method = "UAX 11 East_Asian_Width with Emoji_Presentation = wide, one code point at a time"
+mode_2027 = false
+check = "cell"
+row = 5
+col = 4
+text = "x"
+width = 1
+
+[[assertion]]
+id = "flag-cluster"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr29/"
+rule = "Mode 2027 on: a pair of regional indicators is one cluster (rule GB12), two columns wide."
+width_method = "UAX 29 extended grapheme cluster, flag width = 2"
+mode_2027 = true
+check = "cell"
+row = 6
+col = 2
+text = "x"
+width = 1

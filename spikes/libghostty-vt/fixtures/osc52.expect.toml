@@ -1,0 +1,31 @@
+# Source: sources/osc52.sh (4x40).
+
+[[assertion]]
+id = "write-observed"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "OSC 52 ; c ; <base64> sets the clipboard; aGVsbG8= decodes to 5 bytes."
+check = "clipboard_write"
+bytes = 5
+
+[[assertion]]
+id = "write-prints-nothing"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The OSC 52 sequence prints nothing: the text after it starts at column 0 of row 0."
+check = "cell"
+row = 0
+col = 0
+text = "a"
+width = 1
+
+[[assertion]]
+id = "read-prints-nothing"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "An OSC 52 read request prints nothing: the text after it starts on the next row."
+check = "cell"
+row = 1
+col = 0
+text = "a"
+width = 1

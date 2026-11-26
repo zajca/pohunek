@@ -35,6 +35,41 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/test-support` | Test-only helpers: trusted-filesystem fixture roots, hermetic per-test environment, test binary resolution, and bounded readiness waits. |
 | `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
 
+### libghostty-vt spike
+
+`spikes/libghostty-vt/` is a measurement spike (issue #2538), not a workspace
+member and not in the crate table. It has its own `[workspace]` and
+`Cargo.lock`, so no `--all-features` gate of the root workspace builds it, and
+nothing in it ships. It answers one question: do the PTY traces Pohunek cares
+about replay the same through the current model (`vt100`, as `TerminalTracker`
+uses it) and through libghostty-vt?
+
+- **Record.** `record-trace` runs a command in a real PTY in an isolated
+  `HOME` and writes a versioned `*.trace` (`src/trace.rs`): one `Output`
+  record per PTY read, plus `Resize` records. Scripted sources and the real
+  Claude Code recording are in `fixtures/sources/` (`record-all.sh`,
+  `record-claude.sh`). Each trace has a `*.expect.toml` of spec-derived
+  assertions, each with its source.
+- **Compare.** `cargo run --manifest-path spikes/libghostty-vt/Cargo.toml --bin spike-report -- --models vt100 --out DIR`
+  replays every fixture and writes `report.json` and `report.md`. The report
+  lists each assertion per model, every cell, row and metadata difference
+  between each model pair (trace, record index, row, column), and a repaint
+  round trip per model: the model's repaint is fed to a fresh instance of the
+  same model and the two screens are diffed. Assertions whose width depends on
+  a method and the mode 2027 state are a separate group, and `pohunek-contract`
+  assertions cite Pohunek's own code instead of a public specification.
+- **Build with libghostty.** The `libghostty` cargo feature links a prebuilt
+  static library and is off by default (no Zig, no C library). Zig 0.17.0
+  (the `ZIG_VERSION` of `ci.yml`) and
+  `python3 -I spikes/libghostty-vt/scripts/build-libghostty-vt <rust-target> <out-dir> --tarball-dir <dir>`
+  (or `--fetch`) build the pinned libghostty-vt 1.0.2 from its two sha256-checked
+  tarballs with an offline `zig build` and a fresh `ZIG_GLOBAL_CACHE_DIR`.
+  `LIBGHOSTTY_VT_DIR=<out-dir> cargo build --features libghostty` links it;
+  `build.rs` never downloads anything and never runs Zig. Kitty graphics are
+  compiled out, and the headless terminal installs no reply callback.
+- **CI.** `.github/workflows/libghostty-spike.yml` runs on dispatch and on pull
+  requests that touch the spike. It is not part of `ci.yml`.
+
 Read **[AGENTS.md](../AGENTS.md)** first, then follow its task-specific
 instruction routes.
 Authoritative design lives in [docs/architecture.md](architecture.md);

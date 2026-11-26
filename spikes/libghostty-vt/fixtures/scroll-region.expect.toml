@@ -1,0 +1,70 @@
+# Source: sources/scroll-region.sh (6x20).
+#
+# Rows r1..r6, region rows 2-4 (1-based), cursor at row 4, then a line feed and
+# "X": rows 2-4 scroll up inside the region, rows 1, 5 and 6 are untouched.
+
+[[assertion]]
+id = "above-region-untouched"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "A line feed at the bottom margin of a DECSTBM region scrolls only the region; row 1 is outside."
+check = "cell"
+row = 0
+col = 1
+text = "1"
+width = 1
+
+[[assertion]]
+id = "region-scrolled-up"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The region's second row (r3) moved up to the region's first row."
+check = "cell"
+row = 1
+col = 1
+text = "3"
+width = 1
+
+[[assertion]]
+id = "region-second-scrolled-up"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The region's third row (r4) moved up to the region's second row."
+check = "cell"
+row = 2
+col = 1
+text = "4"
+width = 1
+
+[[assertion]]
+id = "region-bottom-new-line"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The region's bottom row is blank after the scroll and holds the text printed next."
+check = "cell"
+row = 3
+col = 0
+text = "X"
+width = 1
+
+[[assertion]]
+id = "below-region-untouched"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "Rows below the region are outside it and do not scroll."
+check = "cell"
+row = 4
+col = 1
+text = "5"
+width = 1
+
+[[assertion]]
+id = "last-row-untouched"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The last row is outside the region and does not scroll."
+check = "cell"
+row = 5
+col = 1
+text = "6"
+width = 1

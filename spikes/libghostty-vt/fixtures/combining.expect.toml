@@ -1,0 +1,67 @@
+# Source: sources/combining.sh (4x20).
+
+[[assertion]]
+id = "one-mark-joins-base"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr29/"
+rule = "A combining mark (Grapheme_Extend) stays in the cell of its base character."
+check = "cell"
+row = 0
+col = 0
+text = "é"
+width = 1
+
+[[assertion]]
+id = "one-mark-next-cell"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "A combining mark has width 0, so the next character is in column 1."
+check = "cell"
+row = 0
+col = 1
+text = "x"
+width = 1
+
+[[assertion]]
+id = "stacked-marks-join-base"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr29/"
+rule = "All Grapheme_Extend marks after a base character stay in its cell."
+check = "cell"
+row = 1
+col = 0
+text = "à́̂"
+width = 1
+
+[[assertion]]
+id = "stacked-marks-next-cell"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "Stacked marks have width 0, so the next character is in column 1."
+check = "cell"
+row = 1
+col = 1
+text = "x"
+width = 1
+
+[[assertion]]
+id = "mark-after-wide-joins-base"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr29/"
+rule = "A mark after a wide character stays in the wide cell, which keeps width 2."
+check = "cell"
+row = 2
+col = 0
+text = "中́"
+width = 2
+
+[[assertion]]
+id = "mark-after-wide-next-cell"
+basis = "spec"
+source = "https://www.unicode.org/reports/tr11/"
+rule = "The next character after a wide cell with a mark starts at column 2."
+check = "cell"
+row = 2
+col = 2
+text = "x"
+width = 1

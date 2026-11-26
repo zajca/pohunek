@@ -1,0 +1,30 @@
+# Source: sources/kitty-keyboard.sh (4x40, one same-size resize marks the
+# moment between the push and the pop).
+
+[[assertion]]
+id = "push-sets-flags"
+basis = "spec"
+source = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+rule = "CSI > 1 u pushes the flag set 1 (disambiguate escape codes) onto the stack and makes it active."
+after_resize = 1
+check = "kitty_keyboard_flags"
+value = 1
+
+[[assertion]]
+id = "pop-restores-flags"
+basis = "spec"
+source = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+rule = "CSI < u pops the stack, which leaves the initial empty flag set 0."
+check = "kitty_keyboard_flags"
+value = 0
+
+[[assertion]]
+id = "negotiation-prints-nothing"
+basis = "spec"
+source = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+rule = "The push, query and pop sequences print nothing: the first printed character is 'p' at row 0, column 0."
+check = "cell"
+row = 0
+col = 0
+text = "p"
+width = 1

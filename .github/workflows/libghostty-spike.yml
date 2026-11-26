@@ -1,0 +1,221 @@
+# Measurement spike for libghostty-vt (issue #2538). The spike crate lives in
+# spikes/libghostty-vt/, a standalone Cargo workspace outside the root
+# workspace, so no gate of ci.yml builds it and nothing here ships. This
+# workflow is not referenced by ci.yml, its required-jobs aggregation,
+# scripts/ci-reuse or scripts/ci-budgets.json.
+#
+# Run it with `gh workflow run libghostty-spike.yml`.
+name: libghostty-vt spike
+
+# Linux jobs are pinned to ubuntu-24.04, never ubuntu-latest.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - spikes/libghostty-vt/**
+      - .github/workflows/libghostty-spike.yml
+
+permissions: {}
+
+concurrency:
+  group: libghostty-spike-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A Python script never imports from its own directory or the working
+  # directory, so a file a pull request adds there cannot shadow a module.
+  PYTHONSAFEPATH: "1"
+  # Zig 0.17.0 as pinned for ci.yml and pinned-cache-offline.yml; the first
+  # step of spike-libghostty-linux fails when libghostty-vt.pin.toml differs.
+  ZIG_VERSION: "0.17.0"
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+  CI_RETRY_ATTEMPTS: "3"
+  CI_RETRY_BACKOFF_SECONDS: "10"
+  CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS: "180"
+  SPIKE_DIR: spikes/libghostty-vt
+
+jobs:
+  # No Zig and no C library: the trace format, fixtures, vt100 model and report.
+  spike-linux:
+    name: spike (vt100 only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --check --manifest-path "$SPIKE_DIR/Cargo.toml"
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --manifest-path "$SPIKE_DIR/Cargo.toml" -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --manifest-path "$SPIKE_DIR/Cargo.toml"
+
+      - name: Report
+        run: cargo run --locked --manifest-path "$SPIKE_DIR/Cargo.toml" --bin spike-report -- --models vt100 --out "$RUNNER_TEMP/report"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spike-report-vt100
+          path: ${{ runner.temp }}/report
+          if-no-files-found: error
+
+  # Builds libghostty-vt for glibc, musl and (cross) macOS arm64, links the
+  # harness against the glibc and musl builds, and runs both models.
+  spike-libghostty-linux:
+    name: spike (libghostty, linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Zig pin equals the workflow pin
+        run: |
+          set -eu
+          pin=$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["zig"]["version"])' "$SPIKE_DIR/libghostty-vt.pin.toml")
+          for file in .github/workflows/ci.yml .github/workflows/pinned-cache-offline.yml; do
+            grep -q "ZIG_VERSION: \"$pin\"" "$file" || { echo "::error::$file does not pin Zig $pin"; exit 1; }
+          done
+          test "$pin" = "$ZIG_VERSION"
+
+      - name: Install zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+
+      - name: Install musl toolchain
+        timeout-minutes: 10
+        run: |
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label apt-musl \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            sudo sh -c 'apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y musl-tools'
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build libghostty-vt (glibc, musl, macOS arm64)
+        timeout-minutes: 30
+        run: |
+          set -eu
+          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin; do
+            python3 -I "$SPIKE_DIR/scripts/build-libghostty-vt" "$target" "$RUNNER_TEMP/ghostty-$target" --fetch
+            cat "$RUNNER_TEMP/ghostty-$target/BUILD_INFO"
+          done
+
+      - name: Clippy and test with the feature (glibc)
+        env:
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty-x86_64-unknown-linux-gnu
+        run: |
+          set -eu
+          cargo clippy --locked --all-targets --features libghostty --manifest-path "$SPIKE_DIR/Cargo.toml" -- -D warnings
+          cargo test --locked --features libghostty --manifest-path "$SPIKE_DIR/Cargo.toml"
+
+      - name: Report with both models (glibc)
+        env:
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty-x86_64-unknown-linux-gnu
+        run: cargo run --locked --release --features libghostty --manifest-path "$SPIKE_DIR/Cargo.toml" --bin spike-report -- --models vt100,libghostty --out "$RUNNER_TEMP/report"
+
+      - name: Link the musl harness and check the binary
+        env:
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty-x86_64-unknown-linux-musl
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          set -eu
+          cargo build --locked --release --target x86_64-unknown-linux-musl --features libghostty \
+            --manifest-path "$SPIKE_DIR/Cargo.toml" --bin spike-report
+          binary="$SPIKE_DIR/target/x86_64-unknown-linux-musl/release/spike-report"
+          test -x "$binary"
+          # A fully static executable, with no C++ runtime symbol.
+          file "$binary" | tee "$RUNNER_TEMP/file.txt"
+          grep -Eq "statically linked|static-pie linked" "$RUNNER_TEMP/file.txt"
+          if nm -u "$binary" | grep -E '_ZSt|__cxa_|__gxx_'; then
+            echo "::error::the musl harness references the C++ runtime"; exit 1
+          fi
+          "$binary" --models vt100,libghostty --out "$RUNNER_TEMP/report-musl"
+          cmp "$RUNNER_TEMP/report/report.json" "$RUNNER_TEMP/report-musl/report.json"
+          ls -l "$binary" "$RUNNER_TEMP"/ghostty-*/lib/libghostty-vt.a | tee "$RUNNER_TEMP/sizes.txt"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spike-report-libghostty
+          path: |
+            ${{ runner.temp }}/report
+            ${{ runner.temp }}/sizes.txt
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-aarch64-apple-darwin
+          path: ${{ runner.temp }}/ghostty-aarch64-apple-darwin
+          if-no-files-found: error
+
+  # Links the cross-built macOS arm64 library on the release runner with the
+  # deployment target of the release, and checks the minimum OS of the binary.
+  # Runs on dispatch, or on a pull request that touches a build input.
+  spike-libghostty-macos:
+    name: spike (libghostty, macos arm64)
+    needs: spike-libghostty-linux
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: libghostty-vt-aarch64-apple-darwin
+          path: ${{ runner.temp }}/ghostty
+
+      - name: Record the layout of the mirrored types with the host compiler
+        run: python3 -I "$SPIKE_DIR/scripts/build-libghostty-vt" aarch64-apple-darwin "$RUNNER_TEMP/ghostty" --probe-native
+
+      - name: Link the harness and check the minimum OS
+        env:
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty
+        run: |
+          set -eu
+          cargo build --locked --release --features libghostty \
+            --manifest-path "$SPIKE_DIR/Cargo.toml" --bin spike-report 2>&1 | tee "$RUNNER_TEMP/link.log"
+          if grep -i "warning" "$RUNNER_TEMP/link.log"; then
+            echo "::error::the macOS link reported a warning"; exit 1
+          fi
+          binary="$SPIKE_DIR/target/release/spike-report"
+          otool -l "$binary" | tee "$RUNNER_TEMP/otool.txt" | grep -A4 LC_BUILD_VERSION
+          grep -q "minos 14.0" "$RUNNER_TEMP/otool.txt"
+          xcodebuild -version
+          "$binary" --models vt100,libghostty --out "$RUNNER_TEMP/report-macos"

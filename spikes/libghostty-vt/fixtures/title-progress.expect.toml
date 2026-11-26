@@ -1,0 +1,28 @@
+# Source: sources/title-progress.sh (4x40).
+
+[[assertion]]
+id = "latest-title-wins"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "OSC 0 and OSC 2 both set the window title; the later one is current."
+check = "title"
+value = "title two"
+
+[[assertion]]
+id = "progress-payload"
+basis = "spec"
+source = "https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences"
+rule = "OSC 9 ; 4 ; 1 ; 50 reports progress state 1 at 50 percent; its payload after OSC 9 is 4;1;50."
+check = "progress"
+value = "4;1;50"
+
+[[assertion]]
+id = "osc-prints-nothing"
+basis = "spec"
+source = "https://invisible-island.net/xterm/ctlseqs/ctlseqs.html"
+rule = "The OSC sequences print nothing: the visible text starts at row 0, column 0."
+check = "cell"
+row = 0
+col = 0
+text = "v"
+width = 1
