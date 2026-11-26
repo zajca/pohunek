@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use pohunek_service_config::{NotificationSettings, DEFAULT_NOTIFICATION_SETTINGS};
+use pohunek_service_config::{
+    NotificationSettings, DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_SUBSCRIPTION_SETTINGS,
+};
 use protocol::{
     event, ErrorClass, Event, NotificationCreateParams, NotificationCreateResult,
     NotificationCreatedEvent, NotificationDeletedEvent, NotificationId, NotificationKind,
@@ -139,12 +141,6 @@ pub const MAX_METADATA_VALUE_CHARS: usize = 512;
 /// Project ids are compact daemon-generated identifiers, so larger values are
 /// user input that should be bounded before reaching the store.
 const MAX_PROJECT_ID_CHARS: usize = 128;
-
-/// Capacity for notification subscription events.
-///
-/// Matches the session event channel scale so short subscriber stalls do not
-/// drop ordinary notification bursts, while keeping per-daemon memory bounded.
-const NOTIFICATION_EVENT_CAPACITY: usize = 128;
 
 /// Prefix of the shared session attention dedupe key (`attention:<session_id>`).
 ///
@@ -428,8 +424,27 @@ impl NotificationService {
         data_dir: &Path,
         settings: NotificationSettings,
     ) -> Result<Self, NotificationError> {
+        Self::open_with_event_capacity(
+            data_dir,
+            settings,
+            DEFAULT_SUBSCRIPTION_SETTINGS.notification_channel_size(),
+        )
+    }
+
+    /// Open the service with explicit settings and the capacity of the
+    /// broadcast channel its subscribers read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`NotificationError`] when the store cannot be opened or
+    /// replayed.
+    pub fn open_with_event_capacity(
+        data_dir: &Path,
+        settings: NotificationSettings,
+        event_capacity: usize,
+    ) -> Result<Self, NotificationError> {
         let store = NotificationStore::open(data_dir)?;
-        let (events, _) = broadcast::channel(NOTIFICATION_EVENT_CAPACITY);
+        let (events, _) = broadcast::channel(event_capacity);
         Ok(Self {
             inner: Arc::new(NotificationServiceInner {
                 store,

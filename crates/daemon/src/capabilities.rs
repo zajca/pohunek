@@ -431,6 +431,9 @@ fn capability_snapshot(
         session_retention_selector_supported: true,
         session_remove_tree_supported: true,
         session_adopt_supported: true,
+        // The heartbeat bounds come from service config; the `host.inspect`
+        // handler fills them in.
+        subscribe_heartbeat: None,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_setup_supported: true,

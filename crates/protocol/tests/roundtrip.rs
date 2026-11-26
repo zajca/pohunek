@@ -3945,6 +3945,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_retention_selector_supported: true,
         session_remove_tree_supported: false,
         session_adopt_supported: false,
+        subscribe_heartbeat: None,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,

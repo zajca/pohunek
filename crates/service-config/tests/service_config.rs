@@ -247,6 +247,7 @@ fn spec() -> ConfigSpec {
         inventory_probe: DEFAULT_INVENTORY_PROBE,
         worker_journal_max_age: DEFAULT_WORKER_JOURNAL_MAX_AGE,
         notifications: DEFAULT_NOTIFICATION_SETTINGS,
+        subscriptions: pohunek_service_config::DEFAULT_SUBSCRIPTION_SETTINGS,
         open_files: 8192,
     }
 }

@@ -611,6 +611,10 @@ pub struct SessionRegistryConfig {
     /// (`[notifications]` of `service.toml`). Defaults to
     /// [`pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS`].
     pub notification_settings: pohunek_service_config::NotificationSettings,
+    /// Event channel capacities and heartbeat bounds of `subscribe` streams
+    /// (`[subscriptions]` of `service.toml`). Defaults to
+    /// [`pohunek_service_config::DEFAULT_SUBSCRIPTION_SETTINGS`].
+    pub subscriptions: pohunek_service_config::SubscriptionSettings,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the default retention policy, which is what registries
     /// that never read a policy file use.
@@ -821,6 +825,7 @@ impl Default for SessionRegistryConfig {
             doctor_probe_budget: hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
             worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
             notification_settings: pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS,
+            subscriptions: pohunek_service_config::DEFAULT_SUBSCRIPTION_SETTINGS,
             retention_policy_path: None,
             log_dir: None,
             config_dir: None,
@@ -2966,8 +2971,8 @@ impl SessionRegistry {
         let external_observer = config
             .observe_external_agents
             .then(|| ExternalSessions::observer_config(config.procwatch_poll));
-        let (events, _) = broadcast::channel(128);
-        let (produced_events, _) = broadcast::channel(128);
+        let (events, _) = broadcast::channel(config.subscriptions.session_channel_size());
+        let (produced_events, _) = broadcast::channel(config.subscriptions.session_channel_size());
         // One unified store instance, shared (`Arc`) with the worktree manager so
         // resume and worktree records live in one file behind one serialization
         // point.
@@ -3195,6 +3200,12 @@ impl SessionRegistry {
     #[must_use]
     pub fn notification_settings(&self) -> pohunek_service_config::NotificationSettings {
         self.inner.config.notification_settings
+    }
+
+    /// Event channel capacities and `heartbeat_ms` bounds of `subscribe` streams.
+    #[must_use]
+    pub fn subscription_settings(&self) -> pohunek_service_config::SubscriptionSettings {
+        self.inner.config.subscriptions
     }
 
     /// Size, count and age bounds the event journal is opened with.

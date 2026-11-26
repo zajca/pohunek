@@ -219,6 +219,26 @@ fn read_origin_environment(name: &str) -> Result<Option<String>, ClientError> {
     }
 }
 
+/// Options of [`Client::subscribe_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubscribeOptions {
+    /// Ask the daemon for a `heartbeat` event whenever the stream has been
+    /// quiet this long. Whole milliseconds; the daemon bounds the interval
+    /// (see `host.inspect` `subscribe_heartbeat`) and refuses one outside them.
+    pub heartbeat: Option<Duration>,
+}
+
+impl SubscribeOptions {
+    /// Options that ask for a heartbeat every `interval` of quiet.
+    #[must_use]
+    pub fn with_heartbeat(interval: Duration) -> Self {
+        Self {
+            heartbeat: Some(interval),
+        }
+    }
+}
+
 /// A live subscription connection that yields raw event JSON lines.
 #[derive(Debug)]
 pub struct Subscription {
@@ -1562,6 +1582,49 @@ impl Client {
                 Ok(client)
             }
         }
+    }
+
+    /// Subscribe with typed options and return a live event stream.
+    ///
+    /// A heartbeat is requested only after `host.inspect` shows the daemon
+    /// serves it, so a daemon that predates heartbeats is never sent
+    /// `heartbeat_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Protocol`] with `subscribe_heartbeat_unsupported`
+    /// when a heartbeat is requested from a daemon that does not serve it, with
+    /// `heartbeat_out_of_range` when the interval is outside the daemon's
+    /// bounds, and the usual transport errors otherwise.
+    pub async fn subscribe_with_options(
+        mut self,
+        options: SubscribeOptions,
+    ) -> Result<Subscription, ClientError> {
+        let params = options.heartbeat.map(|interval| protocol::SubscribeParams {
+            heartbeat_ms: Some(u32::try_from(interval.as_millis()).unwrap_or(u32::MAX)),
+        });
+        if params.is_some() {
+            let capabilities = self
+                .host_inspect_with(protocol::HostInspectParams {
+                    skip_runtime_probes: Some(true),
+                })
+                .await?;
+            if capabilities.subscribe_heartbeat.is_none() {
+                return Err(ClientError::Protocol(
+                    ProtocolError::subscribe_heartbeat_unsupported(self.remote_host()),
+                ));
+            }
+        }
+        let params = match params {
+            Some(params) => serde_json::to_value(params)?,
+            None => Value::Null,
+        };
+        let request = Request::new(
+            next_request_id(protocol::method::SUBSCRIBE),
+            protocol::method::SUBSCRIBE,
+            params,
+        )?;
+        self.subscribe(&request).await
     }
 
     /// Send a subscription request and return a live raw event-line stream.

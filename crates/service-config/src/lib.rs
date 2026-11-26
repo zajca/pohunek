@@ -123,6 +123,11 @@
 //! lifetime of resolved records; see [`DEFAULT_NOTIFICATION_SETTINGS`]. The table
 //! and each key are optional and a value equal to its default is not written.
 //!
+//! `[subscriptions]` sets the event channel capacities of `subscribe` streams
+//! and the bounds of the `heartbeat_ms` a subscriber may request; see
+//! [`DEFAULT_SUBSCRIPTION_SETTINGS`]. The table and each key are optional and a
+//! value equal to its default is not written.
+//!
 //! `[worker_journals]` bounds how long the daemon keeps the journal directory of
 //! a session that no longer exists; see [`DEFAULT_WORKER_JOURNAL_MAX_AGE`]. The
 //! table and its `max_age_days` key are optional, a file that lacks them means
@@ -398,6 +403,34 @@ pub const MAX_NOTIFICATION_SWEEP_INTERVAL_SECS: u64 = SECONDS_PER_DAY;
 
 /// Smallest accepted `notifications.record_ttl_secs`.
 pub const MIN_NOTIFICATION_RECORD_TTL_SECS: u64 = 60;
+
+/// `subscribe` stream settings used when `[subscriptions]` names none.
+///
+/// A capacity of 128 events per channel absorbs the burst a busy host emits
+/// while a client reads one screen of output; a slower reader gets
+/// `subscription_lagged` instead of unbounded memory growth. A heartbeat
+/// interval of one second to one minute lets a client detect a dead connection
+/// within seconds without a chatty stream.
+pub const DEFAULT_SUBSCRIPTION_SETTINGS: SubscriptionSettings = SubscriptionSettings {
+    session_event_capacity: 128,
+    notification_event_capacity: 128,
+    heartbeat_min_ms: 1_000,
+    heartbeat_max_ms: 60_000,
+};
+
+/// Smallest accepted event channel capacity under `[subscriptions]`.
+pub const MIN_EVENT_CHANNEL_CAPACITY: u64 = 2;
+
+/// Largest accepted event channel capacity under `[subscriptions]`; events are
+/// shared, so a bound of 64 Ki keeps a stalled subscriber's backlog small.
+pub const MAX_EVENT_CHANNEL_CAPACITY: u64 = 65_536;
+
+/// Smallest accepted `subscriptions.heartbeat_min_ms` and `heartbeat_max_ms`.
+pub const MIN_HEARTBEAT_BOUND_MS: u64 = 10;
+
+/// Largest accepted `subscriptions.heartbeat_min_ms` and `heartbeat_max_ms`
+/// (one hour).
+pub const MAX_HEARTBEAT_BOUND_MS: u64 = 3_600_000;
 
 /// Smallest accepted `worker_journals.max_age_days`.
 pub const MIN_WORKER_JOURNAL_AGE_DAYS: u64 = 1;
@@ -1018,6 +1051,48 @@ pub struct NotificationSettings {
     pub record_sweep_interval_secs: u64,
 }
 
+/// `subscribe` stream settings recorded in `[subscriptions]`.
+///
+/// [`ServiceConfig::new`] keeps both capacities within
+/// [`MIN_EVENT_CHANNEL_CAPACITY`]`..=`[`MAX_EVENT_CHANNEL_CAPACITY`] and both
+/// heartbeat bounds within [`MIN_HEARTBEAT_BOUND_MS`]`..=`[`MAX_HEARTBEAT_BOUND_MS`]
+/// with `heartbeat_min_ms <= heartbeat_max_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionSettings {
+    /// Events the session broadcast channel holds for a slow subscriber.
+    pub session_event_capacity: u64,
+    /// Events the notification broadcast channel holds for a slow subscriber.
+    pub notification_event_capacity: u64,
+    /// Smallest `heartbeat_ms` a `subscribe` request may ask for.
+    pub heartbeat_min_ms: u32,
+    /// Largest `heartbeat_ms` a `subscribe` request may ask for.
+    pub heartbeat_max_ms: u32,
+}
+
+impl SubscriptionSettings {
+    /// The session broadcast channel capacity as a channel size.
+    ///
+    /// # Panics
+    ///
+    /// Never for settings that passed [`ServiceConfig::new`]: the validated
+    /// bound fits `usize`.
+    #[must_use]
+    pub fn session_channel_size(&self) -> usize {
+        usize::try_from(self.session_event_capacity).expect("validated capacity fits usize")
+    }
+
+    /// The notification broadcast channel capacity as a channel size.
+    ///
+    /// # Panics
+    ///
+    /// Never for settings that passed [`ServiceConfig::new`]: the validated
+    /// bound fits `usize`.
+    #[must_use]
+    pub fn notification_channel_size(&self) -> usize {
+        usize::try_from(self.notification_event_capacity).expect("validated capacity fits usize")
+    }
+}
+
 /// A key or table of `service.toml` that this version does not know.
 ///
 /// The value never enters this type, so no warning built from it can leak a
@@ -1210,6 +1285,8 @@ pub struct ConfigSpec {
     pub worker_journal_max_age: Duration,
     /// Debounce, dedupe window and record lifetime of the notification inbox.
     pub notifications: NotificationSettings,
+    /// Event channel capacities and heartbeat bounds of `subscribe` streams.
+    pub subscriptions: SubscriptionSettings,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -1241,6 +1318,7 @@ pub struct ServiceConfig {
     inventory_probe: InventoryProbe,
     worker_journal_max_age: Duration,
     notifications: NotificationSettings,
+    subscriptions: SubscriptionSettings,
     open_files: u64,
     unknown: UnknownKeys,
 }
@@ -1353,6 +1431,7 @@ impl ServiceConfig {
             inventory_probe: spec.inventory_probe,
             worker_journal_max_age: spec.worker_journal_max_age,
             notifications: spec.notifications,
+            subscriptions: spec.subscriptions,
             open_files: spec.open_files,
             unknown: UnknownKeys::default(),
         })
@@ -1606,6 +1685,7 @@ impl ServiceConfig {
             inventory: RawInventory::from(self.inventory_probe),
             worker_journals: RawWorkerJournals::from(self.worker_journal_max_age),
             notifications: RawNotifications::from(self.notifications),
+            subscriptions: RawSubscriptions::from(self.subscriptions),
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -1645,6 +1725,7 @@ impl ServiceConfig {
             inventory_probe: self.inventory_probe,
             worker_journal_max_age: self.worker_journal_max_age,
             notifications: self.notifications,
+            subscriptions: self.subscriptions,
             open_files: self.open_files,
         }
     }
@@ -1841,6 +1922,12 @@ impl ServiceConfig {
         self.notifications
     }
 
+    /// Event channel capacities and heartbeat bounds of `subscribe` streams.
+    #[must_use]
+    pub fn subscriptions(&self) -> SubscriptionSettings {
+        self.subscriptions
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -1916,6 +2003,8 @@ struct RawConfig {
     worker_journals: RawWorkerJournals,
     #[serde(default, skip_serializing_if = "RawNotifications::is_default")]
     notifications: RawNotifications,
+    #[serde(default, skip_serializing_if = "RawSubscriptions::is_default")]
+    subscriptions: RawSubscriptions,
     limits: RawLimits,
 }
 
@@ -2477,6 +2566,72 @@ fn default_record_sweep_interval_secs() -> u64 {
     DEFAULT_NOTIFICATION_SETTINGS.record_sweep_interval_secs
 }
 
+/// On-disk `[subscriptions]` table; the writer omits it while every key equals
+/// its default.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSubscriptions {
+    #[serde(default = "default_session_event_capacity")]
+    session_event_capacity: u64,
+    #[serde(default = "default_notification_event_capacity")]
+    notification_event_capacity: u64,
+    #[serde(default = "default_heartbeat_min_ms")]
+    heartbeat_min_ms: u32,
+    #[serde(default = "default_heartbeat_max_ms")]
+    heartbeat_max_ms: u32,
+}
+
+impl RawSubscriptions {
+    /// Whether every key equals its default, so the whole table is omitted.
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// A value of every key that is not its default, used only to derive the
+    /// set of known keys.
+    fn known_keys_sample() -> Self {
+        Self {
+            session_event_capacity: default_session_event_capacity() + 1,
+            notification_event_capacity: default_notification_event_capacity() + 1,
+            heartbeat_min_ms: default_heartbeat_min_ms() + 1,
+            heartbeat_max_ms: default_heartbeat_max_ms() + 1,
+        }
+    }
+}
+
+impl Default for RawSubscriptions {
+    fn default() -> Self {
+        Self::from(DEFAULT_SUBSCRIPTION_SETTINGS)
+    }
+}
+
+impl From<SubscriptionSettings> for RawSubscriptions {
+    fn from(settings: SubscriptionSettings) -> Self {
+        Self {
+            session_event_capacity: settings.session_event_capacity,
+            notification_event_capacity: settings.notification_event_capacity,
+            heartbeat_min_ms: settings.heartbeat_min_ms,
+            heartbeat_max_ms: settings.heartbeat_max_ms,
+        }
+    }
+}
+
+fn default_session_event_capacity() -> u64 {
+    DEFAULT_SUBSCRIPTION_SETTINGS.session_event_capacity
+}
+
+fn default_notification_event_capacity() -> u64 {
+    DEFAULT_SUBSCRIPTION_SETTINGS.notification_event_capacity
+}
+
+fn default_heartbeat_min_ms() -> u32 {
+    DEFAULT_SUBSCRIPTION_SETTINGS.heartbeat_min_ms
+}
+
+fn default_heartbeat_max_ms() -> u32 {
+    DEFAULT_SUBSCRIPTION_SETTINGS.heartbeat_max_ms
+}
+
 #[expect(
     clippy::trivially_copy_pass_by_ref,
     reason = "serde's skip_serializing_if passes the field by reference"
@@ -2770,6 +2925,7 @@ fn parse_upgrade_source_with(
                 inventory: previous.inventory,
                 worker_journals: previous.worker_journals,
                 notifications: previous.notifications,
+                subscriptions: RawSubscriptions::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 7);
@@ -2798,6 +2954,7 @@ fn parse_upgrade_source_with(
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 notifications: RawNotifications::default(),
+                subscriptions: RawSubscriptions::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 2);
@@ -2826,6 +2983,7 @@ fn parse_upgrade_source_with(
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 notifications: RawNotifications::default(),
+                subscriptions: RawSubscriptions::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 4);
@@ -2850,6 +3008,7 @@ fn parse_upgrade_source_with(
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 notifications: RawNotifications::default(),
+                subscriptions: RawSubscriptions::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 5);
@@ -2874,6 +3033,7 @@ fn parse_upgrade_source_with(
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 notifications: RawNotifications::default(),
+                subscriptions: RawSubscriptions::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 6);
@@ -2902,6 +3062,7 @@ fn parse_upgrade_source_with(
                 inventory: RawInventory::default(),
                 worker_journals: RawWorkerJournals::default(),
                 notifications: RawNotifications::default(),
+                subscriptions: RawSubscriptions::default(),
                 limits: previous.limits,
             };
             debug_assert_eq!(previous.schema_version, 3);
@@ -2987,6 +3148,7 @@ impl RawConfig {
             inventory: RawInventory::known_keys_sample(),
             worker_journals: RawWorkerJournals::known_keys_sample(),
             notifications: RawNotifications::known_keys_sample(),
+            subscriptions: RawSubscriptions::known_keys_sample(),
             limits: RawLimits { open_files: 0 },
         }
     }
@@ -3329,6 +3491,12 @@ fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
             record_ttl_secs: raw.notifications.record_ttl_secs,
             record_sweep_interval_secs: raw.notifications.record_sweep_interval_secs,
         },
+        subscriptions: SubscriptionSettings {
+            session_event_capacity: raw.subscriptions.session_event_capacity,
+            notification_event_capacity: raw.subscriptions.notification_event_capacity,
+            heartbeat_min_ms: raw.subscriptions.heartbeat_min_ms,
+            heartbeat_max_ms: raw.subscriptions.heartbeat_max_ms,
+        },
         open_files: raw.limits.open_files,
     })
 }
@@ -3603,7 +3771,58 @@ fn validate_worker_journal_max_age(max_age: Duration) -> Result<(), ConfigError>
 fn validate_retention(spec: &ConfigSpec) -> Result<(), ConfigError> {
     validate_event_retention(spec.event_retention)?;
     validate_worker_journal_max_age(spec.worker_journal_max_age)?;
-    validate_notification_settings(spec.notifications)
+    validate_notification_settings(spec.notifications)?;
+    validate_subscription_settings(spec.subscriptions)
+}
+
+/// Validates each `[subscriptions]` bound and that the heartbeat range is not
+/// inverted.
+fn validate_subscription_settings(settings: SubscriptionSettings) -> Result<(), ConfigError> {
+    let bounds = [
+        (
+            "subscriptions.session_event_capacity",
+            settings.session_event_capacity,
+            MIN_EVENT_CHANNEL_CAPACITY,
+            MAX_EVENT_CHANNEL_CAPACITY,
+        ),
+        (
+            "subscriptions.notification_event_capacity",
+            settings.notification_event_capacity,
+            MIN_EVENT_CHANNEL_CAPACITY,
+            MAX_EVENT_CHANNEL_CAPACITY,
+        ),
+        (
+            "subscriptions.heartbeat_min_ms",
+            u64::from(settings.heartbeat_min_ms),
+            MIN_HEARTBEAT_BOUND_MS,
+            MAX_HEARTBEAT_BOUND_MS,
+        ),
+        (
+            "subscriptions.heartbeat_max_ms",
+            u64::from(settings.heartbeat_max_ms),
+            MIN_HEARTBEAT_BOUND_MS,
+            MAX_HEARTBEAT_BOUND_MS,
+        ),
+    ];
+    for (key, value, min, max) in bounds {
+        if !(min..=max).contains(&value) {
+            return Err(ConfigError::OutOfRange {
+                key,
+                value,
+                min,
+                max,
+            });
+        }
+    }
+    if settings.heartbeat_min_ms > settings.heartbeat_max_ms {
+        return Err(ConfigError::OutOfRange {
+            key: "subscriptions.heartbeat_min_ms",
+            value: u64::from(settings.heartbeat_min_ms),
+            min: MIN_HEARTBEAT_BOUND_MS,
+            max: u64::from(settings.heartbeat_max_ms),
+        });
+    }
+    Ok(())
 }
 
 /// Validates each `[notifications]` bound.

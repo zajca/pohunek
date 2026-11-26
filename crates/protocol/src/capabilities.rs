@@ -295,6 +295,15 @@ pub struct HostCapabilities {
     /// the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_adopt_supported: bool,
+    /// The `heartbeat_ms` bounds `subscribe` accepts, when the daemon serves
+    /// heartbeats.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `None`; its
+    /// `subscribe` ignores params, so a client sends `heartbeat_ms` only when
+    /// this is present. `None` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub subscribe_heartbeat: Option<crate::SubscribeHeartbeatCapability>,
     /// Whether `package.install` and `package.link` accept `accept_commands`
     /// and install packages that declare commands.
     ///

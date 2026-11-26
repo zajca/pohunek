@@ -45,6 +45,7 @@ mod session;
 mod session_tree;
 mod setup;
 mod store;
+mod subscription;
 pub mod tolerant;
 mod turn_wait;
 mod version;
@@ -85,7 +86,8 @@ pub use error::{
     SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
     SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE, SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
     SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
-    SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE,
+    SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE, HEARTBEAT_OUT_OF_RANGE_CODE,
+    SUBSCRIBE_HEARTBEAT_UNSUPPORTED_CODE,
 };
 #[doc(inline)]
 pub use governance::{
@@ -209,6 +211,11 @@ pub use setup::{SetupInfo, SetupResolveParams, SetupResolveResult};
 #[doc(inline)]
 pub use store::{StoreRejectedLine, STORE_REJECTED_TEXT_MAX_BYTES};
 #[doc(inline)]
+pub use subscription::{
+    HeartbeatEvent, SubscribeHeartbeatCapability, SubscribeParams, SubscriptionChannel,
+    SubscriptionLaggedEvent,
+};
+#[doc(inline)]
 pub use turn_wait::{
     SessionTurnCursor, SessionTurnEvent, SessionTurnEventKind, SessionTurnProgress,
     SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult, TurnWaitParamsError,
@@ -285,6 +292,8 @@ pub mod event {
         SESSION_RUNTIME_CONFLICT, "session_runtime_conflict", crate::SessionEvent, "SessionEvent";
         SESSION_RUNTIME_DISCOVERED, "session_runtime_discovered", crate::RuntimeInventoryEvent, "RuntimeInventoryEvent";
         SESSION_NATIVE_RECOVERED, "session_native_recovered", crate::SessionNativeRecoveredEvent, "SessionNativeRecoveredEvent";
+        SUBSCRIPTION_LAGGED, "subscription_lagged", crate::SubscriptionLaggedEvent, "SubscriptionLaggedEvent";
+        HEARTBEAT, "heartbeat", crate::HeartbeatEvent, "HeartbeatEvent";
     );
 
     #[cfg(test)]

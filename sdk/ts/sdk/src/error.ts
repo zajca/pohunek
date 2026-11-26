@@ -54,6 +54,8 @@ export const ClientErrorCode = {
   SessionListTreeFiltersUnsupported: "session_list_tree_filters_unsupported",
   SessionRetentionSelectorUnsupported: "session_retention_selector_unsupported",
   SessionRemoveTreeUnsupported: "session_remove_tree_unsupported",
+  SubscribeHeartbeatUnsupported: "subscribe_heartbeat_unsupported",
+  HeartbeatOutOfRange: "heartbeat_out_of_range",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;

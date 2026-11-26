@@ -26,6 +26,7 @@ mod notification;
 mod package;
 mod project;
 mod session;
+mod subscribe;
 #[cfg(test)]
 mod stale_attention_tests;
 #[cfg(test)]
@@ -38,7 +39,6 @@ use protocol::{
     compat, method, negotiate, ProtocolError, ProtocolVersion, Request, Response, PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
-use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -263,7 +263,13 @@ pub(crate) enum Dispatch {
     Reply(String),
     /// The client asked to subscribe; send this OK ack line, then the caller
     /// streams session events on this connection until the client disconnects.
-    Subscribe(String, protocol::ProtocolVersion),
+    /// The third field is the quiet-stream heartbeat interval the client
+    /// asked for, if any.
+    Subscribe(
+        String,
+        protocol::ProtocolVersion,
+        Option<std::time::Duration>,
+    ),
     /// The client sent an attach prelude; the caller switches to raw PTY bytes.
     Attach(String),
 }
@@ -336,7 +342,8 @@ pub(crate) async fn dispatch_line(
     );
     if request.method() == method::SUBSCRIBE && resp.is_ok() {
         let version = resp.version();
-        return Dispatch::Subscribe(serialize_response(&resp), version);
+        let heartbeat = subscribe::requested_heartbeat(&request);
+        return Dispatch::Subscribe(serialize_response(&resp), version, heartbeat);
     }
     Dispatch::Reply(serialize_response(&resp))
 }
@@ -510,12 +517,7 @@ async fn handle_negotiated(
 
     match request.method() {
         method::DAEMON_HEALTH => daemon::handle_health(request, &state.health),
-        method::SUBSCRIBE => Response::ok(
-            selected_version,
-            request.id(),
-            json!({ "subscribed": true }),
-        )
-        .expect("deserialized request ids satisfy response validation"),
+        method::SUBSCRIBE => subscribe::handle_subscribe(request, &state.sessions),
         method::SESSION_NEW => match attested_spawn_origin(request, state).await {
             Ok(spawned_by) => {
                 session::handle_session_new(request, &state.sessions, spawned_by).await

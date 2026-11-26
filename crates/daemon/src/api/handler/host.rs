@@ -44,6 +44,7 @@ pub(super) async fn handle_host_inspect(
             capabilities.package_install_index_supported;
         capabilities.package_index_apply_supported = capabilities.package_install_index_supported;
         capabilities.host_hooks = Some(crate::worktree::host_hook_scripts(sessions.config_dir()));
+        capabilities.subscribe_heartbeat = Some(heartbeat_capability(sessions));
         return ok_value(request, &capabilities);
     }
     let sessions = sessions.clone();
@@ -66,6 +67,7 @@ pub(super) async fn handle_host_inspect(
                 capabilities.package_install_index_supported;
             capabilities.host_hooks =
                 Some(crate::worktree::host_hook_scripts(sessions.config_dir()));
+            capabilities.subscribe_heartbeat = Some(heartbeat_capability(&sessions));
             Ok(capabilities)
         },
         "host_inspect_task_panicked",
@@ -73,6 +75,15 @@ pub(super) async fn handle_host_inspect(
         Some("retry the request; if it repeats, inspect daemon logs"),
     )
     .await
+}
+
+/// The `heartbeat_ms` bounds `subscribe` accepts on this daemon.
+fn heartbeat_capability(sessions: &SessionRegistry) -> protocol::SubscribeHeartbeatCapability {
+    let settings = sessions.subscription_settings();
+    protocol::SubscribeHeartbeatCapability {
+        min_ms: settings.heartbeat_min_ms,
+        max_ms: settings.heartbeat_max_ms,
+    }
 }
 
 /// `host.discover`: enumerate overlay peers and classify each daemon.

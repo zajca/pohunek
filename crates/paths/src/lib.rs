@@ -318,6 +318,164 @@ pub enum PathError {
         /// Unsupported target operating system.
         target: String,
     },
+    /// An existing runtime directory or socket is not private to the caller.
+    #[error("{} is not a private daemon endpoint: {reason}", path.display())]
+    UnsafeSocketEndpoint {
+        /// The runtime directory or socket that failed the check.
+        path: PathBuf,
+        /// Why it failed.
+        reason: UnsafeEndpointReason,
+    },
+}
+
+/// Why an existing runtime directory or socket is refused by
+/// [`verify_private_socket_endpoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeEndpointReason {
+    /// The entry is a symbolic link.
+    Symlink,
+    /// The runtime directory is not a directory.
+    NotDirectory,
+    /// The socket entry is not a socket.
+    NotSocket,
+    /// The entry belongs to another user.
+    ForeignOwner {
+        /// Owner of the entry.
+        owner: u32,
+        /// The user that must own it.
+        expected: u32,
+    },
+    /// The entry grants group or other access.
+    GroupOrOtherAccess {
+        /// Permission bits of the entry.
+        mode: u32,
+    },
+    /// The entry could not be inspected.
+    Unreadable(std::io::ErrorKind),
+}
+
+impl fmt::Display for UnsafeEndpointReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Symlink => f.write_str("it is a symbolic link"),
+            Self::NotDirectory => f.write_str("it is not a directory"),
+            Self::NotSocket => f.write_str("it is not a socket"),
+            Self::ForeignOwner { owner, expected } => {
+                write!(f, "it is owned by uid {owner}, expected uid {expected}")
+            }
+            Self::GroupOrOtherAccess { mode } => {
+                write!(f, "its mode {mode:04o} grants group or other access")
+            }
+            Self::Unreadable(kind) => write!(f, "it cannot be inspected ({kind})"),
+        }
+    }
+}
+
+/// Mask of the permission bits that grant group or other access.
+const GROUP_OTHER_ACCESS_MASK: u32 = 0o077;
+
+/// Permission bits reported for an endpoint that grants group or other access.
+const PERMISSION_BITS_MASK: u32 = 0o7777;
+
+/// Checks that an existing runtime directory and daemon socket are private to
+/// `effective_uid`.
+///
+/// Each entry that exists must not be a symbolic link, must be a directory
+/// (respectively a socket), must be owned by `effective_uid` and must grant no
+/// access to group or other. An entry that does not exist passes: no daemon is
+/// listening yet, and connecting reports that.
+///
+/// # Errors
+///
+/// Returns [`PathError::UnsafeSocketEndpoint`] for the first entry that fails.
+pub fn verify_private_socket_endpoint(
+    runtime_dir: &Path,
+    socket: &Path,
+    effective_uid: u32,
+) -> Result<(), PathError> {
+    verify_private_entry(runtime_dir, EntryKind::Directory, effective_uid)?;
+    verify_private_entry(socket, EntryKind::Socket, effective_uid)
+}
+
+#[derive(Clone, Copy)]
+enum EntryKind {
+    Directory,
+    Socket,
+}
+
+fn verify_private_entry(
+    path: &Path,
+    kind: EntryKind,
+    effective_uid: u32,
+) -> Result<(), PathError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let unsafe_entry = |reason| PathError::UnsafeSocketEndpoint {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(unsafe_entry(UnsafeEndpointReason::Unreadable(error.kind()))),
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_entry(UnsafeEndpointReason::Symlink));
+    }
+    match kind {
+        EntryKind::Directory if !file_type.is_dir() => {
+            return Err(unsafe_entry(UnsafeEndpointReason::NotDirectory));
+        }
+        EntryKind::Socket if !file_type.is_socket() => {
+            return Err(unsafe_entry(UnsafeEndpointReason::NotSocket));
+        }
+        _ => {}
+    }
+    if metadata.uid() != effective_uid {
+        return Err(unsafe_entry(UnsafeEndpointReason::ForeignOwner {
+            owner: metadata.uid(),
+            expected: effective_uid,
+        }));
+    }
+    if metadata.mode() & GROUP_OTHER_ACCESS_MASK != 0 {
+        return Err(unsafe_entry(UnsafeEndpointReason::GroupOrOtherAccess {
+            mode: metadata.mode() & PERMISSION_BITS_MASK,
+        }));
+    }
+    Ok(())
+}
+
+/// Resolves the local control socket path and verifies that an existing
+/// runtime directory and socket are private to the caller.
+///
+/// # Errors
+///
+/// Returns the [`PathError`] of [`socket_path`], or
+/// [`PathError::UnsafeSocketEndpoint`] when an existing entry is not private.
+pub fn verified_socket_path() -> Result<PathBuf, PathError> {
+    let platform = Platform::current()?;
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    verified_socket_path_for(platform, effective_uid, &PathEnv::capture())
+}
+
+/// [`verified_socket_path`] from explicit platform, identity and environment
+/// inputs, so every platform and failure can be exercised without changing the
+/// process environment.
+///
+/// # Errors
+///
+/// Same as [`verified_socket_path`].
+pub fn verified_socket_path_for(
+    platform: Platform,
+    effective_uid: u32,
+    env: &PathEnv,
+) -> Result<PathBuf, PathError> {
+    let runtime_dir = resolve_runtime_dir(platform, effective_uid, env)?;
+    let socket = runtime_dir.join(SOCKET_NAME);
+    validate_socket_path(&socket, platform, SocketKind::Daemon)?;
+    verify_private_socket_endpoint(&runtime_dir, &socket, effective_uid)?;
+    Ok(socket)
 }
 
 /// Shared XDG-derived path set.

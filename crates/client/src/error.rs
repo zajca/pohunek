@@ -154,6 +154,33 @@ pub enum ClientError {
         detail: String,
     },
 
+    /// The local socket location cannot be derived: the runtime directory
+    /// variable is missing or malformed, or the platform is unsupported.
+    #[error("cannot locate the local daemon socket: {source}")]
+    LocalSocketUnresolvable {
+        /// The resolver failure.
+        #[source]
+        source: pohunek_paths::PathError,
+    },
+
+    /// The derived socket path violates the socket path contract (not
+    /// absolute, a parent component, a NUL byte, or too long).
+    #[error("the local daemon socket path is invalid: {source}")]
+    LocalSocketPathInvalid {
+        /// The resolver failure.
+        #[source]
+        source: pohunek_paths::PathError,
+    },
+
+    /// An existing runtime directory or socket is a symlink, belongs to
+    /// another user, or grants group or other access.
+    #[error("the local daemon socket is not private: {source}")]
+    LocalSocketUnsafe {
+        /// The resolver failure.
+        #[source]
+        source: pohunek_paths::PathError,
+    },
+
     /// Caller-supplied standalone discovery settings violate required bounds.
     #[error("invalid discovery options: {detail}")]
     InvalidDiscoveryOptions {
@@ -441,6 +468,27 @@ impl ClientError {
                 format!("remote host discovery failed: {detail}"),
                 Some(
                     "retry the remote request; if it persists, check the local overlay state"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::LocalSocketUnresolvable { source } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "local_socket_unresolvable",
+                format!("cannot locate the local daemon socket: {source}"),
+                Some("set XDG_RUNTIME_DIR to an absolute directory you own".to_owned()),
+            ),
+            ClientError::LocalSocketPathInvalid { source } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "local_socket_path_invalid",
+                format!("the local daemon socket path is invalid: {source}"),
+                Some("use a shorter absolute XDG_RUNTIME_DIR without `..` components".to_owned()),
+            ),
+            ClientError::LocalSocketUnsafe { source } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "local_socket_unsafe",
+                format!("the local daemon socket is not private: {source}"),
+                Some(
+                    "remove the entry or fix its owner and mode (0700 directory, 0600 socket); the daemon recreates it"
                         .to_owned(),
                 ),
             ),
