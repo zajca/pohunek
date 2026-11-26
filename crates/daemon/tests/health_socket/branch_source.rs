@@ -786,6 +786,13 @@ async fn a_failure_after_the_worktree_is_bound_still_names_the_backup() {
 
     let backup = Rig::backup_name(&local);
     assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("does not exist; nothing was started")),
+        "{error:?}"
+    );
     assert!(error.msg.contains(&backup), "{}", error.msg);
     assert_eq!(rig.rev("refs/heads/feat"), Some(remote));
     assert_eq!(rig.rev(&format!("refs/heads/{backup}")), Some(local));

@@ -4847,6 +4847,12 @@ async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: 
         .expect("kept claude session info")
     };
     assert_eq!(created.prompt_delivered, Some(false));
+    // The CLI names where to answer the dialog from this activity.
+    assert_eq!(
+        created.session.activity,
+        Some(AgentActivity::Blocked),
+        "the kept session reports the blocked activity: {created:?}"
+    );
     // The kept create is a settled session: replaying its request id
     // returns it instead of `session_request_in_progress`. A second create
     // in the armed registry skips the take-once hold.
@@ -9327,6 +9333,14 @@ async fn a_worktree_removed_before_the_agent_starts_fails_closed() {
     );
     assert_eq!(error.code, "session_cwd_missing");
     assert_eq!(error.class, ErrorClass::Runtime);
+    let hint = error.recover.expect("the refusal carries a hint");
+    assert!(
+        hint.starts_with(&format!(
+            "the working directory {}",
+            worktree_root.display()
+        )) && hint.ends_with("does not exist; nothing was started"),
+        "the hint names the removed worktree below the worktree root: {hint}"
+    );
 
     let list = Request::make("cwd-missing-list", method::SESSION_LIST, Value::Null);
     let sessions: Vec<SessionInfo> =
@@ -9382,6 +9396,84 @@ async fn a_worktree_removed_before_the_agent_starts_fails_closed() {
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+/// Creates a session in `missing` against a daemon with `config` and returns
+/// the refusal; the refused create leaves no session behind.
+async fn refused_for_missing_cwd(
+    tag: &str,
+    config: SessionRegistryConfig,
+    missing: PathBuf,
+) -> protocol::ProtocolError {
+    let socket = temp_socket(tag);
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let error =
+        err_payload(create_session_with_params(&mut control, session_params_in(missing)).await);
+
+    let list = Request::make("cwd-missing-named-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("list sessions");
+    assert!(
+        sessions.is_empty(),
+        "a refused create leaves no session: {sessions:?}"
+    );
+    let _ = shutdown.send(());
+    let _ = handle.await;
+    error
+}
+
+/// A create whose working directory never existed is refused with a hint that
+/// names the absolute directory.
+#[tokio::test]
+async fn a_missing_working_directory_is_named_in_the_refusal() {
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        ..SessionRegistryConfig::default()
+    };
+    let base = temp_dir("cwd-missing-base");
+    let never = base.join("never-created");
+    let error = refused_for_missing_cwd("cwd-missing-named", config, never.clone()).await;
+
+    assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
+    assert_eq!(error.class, ErrorClass::Runtime);
+    assert_eq!(
+        error.recover,
+        Some(format!(
+            "the working directory {} does not exist; nothing was started",
+            never.display()
+        ))
+    );
+}
+
+/// The assistant working directory also names the command that creates it.
+#[tokio::test]
+async fn a_missing_assistant_directory_names_the_command_that_creates_it() {
+    let base = temp_dir("cwd-missing-assistant-base");
+    let assistant = base.join("assistant");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        store_path: Some(base.join("metadata.jsonl")),
+        ..SessionRegistryConfig::default()
+    };
+    let error = refused_for_missing_cwd("cwd-missing-assistant", config, assistant.clone()).await;
+
+    assert_eq!(error.code, "session_cwd_missing", "{}", error.msg);
+    let hint = error.recover.expect("the refusal carries a hint");
+    assert!(
+        hint.starts_with(&format!(
+            "the working directory {} does not exist; nothing was started",
+            assistant.display()
+        )),
+        "{hint}"
+    );
+    assert!(
+        hint.contains("`pohunek assistant` creates it")
+            && hint.contains("`pohunek assistant setup`"),
+        "{hint}"
+    );
 }
 
 /// The daemon opens its event journal with the retention of its configuration:

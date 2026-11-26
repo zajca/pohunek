@@ -40,6 +40,8 @@ struct Daemon {
     ack_supported: bool,
     branch_source_supported: bool,
     prompt_delivered: Option<bool>,
+    /// Activity the created session reports, when the daemon reports one.
+    activity: Option<&'static str>,
 }
 
 fn capabilities(daemon: Daemon) -> Value {
@@ -81,6 +83,9 @@ fn session_new_result(request: &Request, daemon: Daemon) -> Value {
     });
     if let Some(delivered) = daemon.prompt_delivered {
         value["prompt_delivered"] = json!(delivered);
+    }
+    if let Some(activity) = daemon.activity {
+        value["activity"] = json!(activity);
     }
     if request.params()["branch_source"] == "remote" {
         value["worktree_source"] = json!({"ref": "origin/feat", "commit": REMOTE_COMMIT});
@@ -227,6 +232,7 @@ const ACK_DAEMON: Daemon = Daemon {
     ack_supported: true,
     branch_source_supported: true,
     prompt_delivered: Some(true),
+    activity: None,
 };
 
 #[test]
@@ -284,6 +290,37 @@ fn an_acknowledged_start_prints_the_outcome_for_humans() {
     }
 }
 
+/// A kept create whose agent waits on a dialog tells the user where to answer
+/// it; an undelivered prompt on any other activity, and a delivered prompt on
+/// a blocked one, carry no such line.
+#[test]
+fn an_undelivered_prompt_behind_a_dialog_names_where_to_answer_it() {
+    let line = "waiting on a dialog: see `pohunek session screen s-ack-1`, answer it with `pohunek attach s-ack-1`";
+    for (delivered, activity, expected) in [
+        (false, Some("blocked"), true),
+        (false, Some("idle"), false),
+        (false, None, false),
+        (true, Some("blocked"), false),
+    ] {
+        let run = run_local(
+            &["--input-ack-timeout-ms", "100"],
+            Daemon {
+                prompt_delivered: Some(delivered),
+                activity,
+                ..ACK_DAEMON
+            },
+        );
+
+        assert!(run.output.status.success(), "{}", run.stdout());
+        assert_eq!(
+            run.stdout().contains(line),
+            expected,
+            "delivered={delivered} activity={activity:?}: {}",
+            run.stdout()
+        );
+    }
+}
+
 #[test]
 fn a_start_without_the_flag_reports_no_outcome_and_checks_no_capability() {
     let run = run_local(&["--json"], ACK_DAEMON);
@@ -312,6 +349,7 @@ fn a_host_without_the_capability_is_refused_before_a_session_is_created() {
             ack_supported: false,
             branch_source_supported: true,
             prompt_delivered: None,
+            activity: None,
         },
     );
 

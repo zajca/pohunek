@@ -2342,6 +2342,13 @@ fn render_new_human(
             "  prompt delivered: {}",
             if delivered { "yes" } else { "no" }
         );
+        if !delivered && info.activity == Some(AgentActivity::Blocked) {
+            let _ = writeln!(
+                output,
+                "  waiting on a dialog: see `pohunek session screen {id}`, answer it with `pohunek attach {id}`; the prompt is sent once the agent is ready",
+                id = info.id.0
+            );
+        }
     }
     write_warnings(&mut output, &info.warnings);
     output

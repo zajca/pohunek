@@ -5635,9 +5635,14 @@ impl SessionRegistry {
         let outcome = self.wait_for_input_readiness(input_ready, grace).await;
         // Only a strict readiness keeps a blocked create: a non-strict
         // timeout is the compat grace, after which the prompt is written.
-        let blocked = strict
-            && outcome == InitialInputWait::TimedOut
-            && self.current_activity(session_id).await == Some(AgentActivity::Blocked);
+        // The activity is read once: the blocked decision and the not-ready
+        // label below must agree, so a blocked agent never gets the grace hint.
+        let timed_out_activity = if strict && outcome == InitialInputWait::TimedOut {
+            self.current_activity(session_id).await
+        } else {
+            None
+        };
+        let blocked = timed_out_activity == Some(AgentActivity::Blocked);
         // A kept create leaves the initial observation open: the detector
         // keeps publishing `input_ready` for the session, and the deferred
         // watcher ends the observation when the prompt is delivered or
@@ -5656,8 +5661,7 @@ impl SessionRegistry {
         match (strict, outcome) {
             (_, InitialInputWait::Ready) | (false, _) => InitialInputReadiness::Ready,
             (true, InitialInputWait::TimedOut) => {
-                let activity = self.current_activity(session_id).await;
-                let label = activity.map_or_else(
+                let label = timed_out_activity.map_or_else(
                     || "none".to_owned(),
                     |activity| format!("{activity:?}").to_lowercase(),
                 );
@@ -10858,6 +10862,27 @@ pub(super) fn session_external_read_only(id: &SessionId) -> ProtocolError {
     )
 }
 
+/// The refusal of a launch whose working directory does not exist. The hint
+/// names the directory; the assistant working directory also names the
+/// command that creates it.
+fn launch_cwd_missing_error(cwd: &Path, assistant_workdir: Option<&Path>) -> ProtocolError {
+    let mut hint = format!(
+        "the working directory {} does not exist; nothing was started",
+        cwd.display()
+    );
+    if assistant_workdir == Some(cwd) {
+        hint.push_str(
+            "; `pohunek assistant` creates it (run `pohunek assistant setup` first if the assistant is not installed)",
+        );
+    }
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "session_cwd_missing",
+        format!("working directory does not exist: {}", cwd.display()),
+        Some(hint),
+    )
+}
+
 fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
     match err {
         unsupported @ WorkerError::AttachSnapshotUnsupported { .. } => ProtocolError::new(
@@ -10890,7 +10915,7 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
             "session_cwd_missing",
             message,
             Some(
-                "the session's working directory no longer exists; nothing was started".to_owned(),
+                "the working directory does not exist; nothing was started".to_owned(),
             ),
         ),
         unanswered @ WorkerError::StopUnanswered { .. } => ProtocolError::new(
