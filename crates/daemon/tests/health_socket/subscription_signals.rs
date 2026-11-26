@@ -29,6 +29,12 @@ const FLOOD_EVENTS: usize = 6_000;
 /// How many leading digits the flood sequence number has in a name or title.
 const SEQUENCE_DIGITS: usize = 5;
 
+/// Wire name of the heartbeat event.
+const EVENT_HEARTBEAT: &str = "heartbeat";
+
+/// Wire name of the lag notice event.
+const EVENT_SUBSCRIPTION_LAGGED: &str = "subscription_lagged";
+
 /// Keeps the session alive for the whole scenario, so its exit publishes no
 /// event into a flood.
 const SESSION_SCRIPT: &str = "sleep 86400";
@@ -133,7 +139,7 @@ async fn read_rename_without_heartbeat(
         let event = next_event(subscriber).await;
         assert_ne!(
             event.event(),
-            event::HEARTBEAT,
+            EVENT_HEARTBEAT,
             "no heartbeat while events keep arriving within the interval"
         );
         if event.event() == event::SESSION_UPDATED && event.payload()["session"]["name"] == name {
@@ -156,7 +162,7 @@ async fn heartbeat_follows_the_interval_only_for_the_subscriber_that_asked() {
     for _ in 0..3 {
         tokio::time::advance(INTERVAL + TIMER_TICK).await;
         let event = next_event(&mut opted_in).await;
-        assert_eq!(event.event(), event::HEARTBEAT);
+        assert_eq!(event.event(), EVENT_HEARTBEAT);
         assert_eq!(*event.payload(), json!({}), "a heartbeat carries no fields");
     }
 
@@ -188,7 +194,7 @@ async fn each_forwarded_event_restarts_the_quiet_interval() {
     // The quiet stream then gets its heartbeat.
     tokio::time::advance(INTERVAL + TIMER_TICK).await;
     loop {
-        if next_event(&mut opted_in).await.event() == event::HEARTBEAT {
+        if next_event(&mut opted_in).await.event() == EVENT_HEARTBEAT {
             break;
         }
     }
@@ -290,6 +296,15 @@ impl Channel {
     }
 }
 
+/// The channel name and skipped count of a `subscription_lagged` event.
+fn lag_notice(event: &Event) -> Option<(String, u64)> {
+    if event.event() != EVENT_SUBSCRIPTION_LAGGED {
+        return None;
+    }
+    let channel = event.payload()["channel"].as_str()?.to_owned();
+    Some((channel, event.payload()["skipped"].as_u64()?))
+}
+
 /// Floods `channel` while `stalled` reads nothing and `draining` keeps pace,
 /// then resumes `stalled`.
 ///
@@ -310,7 +325,7 @@ async fn assert_lag_is_reported(tag: &str, channel: Channel) {
         loop {
             let event = next_event(&mut draining).await;
             assert!(
-                event.subscription_lagged().is_none(),
+                lag_notice(&event).is_none(),
                 "the draining subscriber never lags"
             );
             if channel.name_of(&event).as_deref() == Some(name.as_str()) {
@@ -324,7 +339,7 @@ async fn assert_lag_is_reported(tag: &str, channel: Channel) {
     let mut last_before_gap = None;
     let lagged = loop {
         let event = next_event(&mut stalled).await;
-        if let Some(lagged) = event.subscription_lagged() {
+        if let Some(lagged) = lag_notice(&event) {
             break lagged;
         }
         if let Some(sequence) = channel.name_of(&event).as_deref().and_then(flood_sequence) {
@@ -333,26 +348,24 @@ async fn assert_lag_is_reported(tag: &str, channel: Channel) {
                 last_before_gap.map_or(0, |last| last + 1),
                 "events before the gap arrive in order"
             );
+            assert!(
+                sequence + 1 < FLOOD_EVENTS,
+                "the stalled subscriber lost events but was never told"
+            );
             last_before_gap = Some(sequence);
         }
     };
-    assert_eq!(
-        serde_json::to_value(lagged.channel).expect("serialize the channel"),
-        Value::from(channel.wire_name())
-    );
-    assert!(lagged.skipped > 0, "the notice counts the lost events");
+    assert_eq!(lagged.0, channel.wire_name());
+    assert!(lagged.1 > 0, "the notice counts the lost events");
 
     let first_after_gap = loop {
         let event = next_event(&mut stalled).await;
-        assert!(
-            event.subscription_lagged().is_none(),
-            "one overflow, one notice"
-        );
+        assert!(lag_notice(&event).is_none(), "one overflow, one notice");
         if let Some(sequence) = channel.name_of(&event).as_deref().and_then(flood_sequence) {
             break sequence;
         }
     };
-    let skipped = usize::try_from(lagged.skipped).expect("skipped fits usize");
+    let skipped = usize::try_from(lagged.1).expect("skipped fits usize");
     let missing = first_after_gap - last_before_gap.map_or(0, |last| last + 1);
     assert!(
         skipped >= missing,
