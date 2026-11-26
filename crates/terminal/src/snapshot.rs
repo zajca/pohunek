@@ -163,8 +163,10 @@ struct OscTracker {
     probes: Vec<ProbeSpan>,
     /// Event completed by the byte just advanced, not yet taken.
     event: Option<TrackerEvent>,
-    /// Parameter bytes of the private-mode CSI being read.
-    csi: Vec<u8>,
+    /// Value of the private-mode CSI parameter being read.
+    csi_param: u32,
+    /// Whether an earlier parameter of that CSI names an alternate screen.
+    csi_selects: bool,
 }
 
 /// Something the tracker applies between two parser runs.
@@ -176,14 +178,9 @@ enum TrackerEvent {
     BufferSwitch,
 }
 
-/// Longest private-mode parameter string examined for a buffer switch.
-const MAX_CSI_PARAM_BYTES: usize = 32;
-
-/// Whether the `;`-separated private-mode parameters name an alternate screen.
-fn selects_alternate_screen(params: &[u8]) -> bool {
-    params
-        .split(|byte| *byte == b';')
-        .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
+/// Whether a private mode number selects an alternate screen buffer.
+fn is_alternate_screen_mode(mode: u32) -> bool {
+    matches!(mode, 47 | 1047 | 1049)
 }
 
 impl OscTracker {
@@ -199,7 +196,8 @@ impl OscTracker {
             osc_start: 0,
             probes: Vec::new(),
             event: None,
-            csi: Vec::new(),
+            csi_param: 0,
+            csi_selects: false,
         }
     }
 
@@ -216,6 +214,37 @@ impl OscTracker {
             }
         }
         (bytes.len(), None)
+    }
+
+    /// Reads one byte of a private-mode CSI the way the VT parser does: a
+    /// decimal parameter that saturates, and C0 controls inside the sequence do
+    /// not end it.
+    fn advance_private_mode(&mut self, byte: u8) {
+        match byte {
+            b'0'..=b'9' => {
+                self.csi_param = self
+                    .csi_param
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(byte - b'0'));
+            }
+            b';' => {
+                self.csi_selects |= is_alternate_screen_mode(self.csi_param);
+                self.csi_param = 0;
+            }
+            b'h' | b'l' => {
+                if self.csi_selects || is_alternate_screen_mode(self.csi_param) {
+                    self.event = Some(TrackerEvent::BufferSwitch);
+                }
+                self.state = OscState::Ground;
+            }
+            0x1b => {
+                self.escape_at = self.consumed;
+                self.state = OscState::Escape;
+            }
+            0x18 | 0x1a => self.state = OscState::Ground,
+            0x00..=0x1f => {}
+            _ => self.state = OscState::Ground,
+        }
     }
 
     fn advance(&mut self, byte: u8) {
@@ -245,7 +274,8 @@ impl OscTracker {
             OscState::Csi => {
                 self.state = match byte {
                     b'?' => {
-                        self.csi.clear();
+                        self.csi_param = 0;
+                        self.csi_selects = false;
                         OscState::CsiPrivate
                     }
                     0x1b => {
@@ -255,22 +285,7 @@ impl OscTracker {
                     _ => OscState::Ground,
                 };
             }
-            OscState::CsiPrivate => match byte {
-                b'0'..=b'9' | b';' if self.csi.len() < MAX_CSI_PARAM_BYTES => {
-                    self.csi.push(byte);
-                }
-                b'h' | b'l' => {
-                    if selects_alternate_screen(&self.csi) {
-                        self.event = Some(TrackerEvent::BufferSwitch);
-                    }
-                    self.state = OscState::Ground;
-                }
-                0x1b => {
-                    self.escape_at = self.consumed;
-                    self.state = OscState::Escape;
-                }
-                _ => self.state = OscState::Ground,
-            },
+            OscState::CsiPrivate => self.advance_private_mode(byte),
             OscState::Command => match byte {
                 b';' => self.state = OscState::Payload,
                 0x07 => self.finish(),

@@ -41,12 +41,13 @@ const TEXT_SCHEMES: [&str; 2] = ["https://", "http://"];
 /// Unicode format characters (general category Cf), which `char::is_control`
 /// does not cover. Bidi overrides and zero-width characters can make a
 /// displayed URL differ from the one a client opens.
-const FORMAT_RANGES: [(u32, u32); 20] = [
+const FORMAT_RANGES: [(u32, u32); 21] = [
     (0x00AD, 0x00AD),
     (0x0600, 0x0605),
     (0x061C, 0x061C),
     (0x06DD, 0x06DD),
     (0x070F, 0x070F),
+    (0x0890, 0x0891),
     (0x08E2, 0x08E2),
     (0x180E, 0x180E),
     (0x200B, 0x200F),
@@ -397,13 +398,9 @@ fn match_line(
             .unwrap_or(rest.len());
         let begin = at;
         at += end.max(scheme_len);
-        // A candidate longer than the cap is skipped whole; it is checked
-        // before trimming, which is quadratic in the length it is given.
-        if end > max_url_bytes {
-            continue;
-        }
         let url = trim_url(&rest[..end]);
-        if url.len() <= scheme_len {
+        // A URL longer than the cap is skipped whole, never truncated.
+        if url.len() <= scheme_len || url.len() > max_url_bytes {
             continue;
         }
         if let Some(glyph) = starts
@@ -433,20 +430,24 @@ fn scheme_at(text: &str, at: usize) -> Option<usize> {
         .map(|scheme| scheme.len())
 }
 
-/// Removes trailing prose punctuation; a `)` stays when the URL opens one.
+/// Removes trailing prose punctuation; a closing bracket stays when the URL
+/// opens as many as it closes.
+///
+/// The bracket counts are taken once and kept up to date as characters are
+/// removed, so the cost is linear in the length of `url`.
 fn trim_url(url: &str) -> &str {
+    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+    let opened = PAIRS.map(|(open, _)| url.matches(open).count());
+    let mut closed = PAIRS.map(|(_, close)| url.matches(close).count());
     let mut url = url;
     while let Some(last) = url.chars().next_back() {
-        let opener = match last {
-            ')' => Some('('),
-            ']' => Some('['),
-            '}' => Some('{'),
-            _ => None,
-        };
-        let keep_bracket =
-            opener.is_some_and(|open| url.matches(open).count() >= url.matches(last).count());
+        let pair = PAIRS.iter().position(|(_, close)| *close == last);
+        let keep_bracket = pair.is_some_and(|index| opened[index] >= closed[index]);
         if !TRAILING_PUNCTUATION.contains(last) || keep_bracket {
             break;
+        }
+        if let Some(index) = pair {
+            closed[index] -= 1;
         }
         url = &url[..url.len() - last.len_utf8()];
     }

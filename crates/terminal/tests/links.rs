@@ -79,6 +79,44 @@ fn a_link_longer_than_the_requested_cap_neither_hides_a_text_link_nor_takes_a_sl
 }
 
 #[test]
+fn every_encoding_of_an_alternate_screen_switch_drops_the_anchors() {
+    let padded = format!("\x1b[?{}1049h", "0".repeat(40));
+    for (name, switch) in [
+        ("plain", "\x1b[?1049h"),
+        ("leading zero", "\x1b[?01049h"),
+        ("long padding", padded.as_str()),
+        ("control inside", "\x1b[?10\x0749h"),
+        ("with another mode", "\x1b[?25;1049h"),
+        ("old mode", "\x1b[?47h"),
+    ] {
+        let mut tracker = TerminalTracker::new(5, 40);
+        tracker.feed(osc8("http://gone.test/p", "click").as_bytes());
+        // Plain text over the anchor's cells would otherwise match it again.
+        tracker.feed(format!("{switch}\x1b[Hclick").as_bytes());
+
+        assert_eq!(tracker.links(MAX_LINK_URL_BYTES), Vec::new(), "{name}");
+    }
+}
+
+#[test]
+fn a_url_of_exactly_the_cap_is_reported_with_prose_punctuation_after_it() {
+    let url = format!("http://a.test/{}", "a".repeat(86));
+    let mut tracker = TerminalTracker::new(5, 200);
+    tracker.feed(format!("{url}.\r\n{url}a\r\n").as_bytes());
+
+    assert_eq!(url.len(), 100);
+    assert_eq!(tracker.links(100), vec![link(&url, LinkSource::Text, 0, 0)]);
+}
+
+#[test]
+fn a_format_character_outside_the_bidi_blocks_rejects_an_osc8_uri() {
+    let mut tracker = TerminalTracker::new(5, 40);
+    tracker.feed(osc8("http://a.test/\u{0890}x", "arabic").as_bytes());
+
+    assert_eq!(tracker.links(MAX_LINK_URL_BYTES), Vec::new());
+}
+
+#[test]
 fn an_anchor_closed_across_the_whole_grid_is_not_reported() {
     let mut tracker = TerminalTracker::new(100, 200);
     tracker.feed(b"\x1b[H\x1b]8;;http://far.test/f\x1b\\x\x1b[100;200Hy\x1b]8;;\x1b\\");

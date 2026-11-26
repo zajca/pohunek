@@ -356,7 +356,15 @@ async fn a_buffer_switch_drops_the_anchors_in_both_directions_and_restores_nothi
     let overlapping = format!("{anchor}\x1b[?1049h\x1b[H{alt_anchor}\x1b[?1049l\r\n{keep}");
     // Still on the alternate screen: only its own anchor is reported.
     let on_alternate = format!("{anchor}\x1b[?1049h\x1b[3;1H{alt_anchor}\r\n");
+    // Entering: the same text printed plainly over the anchor's cells on the
+    // alternate screen is not a link.
+    let entering = format!("{anchor}\x1b[?1049h\x1b[Hclick\r\n");
+    // Leaving: an anchor made on the alternate screen over text the primary
+    // screen holds plainly is not reported once the primary screen returns.
+    let leaving = format!("other\r\n\x1b[?1049h\x1b[H{alt_anchor}\x1b[?1049l{keep}");
     for (name, bytes, expected) in [
+        ("entering", entering, vec![]),
+        ("leaving", leaving, vec!["http://keep.test/k"]),
         ("round trip", round_trip, vec!["http://keep.test/k"]),
         ("overlapping", overlapping, vec!["http://keep.test/k"]),
         ("on alternate", on_alternate, vec!["http://alt.test/a"]),
