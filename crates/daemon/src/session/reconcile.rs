@@ -22993,7 +22993,7 @@ generation "$1"
             // holds the connection, so the forward would time out before its
             // request is written and leave nothing tracked. Parked after a
             // snapshot, the watcher has no request in flight.
-            let parked_watcher = if answer == Answer::Timeout {
+            let parked_watcher = if matches!(answer, Answer::Timeout | Answer::Lost) {
                 Box::pin(park_worker_watcher(fixture, created)).await
             } else {
                 None
