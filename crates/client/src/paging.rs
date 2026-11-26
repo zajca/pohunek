@@ -13,6 +13,13 @@ pub(crate) trait Paged: Serialize {
     /// The cursor that continues the listing after this record. Cursors compare
     /// as strings in the order the daemon sorts the records.
     fn cursor(&self) -> String;
+
+    /// An identity that survives a change of the sort key between pages, when
+    /// the key is mutable: a record that moves past the cursor between two
+    /// pages is answered twice, and the walk keeps the first answer.
+    fn identity(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Paged for protocol::SessionInfo {
@@ -24,6 +31,10 @@ impl Paged for protocol::SessionInfo {
 impl Paged for protocol::ProjectInfo {
     fn cursor(&self) -> String {
         self.list_cursor()
+    }
+
+    fn identity(&self) -> Option<String> {
+        Some(self.id.clone())
     }
 }
 
@@ -101,6 +112,7 @@ where
     let mut cursor: Option<String> = None;
     let mut records: Vec<T> = Vec::new();
     let mut bytes = 0_usize;
+    let mut seen = std::collections::HashSet::new();
     loop {
         let page = match source.fetch(page_size, cursor.clone()).await {
             Ok(page) => page,
@@ -139,7 +151,15 @@ where
             }
         }
         bytes = bytes.saturating_add(serde_json::to_vec(&page).map_or(0, |encoded| encoded.len()));
-        records.extend(page);
+        for record in page {
+            if record
+                .identity()
+                .is_some_and(|identity| !seen.insert(identity))
+            {
+                continue;
+            }
+            records.push(record);
+        }
         if records.len() > protocol::LIST_WALK_MAX_ITEMS || bytes > protocol::LIST_WALK_MAX_BYTES {
             return Err(client_error(
                 spec.walk_limit_code,

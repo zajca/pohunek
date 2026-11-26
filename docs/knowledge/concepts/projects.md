@@ -18,7 +18,9 @@ actions. The current CLI exposes `pohunek project list`, `add`, `show`,
 set that does not fit one control line is refused with `project_list_too_large`;
 `pohunek project list` and the Rust SDK `Client::project_list` page through the set
 themselves, 200 projects at a time and fewer when the daemon says the page is too
-large.
+large. A listing that takes several pages is not a snapshot: a project renamed or
+registered while it runs can be missing from it, and the client lists a project
+that was renamed past the cursor once.
 
 Projects give sessions stable targeting. A remote host can resolve a project id
 or label on that host without the local CLI sending a local filesystem path.

@@ -25,10 +25,13 @@ const CLIENT_PAGE_SIZE: usize = 200;
 /// The sets the fixture daemon answers, one per `project.list` request.
 type Script = Arc<Mutex<VecDeque<Vec<String>>>>;
 
-fn project(id: &str) -> Value {
+/// A project record; `entry` is an id, or `id@label` for a project whose label
+/// differs from its id.
+fn project(entry: &str) -> Value {
+    let (id, label) = entry.split_once('@').unwrap_or((entry, entry));
     json!({
         "id": id,
-        "label": id,
+        "label": label,
         "repo_root": format!("/repos/{id}"),
         "git_common_dir": format!("/repos/{id}/.git"),
         "source": "manual",
@@ -120,4 +123,26 @@ async fn a_set_that_changes_between_requests_is_listed_once_from_its_current_sta
         .collect();
 
     assert_eq!(listed, second);
+}
+
+#[tokio::test]
+async fn a_project_renamed_past_the_cursor_between_pages_is_listed_once() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    // The second page answers a project the first page already listed, now
+    // under a label that sorts after the cursor, as a paging daemon does when
+    // a project is renamed between two requests.
+    let first = ids(0, CLIENT_PAGE_SIZE);
+    let renamed = vec!["p-00005@zz".to_owned()];
+    let socket = spawn_daemon(&env, vec![first.clone(), renamed]);
+    let mut client = connect(&socket).await;
+
+    let listed: Vec<String> = client
+        .project_list(ProjectListParams::default())
+        .await
+        .expect("list the projects")
+        .into_iter()
+        .map(|project| project.id)
+        .collect();
+
+    assert_eq!(listed, first);
 }

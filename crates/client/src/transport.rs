@@ -873,7 +873,8 @@ impl Client {
     /// `session.input`, `session.new`, `session.resume`,
     /// `session.stop`, `session.remove`, `session.remove_accepting_unconfirmed`,
     /// `session.wait`, `session.wait_turn`, `session.output`, `session.list`,
-    /// `session.retention.sweep`, and `session.remove_tree` take the same
+    /// `project.list`, `session.retention.sweep`, and `session.remove_tree`
+    /// take the same
     /// dedicated-connection budgets and capability gates as their typed
     /// helpers. The lower-level
     /// [`Self::request`] remains available for callers that need raw JSON
