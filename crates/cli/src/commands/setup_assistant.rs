@@ -140,36 +140,32 @@ pub(crate) async fn plan_with_cause(
             return (AssistantStep::gap(error.to_string()), Some(GapCause::Other));
         }
         if let Ok(listed) = plugin::list(client).await {
-            // A selection that serves and is not older than the listing stays:
-            // it is the assistant the owner runs now. This rule is read before
-            // the listed digest, so a digest the owner does not run never
-            // replaces a selection that serves.
-            let selected = selected_package(&listed.packages, &package_id, &version);
-            if let Some(selected) = &selected {
-                if serves(selected.info) && !selected.older {
+            match decide(&listed.packages, &resolved) {
+                Decision::Keep(kept) => {
                     return (
                         AssistantStep::Present {
                             package_id,
-                            version: selected.info.package.version.to_string(),
-                            digest: selected.info.digest.as_str().to_owned(),
+                            version: kept.package.version.to_string(),
+                            digest: kept.digest.as_str().to_owned(),
                         },
                         None,
                     );
                 }
-            }
-            if let Some(outcome) = installed_digest_outcome(
-                &listed.packages,
-                &resolved,
-                &package_id,
-                &version,
-                &digest,
-            ) {
-                return outcome;
-            }
-            // The listed digest is not installed, so installing it replaces a
-            // selection that does not serve or is older than the listing.
-            if let Some(selected) = selected {
-                replaces = Some(selected.info.package.version.to_string());
+                Decision::Revoked(detail) => {
+                    return (AssistantStep::gap(detail), Some(GapCause::Other));
+                }
+                Decision::Held(hold) => {
+                    return (
+                        AssistantStep::Gap {
+                            detail: format!("{}, which setup leaves as it is", hold.detail),
+                            command: hold.command,
+                        },
+                        Some(GapCause::Other),
+                    );
+                }
+                Decision::Install { replaces: replaced } => {
+                    replaces = replaced.map(|info| info.package.version.to_string());
+                }
             }
         }
     }
@@ -182,6 +178,85 @@ pub(crate) async fn plan_with_cause(
         },
         None,
     )
+}
+
+/// What `pohunek setup` and `pohunek service upgrade` do with the assistant
+/// package once the index listed a version for this core.
+pub(crate) enum Decision<'a> {
+    /// A selection that serves and is not older than the listing stays: it is
+    /// the assistant the owner runs now.
+    Keep(&'a protocol::PackageInfo),
+    /// The listed digest is installed; `replaces` is the selection it takes
+    /// over, which does not serve or is older than the listing. A listed digest
+    /// that is installed with a fault is installed again (the daemon restores
+    /// its root) and replaces nothing.
+    Install {
+        /// The selection the install supersedes.
+        replaces: Option<&'a protocol::PackageInfo>,
+    },
+    /// The listed digest is installed and the owner's disable or selection
+    /// choice stands.
+    Held(OwnerHold),
+    /// The listed digest is revoked; the text says what to wait for.
+    Revoked(String),
+}
+
+/// The one decision about the assistant package for the version the index
+/// `resolved`, read from the daemon's `packages`.
+///
+/// A serving selection that is not older than the listing is read first, so a
+/// digest the owner does not run never replaces a selection that serves. An
+/// installed listed digest is never switched by the caller: the owner's choice
+/// holds, a revoked one is refused and a faulted one is installed again.
+pub(crate) fn decide<'a>(
+    packages: &'a [protocol::PackageInfo],
+    resolved: &plugin_index::Resolved,
+) -> Decision<'a> {
+    let package_id = resolved.id.to_string();
+    let version = resolved.version.to_string();
+    let selected = selected_package(packages, &package_id, &version);
+    if let Some(selected) = &selected {
+        if serves(selected.info) && !selected.older {
+            return Decision::Keep(selected.info);
+        }
+    }
+    let installed = packages
+        .iter()
+        .find(|info| info.package.id == resolved.id && info.digest == resolved.digest);
+    if let Some(info) = installed {
+        if info.revoked {
+            return Decision::Revoked(format!(
+                "version {version} is revoked; wait for a release whose index lists a newer version"
+            ));
+        }
+        if info.fault.is_some() {
+            return Decision::Install { replaces: None };
+        }
+        // `serves` also needs a selected and enabled package, which the
+        // selection rule above has already kept, so what is left is the
+        // owner's choice.
+        let digest = info.digest.as_str();
+        let (state, command) = if info.enabled {
+            (
+                "not selected",
+                format!("pohunek plugin select {package_id} --digest {digest}"),
+            )
+        } else {
+            (
+                "disabled",
+                format!(
+                    "pohunek plugin enable {package_id} --digest {digest} && pohunek plugin select {package_id} --digest {digest}"
+                ),
+            )
+        };
+        return Decision::Held(OwnerHold {
+            detail: format!("version {version} is installed but {state}"),
+            command,
+        });
+    }
+    Decision::Install {
+        replaces: selected.map(|selected| selected.info),
+    }
 }
 
 /// The selected package of one id, compared with the version the index lists.
@@ -256,65 +331,6 @@ pub(crate) fn owner_hold(
             })
         }
     }
-}
-
-/// The plan outcome for a listed digest that is already installed.
-///
-/// `None` when the digest is not installed; the caller then installs it.
-fn installed_digest_outcome(
-    packages: &[protocol::PackageInfo],
-    resolved: &plugin_index::Resolved,
-    package_id: &str,
-    version: &str,
-    digest: &str,
-) -> Option<(AssistantStep, Option<GapCause>)> {
-    let info = packages
-        .iter()
-        .find(|info| info.package.id == resolved.id && info.digest == resolved.digest)?;
-    if serves(info) {
-        return Some((
-            AssistantStep::Present {
-                package_id: package_id.to_owned(),
-                version: version.to_owned(),
-                digest: digest.to_owned(),
-            },
-            None,
-        ));
-    }
-    if info.revoked {
-        return Some((
-            AssistantStep::gap(format!(
-                "version {version} is revoked; wait for a release whose index lists a newer version"
-            )),
-            Some(GapCause::Other),
-        ));
-    }
-    // A package with a fault (a missing root, say) is installed again: the
-    // daemon restores the root of the same digest.
-    if info.fault.is_some() {
-        return Some((
-            AssistantStep::Install {
-                package_id: package_id.to_owned(),
-                version: version.to_owned(),
-                digest: digest.to_owned(),
-                replaces: None,
-            },
-            None,
-        ));
-    }
-    // An owner's disable or version choice is not overridden by a reinstall
-    // of the same digest, which the daemon keeps as it is.
-    Some((
-        AssistantStep::Gap {
-            detail: format!(
-                "version {version} is installed but not enabled and selected, which setup leaves as it is"
-            ),
-            command: format!(
-                "pohunek plugin enable {package_id} --digest {digest} && pohunek plugin select {package_id} --digest {digest}"
-            ),
-        },
-        Some(GapCause::Other),
-    ))
 }
 
 /// Whether `info` is a package that serves fresh launches and bare requests.

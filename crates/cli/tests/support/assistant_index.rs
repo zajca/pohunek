@@ -317,3 +317,46 @@ fn serve(stream: TcpStream, state: &ServerState) {
         .and_then(|()| stream.write_all(&bytes))
         .and_then(|()| stream.flush());
 }
+
+/// Runs `pohunek assistant` with `arguments` against the index at `url` and
+/// returns the exit code, the JSON document on stdout and the text on stderr.
+///
+/// The launch names an explicit agent the daemon does not list, which the
+/// launcher allows without a capable runtime: `--print-prompt` never starts a
+/// session, so the agent needs no binary, and the run still plans the
+/// assistant package through the official index path (`index_url: None`).
+pub(crate) fn run_assistant(
+    env: &pohunek_test_support::env::TestEnv,
+    url: &str,
+    arguments: &[&str],
+) -> (i32, serde_json::Value, String) {
+    let mut full: Vec<&str> = vec![
+        "assistant",
+        "--agent",
+        "fixture-agent",
+        "--print-prompt",
+        "--no-snapshot",
+        "--no-start-daemon",
+    ];
+    full.extend(arguments.iter().copied());
+    full.push("--json");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(&full)
+        .env("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", url)
+        .output()
+        .expect("run pohunek assistant");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "stdout of {full:?} is one JSON document ({error}): {} / {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    (
+        output.status.code().expect("exit code"),
+        document,
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}

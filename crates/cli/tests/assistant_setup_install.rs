@@ -88,45 +88,9 @@ impl Rig {
         self.server.set(INDEX_PATH, self.keys.signed(Vec::new()));
     }
 
-    /// Runs `assistant` with `arguments` and returns the exit code, the JSON
-    /// document on stdout and the human text on stderr.
-    ///
-    /// The launch names an explicit agent the daemon does not list, which the
-    /// launcher allows without a capable runtime: `--print-prompt` never
-    /// starts a session, so the agent needs no binary, and the run still walks
-    /// the same `assistant.materialize` path as a launch.
+    /// Runs `assistant` with `arguments`; see [`assistant_index::run_assistant`].
     fn assistant(&self, arguments: &[&str]) -> (i32, Value, String) {
-        let url = self.url();
-        let mut full: Vec<&str> = vec![
-            "assistant",
-            "--agent",
-            "fixture-agent",
-            "--print-prompt",
-            "--no-snapshot",
-            "--no-start-daemon",
-        ];
-        full.extend(arguments.iter().copied());
-        full.push("--json");
-        let output = self
-            .install
-            .env
-            .command(pohunek_test_support::bin_exe("pohunek"))
-            .args(&full)
-            .env("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", &url)
-            .output()
-            .expect("run pohunek assistant");
-        let document: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-            panic!(
-                "stdout of {full:?} is one JSON document ({error}): {} / {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
-        (
-            output.status.code().expect("exit code"),
-            document,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )
+        assistant_index::run_assistant(&self.install.env, &self.url(), arguments)
     }
 
     /// The assistant package versions the daemon lists.

@@ -19,6 +19,10 @@
 
 // Rust guideline compliant 2026-10-14
 
+#[expect(
+    dead_code,
+    reason = "the module is shared with scenarios that use more of its helpers"
+)]
 #[path = "support/assistant_index.rs"]
 mod assistant_index;
 #[path = "support/native.rs"]

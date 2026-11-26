@@ -1039,6 +1039,53 @@ async fn a_check_of_an_upgrade_is_refused_like_the_upgrade_while_a_refresh_is_re
 }
 
 #[tokio::test]
+async fn a_check_of_an_upgrade_refuses_a_previous_schema_file_under_a_pending_refresh_like_the_upgrade(
+) {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Config).await;
+    let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
+    // Schema 7 is the last one without `namespace.session_tmp_root`, so the
+    // file stays readable as an upgrade source.
+    let older: String = text
+        .replacen("schema_version = 8", "schema_version = 7", 1)
+        .lines()
+        .filter(|line| !line.starts_with("session_tmp_root"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(older, text, "the fixture declares schema 8");
+    std::fs::write(harness.context.config_path(), &older).expect("write schema 7");
+    let (bytes, record) = (config_bytes(harness), record_bytes(harness));
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("the check refuses what the upgrade refuses");
+    let upgraded = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the upgrade refuses a file of another schema");
+
+    assert_eq!(checked.code(), "service_refresh_config_schema", "{checked}");
+    assert_eq!(upgraded.code(), checked.code(), "{upgraded}");
+    assert_eq!(upgraded.hint(), checked.hint());
+    assert!(
+        checked
+            .hint()
+            .is_some_and(|hint| hint.contains("service refresh-path")),
+        "the hint names the installed release's refresh-path: {:?}",
+        checked.hint()
+    );
+    assert_eq!(config_bytes(harness), bytes, "the file is untouched");
+    assert_eq!(record_bytes(harness), record, "the record is kept");
+}
+
+#[tokio::test]
 async fn a_dry_run_over_a_pending_refresh_fails_closed_and_leaves_the_record() {
     let r = refreshable().await;
     let harness = &r.harness;

@@ -1241,6 +1241,14 @@ pub(crate) fn check_local(
                 definition::unknown_keys_warning(config),
             )
         };
+    // Rolling back a pending `refresh-path` reads the installed file with the
+    // strict current-schema reader, so a file of another schema is refused here
+    // exactly as install and upgrade refuse it.
+    if let engine::Plan::RollBack(record) = &plan {
+        if record.operation == record::Operation::RefreshPath {
+            refresh::load_installed_config(context)?;
+        }
+    }
     let fresh_install =
         operation == record::Operation::Install && !matches!(plan, engine::Plan::Resume(_));
     let pending = plan.record().cloned();

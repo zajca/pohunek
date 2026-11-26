@@ -23,11 +23,14 @@ use pohunek_cli::service::report::{AcceptanceGroups, AssistantPackageStatus, Upg
 use pohunek_cli::service::VERSION;
 use pohunek_cli::upgrade_assistant::{self, Options};
 use pohunek_paths::{BasePaths, PathEnv, Platform};
-use pohunek_test_support::catalog::{anchor_for, key_id, test_key};
+use pohunek_test_support::catalog::{
+    anchor_for, catalog_of, host_platform, key_id, signed, test_key, ANY_CORE, WINDOW_END,
+};
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::process_env::ProcessEnv;
 use serde_json::Value;
 
-use super::plugin_catalog_install::{Anchor, Channel, Install};
+use super::plugin_catalog_install::{entry_for, Anchor, Channel, Install};
 
 #[expect(
     dead_code,
@@ -211,6 +214,40 @@ impl Rig {
     /// The selected assistant package, when one is selected.
     async fn selected(&self) -> Option<Listed> {
         self.listed().await.into_iter().find(|entry| entry.selected)
+    }
+
+    /// Runs `pohunek assistant --yes`, whose plan is the one `pohunek setup`
+    /// makes, against the same daemon and index.
+    fn setup(&self) -> (i32, Value, String) {
+        assistant_index::run_assistant(&self.install.env, &self.url(), &["--yes", "help me"])
+    }
+
+    /// Makes the daemon hold `digest` revoked: a signed catalog that lists a
+    /// fixture runtime package and revokes `digest` is installed.
+    async fn revoke(&self, digest: &package::PackageDigest) {
+        let built = self.install.archive("1.0.0");
+        let mut catalog = catalog_of(
+            1,
+            WINDOW_END,
+            vec![entry_for(&built, "1.0.0", &host_platform(), ANY_CORE)],
+        );
+        catalog.revoked_digests = vec![digest.clone()];
+        let path = self
+            .install
+            .write("revoking-catalog.json", &signed(&self.keys.root, catalog));
+        let (code, document) = self.install.install_catalog(&built, &path).await;
+        assert_eq!(code, 0, "{document}");
+    }
+
+    /// Removes the installed root of `digest`, so the daemon lists it faulted.
+    fn damage_root(&self, digest: &package::PackageDigest) {
+        let root = self
+            .install
+            .env
+            .state_home()
+            .join("pohunek/plugins/packages")
+            .join(digest.as_str().trim_start_matches("sha256:"));
+        fs::remove_dir_all(&root).expect("remove the installed package root");
     }
 
     /// The upgrade step for a core that moved from `from` to `to`.
@@ -716,6 +753,158 @@ async fn a_package_the_owner_disabled_is_left_as_set() {
     );
     let text = upgrade_assistant::render_report(&report);
     assert!(text.contains("plugin enable"), "{text}");
+}
+
+/// With no explicit index URL the step asks the official index, which a test
+/// build reads from `POHUNEK_TEST_OFFICIAL_INDEX_URL_V2`: the production
+/// branch resolves the signed loopback index and installs through the daemon.
+#[tokio::test]
+async fn the_step_without_an_index_url_resolves_the_official_index() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    rig.install_by_digest(OLDER_VERSION).await;
+    let archive = rig.publish(VERSION);
+    let mut environment = ProcessEnv::lock();
+    environment.set("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", rig.url());
+    let options = Options {
+        opt_out: false,
+        repair: false,
+        index_url: None,
+    };
+
+    let report = upgrade_assistant::reconcile(
+        upgrade_report(OLDER_VERSION, VERSION),
+        &rig.base(),
+        &options,
+    )
+    .await;
+
+    let document = as_json(&report);
+    let install = install_of(&document);
+    assert_eq!(install["result"], "installed", "{document}");
+    assert_eq!(install["digest"], archive.digest.as_str(), "{document}");
+    assert!(
+        rig.server.requests().iter().any(|path| path == INDEX_PATH),
+        "the official index was read: {:?}",
+        rig.server.requests()
+    );
+    assert_eq!(
+        rig.selected().await.expect("selected").digest,
+        archive.digest.as_str()
+    );
+}
+
+/// A listed digest the daemon holds revoked is refused by the upgrade step
+/// and by the plan `pohunek assistant` makes, with the same text, and nothing
+/// is installed or selected.
+#[tokio::test]
+async fn a_revoked_listed_digest_is_refused_like_setup_refuses_it() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    let old_digest = rig.install_by_digest(OLDER_VERSION).await;
+    let archive = rig.publish(VERSION);
+    let first = document_of_upgrade(&rig).await;
+    assert_eq!(install_of(&first)["result"], "installed", "{first}");
+    let (code, selected) = rig
+        .install
+        .json(&[
+            "plugin",
+            "select",
+            ASSISTANT_PACKAGE,
+            "--digest",
+            &old_digest,
+        ])
+        .await;
+    assert_eq!(code, 0, "{selected}");
+    rig.revoke(&archive.digest).await;
+    let before = rig.listed().await;
+
+    let document = document_of_upgrade(&rig).await;
+    let install = install_of(&document);
+    assert_eq!(install["result"], "failed", "{document}");
+    let detail = install["detail"].as_str().expect("the refusal has a detail");
+    assert!(
+        detail.contains(&format!(
+            "version {VERSION} is revoked; wait for a release whose index lists a newer version"
+        )),
+        "{detail}"
+    );
+    let (code, setup, stderr) = rig.setup();
+    assert_ne!(code, 0, "{setup} / {stderr}");
+    let recover = setup["err"]["recover"].as_str().unwrap_or_default();
+    assert!(
+        recover.contains(detail),
+        "setup words the refusal as the upgrade does: {recover} / {detail}"
+    );
+    assert_eq!(rig.listed().await, before, "nothing changed");
+    assert_eq!(
+        rig.selected().await.expect("selected").digest,
+        old_digest,
+        "the owner's selection stays"
+    );
+}
+
+/// A listed digest that is installed with a damaged root is installed again
+/// by the upgrade step and by the plan `pohunek assistant` makes, which ends
+/// the same way: the daemon restores the root and the owner's selection
+/// stays.
+#[tokio::test]
+async fn a_faulted_listed_digest_is_installed_again_like_setup_installs_it() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let rig = Rig::start().await;
+    let old_digest = rig.install_by_digest(OLDER_VERSION).await;
+    let archive = rig.publish(VERSION);
+    let first = document_of_upgrade(&rig).await;
+    assert_eq!(install_of(&first)["result"], "installed", "{first}");
+    let (code, selected) = rig
+        .install
+        .json(&[
+            "plugin",
+            "select",
+            ASSISTANT_PACKAGE,
+            "--digest",
+            &old_digest,
+        ])
+        .await;
+    assert_eq!(code, 0, "{selected}");
+    rig.damage_root(&archive.digest);
+    let faulted = rig
+        .install
+        .packages()
+        .await
+        .into_iter()
+        .any(|info| info["digest"] == archive.digest.as_str() && !info["fault"].is_null());
+    assert!(faulted, "the daemon lists the damaged digest faulted");
+
+    let document = document_of_upgrade(&rig).await;
+    let install = install_of(&document);
+    assert_eq!(install["result"], "failed", "{document}");
+    let detail = install["detail"].as_str().expect("the outcome has a detail");
+    assert!(
+        detail.contains("installed but is not enabled and selected"),
+        "the digest was installed again and left unselected: {detail}"
+    );
+    // The upgrade step restored the root; damage it again so the plan of
+    // `pohunek assistant` reads the same state.
+    rig.damage_root(&archive.digest);
+    let (code, setup, stderr) = rig.setup();
+    assert_ne!(code, 0, "{setup} / {stderr}");
+    let combined = format!("{setup}{stderr}");
+    assert!(
+        combined.contains(detail),
+        "setup ends the same way: {combined} / {detail}"
+    );
+    assert_eq!(
+        rig.selected().await.expect("selected").digest,
+        old_digest,
+        "the owner's selection stays"
+    );
 }
 
 /// `--no-assistant-package` asks no index and installs nothing; the report
