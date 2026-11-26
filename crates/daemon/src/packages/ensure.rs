@@ -1779,6 +1779,10 @@ fn prepare_release_archive(
 /// search path, and gaps it otherwise. Returns whether the runtime is still
 /// planned: a runtime the host uses keeps its planned package, while one it
 /// does not use is not installed for an agent that is not there.
+///
+/// The offline `pohunekd` step that calls this has no registry and so no
+/// manager search path to follow: it resolves on the process `PATH`, the
+/// environment the operator ran it in.
 fn detect_on_search_path(
     report: &mut Report,
     subject: &str,

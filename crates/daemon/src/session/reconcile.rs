@@ -14743,9 +14743,16 @@ generation "$1"
             let cwd = fixture.root.clone();
             let context = crate::worktree::HookContext {
                 session_id: "s-312".to_owned(),
+                project_id: None,
                 agent: "shell".to_owned(),
+                repo: None,
+                worktree: None,
+                branch: None,
+                base_branch: None,
+                stop_reason: None,
+                activity: None,
+                repo_layer: crate::worktree::RepoHookLayer::Run,
                 search_path: crate::runtime::SearchPath::process(),
-                ..crate::worktree::HookContext::default()
             };
             let runner = tokio::task::spawn_blocking(move || {
                 let mut warnings = Vec::new();
@@ -15170,6 +15177,95 @@ generation "$1"
 
             assert_eq!(malformed.as_deref(), Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED));
             assert_eq!(same_boot.as_deref(), Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED));
+        }
+
+        /// A loss whose cleanup was left unconfirmed in one boot is resumed in a
+        /// later one: the journal then names an earlier boot, so the cleanup
+        /// proof finds no process of the runtime to sweep, however many
+        /// unreadable-marker processes the host holds. The resume mints a new
+        /// generation under the captured native conversation and signals
+        /// nobody.
+        #[tokio::test(start_paused = true)]
+        async fn a_resume_of_an_unconfirmed_loss_from_an_earlier_boot_starts_a_new_generation() {
+            const SESSION: &str = "s-1262";
+            let (fixture, marked) = lost_runtime_with_unreadable_markers(SESSION).await;
+            let id = SessionId(SESSION.to_owned());
+            // The daemon never creates the configured base of the session TMPDIR
+            // root, so the launch needs it to exist.
+            super::create_private_dir(
+                fixture
+                    .root
+                    .join(FIXTURE_TMP_ROOT)
+                    .parent()
+                    .expect("cache directory"),
+            );
+            // The persisted loss is `runtime_lost_cleanup_unconfirmed`; only the
+            // boot the journal records changes, as if that loss had been
+            // recorded before a reboot.
+            write_journal_record(
+                &fixture.root,
+                SESSION,
+                &format!("worker-{SESSION}"),
+                TEST_GENERATION,
+                dead_worker(),
+                Some(&format!("runtime-{SESSION}")),
+                |journal| {
+                    journal.boot_identity = OTHER_BOOT.to_owned();
+                    journal.boot_session_id = Some(OTHER_BOOT.to_owned());
+                },
+            );
+            let before = runtime_of(&fixture.registry, SESSION).await;
+            assert_eq!(
+                before.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+
+            // The start is held so the record persisted before it can be read;
+            // no worker answers it, so the launch then ends in a refusal after
+            // the cleanup proof and the mint.
+            let gate = crate::runtime::lifecycle::tests::StartGate {
+                session_id: Some(SESSION.to_owned()),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            };
+            fixture.supervisor.hold_start(gate.clone());
+            let store = Store::new(fixture.root.join("data/metadata.jsonl"));
+            let held = async {
+                guard("the held start", gate.entered.notified()).await;
+                let native = store
+                    .load_sessions()
+                    .expect("load sessions")
+                    .into_iter()
+                    .find(|record| record.session_id == SESSION)
+                    .and_then(|record| record.recovery)
+                    .and_then(|binding| binding.native_session_id);
+                gate.release.notify_one();
+                native
+            };
+            let (resumed, native) = tokio::join!(fixture.registry.resume(&id), held);
+            let refused = resumed.expect_err("the scripted start has no worker to answer");
+
+            assert_eq!(
+                refused.code,
+                crate::runtime::lifecycle::WORKER_EXITED_BEFORE_READY,
+                "an earlier boot confirms the cleanup, so only the launch fails: {refused:?}"
+            );
+            assert_eq!(
+                native.as_deref(),
+                Some("native-resume"),
+                "the new generation is recorded under the captured native conversation"
+            );
+            let old = service_id(SESSION, TEST_GENERATION);
+            let started = fixture.supervisor.started();
+            assert!(
+                started.iter().any(|started| started != &old
+                    && started.as_str().starts_with(&format!("{SESSION}."))),
+                "a new generation of the session was started: {started:?}"
+            );
+            assert!(
+                marked.alive(),
+                "an unreadable-marker bystander is never signalled"
+            );
         }
 
         /// Consent to unreadable-marker processes never signals them: the record

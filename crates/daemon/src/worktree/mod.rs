@@ -2060,7 +2060,7 @@ impl HookEvent {
 /// NAME, repo/worktree paths, branch names). The daemon handshake vars
 /// (`POHUNEK_SOCKET_PATH`/`_DAEMON_ID`/`_ENV`/`_PROTOCOL_VERSION`) are **never**
 /// here — a hook runs with a cleared environment plus only this allowlist.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct HookContext {
     /// Owning session id (`POHUNEK_SESSION_ID`).
     pub session_id: String,

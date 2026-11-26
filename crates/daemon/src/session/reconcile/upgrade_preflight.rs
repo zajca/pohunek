@@ -2196,6 +2196,8 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         }
     };
     let program = binding_program(binding, &definition);
+    // The preflight is a one-shot read-only process without a registry, so it
+    // resolves agents on the process `PATH` and never reads the service manager.
     let environment = ProbeEnvironment::for_launch(
         base,
         profile_env.as_slice(),
