@@ -22978,26 +22978,8 @@ generation "$1"
             // holds the connection, so the forward would time out before its
             // request is written and leave nothing tracked. Parked after a
             // snapshot, the watcher has no request in flight.
-            let watcher_runs = !fixture
-                .registry
-                .inner
-                .sessions
-                .lock()
-                .await
-                .get(&created.id)
-                .expect("the session")
-                .runtime_watch_cancel
-                .is_cancelled();
-            let parked_watcher = if answer == Answer::Timeout && watcher_runs {
-                let parked = fixture
-                    .registry
-                    .hold_next_input(&created.id, "worker_snapshot");
-                pohunek_test_support::wait::guard(
-                    "the worker watcher to park after a snapshot",
-                    parked.entered.notified(),
-                )
-                .await;
-                Some(parked)
+            let parked_watcher = if answer == Answer::Timeout {
+                Box::pin(park_worker_watcher(fixture, created)).await
             } else {
                 None
             };
@@ -23049,6 +23031,38 @@ generation "$1"
                 parked.release.notify_one();
             }
             (result, stopped)
+        }
+
+        /// Parks the session's worker watcher after a snapshot, or returns `None`
+        /// when a scenario cancelled the watchers. A parked watcher has no
+        /// request in flight on the worker connection; release the returned gate
+        /// to let it go on.
+        async fn park_worker_watcher(
+            fixture: &Fixture,
+            created: &SessionInfo,
+        ) -> Option<crate::runtime::lifecycle::tests::StartGate> {
+            let watcher_runs = !fixture
+                .registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&created.id)
+                .expect("the session")
+                .runtime_watch_cancel
+                .is_cancelled();
+            if !watcher_runs {
+                return None;
+            }
+            let parked = fixture
+                .registry
+                .hold_next_input(&created.id, "worker_snapshot");
+            pohunek_test_support::wait::guard(
+                "the worker watcher to park after a snapshot",
+                parked.entered.notified(),
+            )
+            .await;
+            Some(parked)
         }
 
         fn unbound_report(created: &SessionInfo, seq: u64) -> protocol::SessionReportAgentParams {
