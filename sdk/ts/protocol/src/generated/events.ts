@@ -4,6 +4,7 @@ import type {
   AgentStateEvent,
   AttachEvent,
   BackgroundStateEvent,
+  HeartbeatEvent,
   NotificationCreatedEvent,
   NotificationDeletedEvent,
   NotificationUpdatedEvent,
@@ -12,6 +13,7 @@ import type {
   SessionEvent,
   SessionNativeRecoveredEvent,
   SubagentStateEvent,
+  SubscriptionLaggedEvent,
 } from "./index";
 
 export type ProtocolEvent =
@@ -19,6 +21,7 @@ export type ProtocolEvent =
   | ({ v: ProtocolVersion; event: "attach_closed"; id?: string } & AttachEvent)
   | ({ v: ProtocolVersion; event: "attach_opened"; id?: string } & AttachEvent)
   | ({ v: ProtocolVersion; event: "background_state"; id?: string } & BackgroundStateEvent)
+  | ({ v: ProtocolVersion; event: "heartbeat"; id?: string } & HeartbeatEvent)
   | ({ v: ProtocolVersion; event: "notification_created"; id?: string } & NotificationCreatedEvent)
   | ({ v: ProtocolVersion; event: "notification_deleted"; id?: string } & NotificationDeletedEvent)
   | ({ v: ProtocolVersion; event: "notification_updated"; id?: string } & NotificationUpdatedEvent)
@@ -32,4 +35,5 @@ export type ProtocolEvent =
   | ({ v: ProtocolVersion; event: "session_stopped"; id?: string } & SessionEvent)
   | ({ v: ProtocolVersion; event: "session_updated"; id?: string } & SessionEvent)
   | ({ v: ProtocolVersion; event: "subagent_state"; id?: string } & SubagentStateEvent)
+  | ({ v: ProtocolVersion; event: "subscription_lagged"; id?: string } & SubscriptionLaggedEvent)
 ;

@@ -838,6 +838,14 @@ Protocol contracts and transport:
 - `crates/client/src/discovery.rs`
 
 - `crates/client/src/lib.rs`
+- `crates/client/src/local_socket.rs` — `local_socket_path()` and its typed
+  `LocalSocketUnresolvable`, `LocalSocketPathInvalid` and `LocalSocketUnsafe`
+  errors, resolved and verified through `crates/paths/src/lib.rs`.
+- `crates/protocol/src/subscription.rs` — `SubscribeParams`, the
+  `subscription_lagged` and `heartbeat` event payloads and the
+  `subscribe_heartbeat` capability.
+- `crates/daemon/src/api/handler/subscribe.rs` — `subscribe` params and the
+  `heartbeat_ms` bounds check.
 - `crates/client/src/overlay_config.rs`
 - `crates/client/src/notifications.rs`
 - `crates/client/src/transport.rs`
