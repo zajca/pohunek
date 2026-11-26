@@ -183,14 +183,14 @@ this table. The fresh instance has a source-sized grid in every variant.
   off hold one cell per code point, the rows written with it on hold one
   cluster. A cell does not record the width method it was written under, and
   the formatter emits the text of every row plus one final mode state
-  (extra `MODES`), so the rows of the other method come back with the wrong
+  (extra `MODES`), so rows whose cells differ between the methods come back with the wrong
   cells. The rows written under the final mode state (1, 2 and 6) round-trip.
   This is a property of a text repaint, not a defect in the library, and no
   formatter option addresses it. A screen that keeps one width method round
   trips; a program that switches the mode between rows of one screen does not.
 
 The configured repaint is larger, 5.6 KB on an 8x20 screen against 0.1 KB for
-`vt100`, because trimming is off and the extras are all on.
+`vt100`, because the extras are all on (the formatter writes the palette, modes and tab stops).
 
 **Agent trace.** The recorded Claude Code session replays with identical cells in
 `vt100` and libghostty; the only difference is the title. It is one short trace
