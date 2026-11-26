@@ -2537,8 +2537,9 @@ async fn an_installed_listed_digest_does_not_hide_a_serving_selection() {
     );
 
     // A selection that no longer serves does not switch to the listed digest:
-    // the listed digest is already recorded, so enable and select stay the
-    // owner's calls and the run names them.
+    // the listed digest is already recorded, enabled and unselected, so
+    // selecting it stays the owner's call and the run names `plugin select`
+    // only.
     let mut client = host.installation.client().await;
     client
         .call::<method::PackageSetEnabled>(protocol::PackageSetEnabledParams {
@@ -2552,7 +2553,8 @@ async fn an_installed_listed_digest_does_not_hide_a_serving_selection() {
         matches!(
             &disabled.preview.assistant,
             Some(AssistantStep::Gap { command, .. })
-                if command.contains("pohunek plugin enable")
+                if command.contains("pohunek plugin select")
+                    && !command.contains("plugin enable")
                     && command.contains(&format!("--digest {listed}"))
         ),
         "{:?}",

@@ -3199,10 +3199,12 @@ not apply are `null`. `result` is one of:
   is selected (no index request is made), or the listed version is installed
   and not selected or disabled (found after the index is read; a daemon
   install of an installed digest keeps its recorded state, so only
-  `plugin select` changes the selection, and the step changes none); `command` names the
-  `plugin enable` and `plugin select` steps;
+  `plugin select` changes the selection, and the step changes none); `command` names
+  `plugin select`, preceded by `plugin enable` when the digest is disabled;
 - `failed`: the index or the archive could not be fetched, or the index or the
-  digest was refused (`detail` carries the reason); the daemon installs nothing
+  digest was refused, the listed digest is revoked, a faulted listed digest was
+  installed again and is not the selected package, or the daemon could not list
+  its packages (`detail` carries the reason); the daemon installs nothing
   it did not verify, `status` and `version` are read after the attempt and
   `command` is `pohunek setup`;
 - `skipped`: `--no-assistant-package` was given; no index request was made.
