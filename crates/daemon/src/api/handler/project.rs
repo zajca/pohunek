@@ -85,8 +85,48 @@ pub(super) async fn handle_project_list(request: &Request, sessions: &SessionReg
         Ok(pm) => pm,
         Err(resp) => return resp,
     };
-    let filters = params.filters;
-    run_project_blocking(request, move || pm.list(&filters)).await
+    let ProjectListParams {
+        filters,
+        limit,
+        cursor,
+    } = params;
+    if limit == Some(0) {
+        return error_value(
+            request,
+            ProtocolError::bad_request("project.list limit must be at least 1"),
+        );
+    }
+    let after = match cursor.as_deref().map(split_list_cursor).transpose() {
+        Ok(after) => after,
+        Err(err) => return error_value(request, err),
+    };
+    super::util::run_blocking_bounded(
+        request,
+        move || {
+            let mut projects = pm.list(&filters)?;
+            // The list is ordered by label, then id: a page is the run after
+            // the cursor key.
+            if let Some((label, id)) = &after {
+                projects.retain(|project| (&project.label, &project.id) > (label, id));
+            }
+            if let Some(limit) = limit {
+                projects.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            }
+            Ok(projects)
+        },
+        "project_task_panicked",
+        "project operation task panicked",
+        ProtocolError::project_list_too_large(),
+    )
+    .await
+}
+
+/// Split a `project.list` cursor into the label and id it was built from.
+fn split_list_cursor(cursor: &str) -> Result<(String, String), ProtocolError> {
+    cursor
+        .split_once('\0')
+        .map(|(label, id)| (label.to_owned(), id.to_owned()))
+        .ok_or_else(|| ProtocolError::bad_request("project.list cursor is not a project cursor"))
 }
 
 /// `project.candidates`: repositories proposed from pohunek sessions and, when

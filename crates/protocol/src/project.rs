@@ -89,6 +89,28 @@ pub struct ProjectListParams {
     /// Exact-match filters applied with AND semantics (mirrors `session.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<ProjectListFilter>,
+    /// Maximum number of projects to return (at least 1). Projects are ordered
+    /// by label, then id; a page holds the first `limit` matching projects
+    /// after `cursor`. Absent means the whole matching set in one response,
+    /// which the daemon refuses with `project_list_too_large` when it does not
+    /// fit one control line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub limit: Option<u32>,
+    /// The [`ProjectInfo::list_cursor`] of the last project of the previous
+    /// page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub cursor: Option<String>,
+}
+
+impl ProjectInfo {
+    /// The `project.list` cursor that continues a listing after this project:
+    /// its label and id joined by a NUL byte, the key the list is ordered by.
+    #[must_use]
+    pub fn list_cursor(&self) -> String {
+        format!("{}\0{}", self.label, self.id)
+    }
 }
 
 /// A single exact-match `project list --filter key=value` predicate.

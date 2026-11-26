@@ -239,3 +239,8 @@ pub const LIST_WALK_MAX_ITEMS: usize = 100_000;
 /// alone does not: a daemon that answers one record of nearly a control line
 /// per page stays under [`LIST_WALK_MAX_ITEMS`] while holding gigabytes.
 pub const LIST_WALK_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Projects one `project.list` page asks for when a caller lists the whole set.
+///
+/// A caller halves the page when the daemon answers `project_list_too_large`.
+pub const PROJECT_LIST_PAGE_SIZE: u32 = 200;

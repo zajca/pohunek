@@ -153,6 +153,7 @@ fn render_candidates_human(result: &ProjectCandidatesResult) -> String {
 fn list_params(filters: &[ProjectListFilter]) -> ProjectListParams {
     ProjectListParams {
         filters: filters.to_vec(),
+        ..ProjectListParams::default()
     }
 }
 

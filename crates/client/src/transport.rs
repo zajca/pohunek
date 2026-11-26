@@ -915,6 +915,13 @@ impl Client {
             let result = self.session_output(params).await?;
             return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
+        if name == protocol::method::PROJECT_LIST {
+            let params = serde_json::from_value::<protocol::ProjectListParams>(
+                serde_json::to_value(params)?,
+            )?;
+            let result = self.project_list(params).await?;
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
+        }
         if name == protocol::method::SESSION_LIST {
             let params =
                 serde_json::from_value::<SessionListParams>(serde_json::to_value(params)?)?;
@@ -1137,6 +1144,89 @@ impl Client {
             self.call_direct::<protocol::method::SessionOutput>(params)
                 .await
         }
+    }
+
+    /// List projects. An explicit `limit` is one request; without one the
+    /// whole matching set is collected by following `cursor` page by page, so
+    /// it never has to fit one control line.
+    ///
+    /// A page the daemon reports as `project_list_too_large` is asked again at
+    /// half the size, down to one project. A daemon that predates paging
+    /// ignores `limit` and answers the whole set at once, which is returned as
+    /// it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails, the daemon reports an
+    /// error, or a page does not follow its cursor.
+    pub async fn project_list(
+        &mut self,
+        params: protocol::ProjectListParams,
+    ) -> Result<Vec<protocol::ProjectInfo>, ClientError> {
+        if params.limit.is_some() {
+            return self
+                .call_direct::<protocol::method::ProjectList>(params)
+                .await;
+        }
+        let mut page_params = params;
+        let mut page_size = protocol::PROJECT_LIST_PAGE_SIZE;
+        let mut projects: Vec<protocol::ProjectInfo> = Vec::new();
+        loop {
+            page_params.limit = Some(page_size);
+            let page = match self
+                .call_direct::<protocol::method::ProjectList>(page_params.clone())
+                .await
+            {
+                Ok(page) => page,
+                Err(ClientError::Protocol(source) | ClientError::RemoteProtocol { source, .. })
+                    if page_size > 1
+                        && source.code == protocol::ProtocolError::PROJECT_LIST_TOO_LARGE =>
+                {
+                    page_size /= 2;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let page_len = page.len();
+            let page_cap = usize::try_from(page_size).unwrap_or(usize::MAX);
+            if projects.is_empty() && page_len > page_cap {
+                return Ok(page);
+            }
+            let Some(last) = page.last().map(protocol::ProjectInfo::list_cursor) else {
+                break;
+            };
+            if page_params
+                .cursor
+                .as_deref()
+                .is_some_and(|cursor| last.as_str() <= cursor)
+            {
+                // A daemon that ignores `cursor` answered the whole set on the
+                // first request and repeats it; the first page is complete.
+                if projects.len() == page_len {
+                    return Ok(projects);
+                }
+                return Err(ClientError::Protocol(protocol::ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "project_list_cursor_repeated",
+                    "the daemon answered a project.list page that does not follow its cursor",
+                    Some("upgrade the daemon and client together".to_owned()),
+                )));
+            }
+            projects.extend(page);
+            if projects.len() > protocol::PROJECT_LIST_WALK_MAX_PROJECTS {
+                return Err(ClientError::Protocol(protocol::ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "project_list_walk_limit",
+                    "the project.list walk exceeded the number of projects a client collects",
+                    Some("narrow the listing with filters".to_owned()),
+                )));
+            }
+            if page_len < page_cap {
+                break;
+            }
+            page_params.cursor = Some(last);
+        }
+        Ok(projects)
     }
 
     /// List sessions, refusing before sending when a tree filter needs a

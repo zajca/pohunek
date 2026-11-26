@@ -725,6 +725,24 @@ impl ProtocolError {
         )
     }
 
+    /// Stable code of [`Self::project_list_too_large`].
+    pub const PROJECT_LIST_TOO_LARGE: &'static str = "project_list_too_large";
+
+    /// The canonical error for a `project.list` result whose projects do not
+    /// fit one control line.
+    #[must_use]
+    pub fn project_list_too_large() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            Self::PROJECT_LIST_TOO_LARGE,
+            "the matching projects exceed the public response budget",
+            Some(
+                "request fewer projects with `limit` and continue with `cursor` set to the cursor of the last project"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/session_has_no_managed_terminal` error.
     #[must_use]
     pub fn session_has_no_managed_terminal() -> Self {
