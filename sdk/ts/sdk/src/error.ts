@@ -53,7 +53,8 @@ export const ClientErrorCode = {
   SessionAttentionIsolationUnsupported: "session_attention_isolation_unsupported",
   SessionListTreeFiltersUnsupported: "session_list_tree_filters_unsupported",
   SessionRetentionSelectorUnsupported: "session_retention_selector_unsupported",
-  SessionRemoveTreeUnsupported: "session_remove_tree_unsupported",  CommandUnsupported: "command_unsupported",
+  SessionRemoveTreeUnsupported: "session_remove_tree_unsupported",
+  CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
 

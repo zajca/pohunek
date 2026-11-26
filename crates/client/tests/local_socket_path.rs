@@ -143,13 +143,35 @@ fn unsafe_reason(error: &ClientError) -> UnsafeEndpointReason {
 #[test]
 fn every_runtime_directory_failure_of_the_shared_fixture_is_a_typed_error() {
     let fixture: Fixture = serde_json::from_str(CONTRACT).expect("valid runtime path fixture");
+    let runtime = Runtime::new();
     let mut checked = 0;
+    let mut unrelated = 0;
     for case in &fixture.cases {
-        // The socket resolver reads only the runtime directory variable, so the
-        // fixture's data, state and config failures do not concern it.
-        let Some(error) = case.error.as_ref().filter(|e| e.var == "XDG_RUNTIME_DIR") else {
+        let Some(error) = case.error.as_ref() else {
             continue;
         };
+        // The socket resolver reads only the runtime directory variable, so the
+        // fixture's data, state and config failures must not stop it: keep the
+        // case's invalid variables and give it a private runtime root.
+        // macOS derives the socket directory from the host home, which a
+        // private root cannot replace, so those cases are excluded.
+        if error.var != "XDG_RUNTIME_DIR" {
+            if case.platform != "linux" {
+                continue;
+            }
+            let mut env = fixture_env(&case.env);
+            env.xdg_runtime_dir = Some(runtime.root.as_os_str().to_owned());
+            let result = local_socket_path_for(Platform::Linux, runtime.uid, &env);
+            assert_eq!(
+                result.as_ref().ok(),
+                Some(&runtime.socket()),
+                "{} ({}): {result:?}",
+                case.name,
+                error.var
+            );
+            unrelated += 1;
+            continue;
+        }
         let platform = match case.platform.as_str() {
             "linux" => Platform::Linux,
             "macos" => Platform::MacOs,
@@ -165,6 +187,7 @@ fn every_runtime_directory_failure_of_the_shared_fixture_is_a_typed_error() {
         checked += 1;
     }
     assert!(checked >= 2, "the fixture holds runtime directory failures");
+    assert!(unrelated >= 1, "the fixture holds unrelated linux failures");
 }
 
 #[test]

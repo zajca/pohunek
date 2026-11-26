@@ -51,5 +51,7 @@ fn classify(source: PathError) -> ClientError {
         | PathError::InvalidEnv { .. }
         | PathError::InvalidInstallPrefix { .. }
         | PathError::UnsupportedPlatform { .. } => ClientError::LocalSocketUnresolvable { source },
+        // `PathError` grows; an unclassified failure is a configuration problem.
+        _ => ClientError::LocalSocketUnresolvable { source },
     }
 }

@@ -247,6 +247,7 @@ impl fmt::Display for InvalidPathReason {
 
 /// Path-resolution error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum PathError {
     /// A required environment variable is missing.
     #[error("required environment variable {var} is not set (no safe default exists)")]
@@ -331,6 +332,7 @@ pub enum PathError {
 /// Why an existing runtime directory or socket is refused by
 /// [`verify_private_socket_endpoint`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsafeEndpointReason {
     /// The entry is a symbolic link.
     Symlink,
