@@ -25,6 +25,12 @@ optimize = "ReleaseFast"
 cpu = "baseline"
 strip = "true"
 download_timeout_seconds = 300
+# The download host answers HTTP 403 to the default `Python-urllib` agent, so
+# the request names itself. A failed attempt (network error, 5xx, 429) is
+# retried with a doubling wait; any other HTTP status fails at once.
+user_agent = "pohunek-libghostty-spike-build/1 (+https://github.com/zajca/pohunek)"
+download_attempts = 3
+download_backoff_seconds = 10
 # The two tarballs are about 10 MB together.
 max_download_bytes = 67108864
 # Kitty graphics are compiled out: the headless model renders no images and a

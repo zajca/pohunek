@@ -27,19 +27,26 @@ fn key_values(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The pinned library version, read from the first `version = "..."` of the pin file.
+/// The pinned library version, the `version` key of the `[library]` table of the pin file.
 fn pinned_version(manifest_dir: &Path) -> String {
     let path = manifest_dir.join("libghostty-vt.pin.toml");
     println!("cargo:rerun-if-changed={}", path.display());
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| fail(&format!("cannot read {}: {error}", path.display())));
-    text.lines()
-        .find_map(|line| {
-            line.strip_prefix("version = \"")
+    let mut in_library = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_library = line == "[library]";
+        } else if in_library {
+            if let Some(version) = line
+                .strip_prefix("version = \"")
                 .and_then(|rest| rest.strip_suffix('"'))
-        })
-        .unwrap_or_else(|| fail("libghostty-vt.pin.toml has no library version"))
-        .to_owned()
+            {
+                return version.to_owned();
+            }
+        }
+    }
+    fail("libghostty-vt.pin.toml has no [library] version")
 }
 
 fn main() {

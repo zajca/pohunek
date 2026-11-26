@@ -78,9 +78,12 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    outputs:
+      macos: ${{ steps.gate.outputs.run }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Zig pin equals the workflow pin
@@ -91,6 +94,27 @@ jobs:
             grep -q "ZIG_VERSION: \"$pin\"" "$file" || { echo "::error::$file does not pin Zig $pin"; exit 1; }
           done
           test "$pin" = "$ZIG_VERSION"
+          for file in .github/workflows/ci.yml .github/workflows/pinned-cache-offline.yml; do
+            grep -q "ZIG_SHA256: $ZIG_SHA256" "$file" || { echo "::error::$file does not pin the Zig sha256 of this workflow"; exit 1; }
+          done
+
+      # A pull request runs the macOS job only when it touches a build input;
+      # a dispatch always runs it. The job-level `if` of the macOS job reads
+      # this output, so no macOS runner starts when the gate is off.
+      - name: Decide whether the macOS job runs
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          if [ "$EVENT" = workflow_dispatch ] || git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
+            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|src/(ffi|ghostty|ghostty_model).rs)|.github/workflows/libghostty-spike.yml)'; then
+            echo run=true >> "$GITHUB_OUTPUT"
+          else
+            echo run=false >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install zig
         uses: ./.github/actions/setup-zig
@@ -175,6 +199,7 @@ jobs:
   spike-libghostty-macos:
     name: spike (libghostty, macos arm64)
     needs: spike-libghostty-linux
+    if: needs.spike-libghostty-linux.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -185,49 +210,25 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      # A pull request runs the macOS steps only when it touches a build input;
-      # a dispatch always runs them.
-      - name: Decide whether the build inputs changed
-        id: gate
-        shell: bash
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = workflow_dispatch ] || git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
-            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|src/(ffi|ghostty|ghostty_model).rs)|.github/workflows/libghostty-spike.yml)'; then
-            echo run=true >> "$GITHUB_OUTPUT"
-          else
-            echo run=false >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Verify native runner architecture
-        if: steps.gate.outputs.run == 'true'
         run: test "$(uname -m)" = "arm64"
 
       - name: Install Rust toolchain
-        if: steps.gate.outputs.run == 'true'
         uses: ./.github/actions/setup-rust
         with:
           targets: aarch64-apple-darwin
 
-      - if: steps.gate.outputs.run == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: libghostty-vt-aarch64-apple-darwin
           path: ${{ runner.temp }}/ghostty
 
       - name: Record the layout of the mirrored types with the host compiler
-        if: steps.gate.outputs.run == 'true'
         run: python3 -I "$SPIKE_DIR/scripts/build-libghostty-vt" aarch64-apple-darwin "$RUNNER_TEMP/ghostty" --probe-native
 
       - name: Link the harness and check the minimum OS
-        if: steps.gate.outputs.run == 'true'
         env:
           LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty
         shell: bash

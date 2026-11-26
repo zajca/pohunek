@@ -525,11 +525,18 @@ fn repaint_row(
     };
     let mut fresh = (spec.make)(original.rows, original.cols).map_err(model_err)?;
     fresh.feed(&bytes);
-    let after = fresh.dump().map_err(model_err)?;
+    let mut after = fresh.dump().map_err(model_err)?;
+    // A repaint never replays events: an OSC 52 write or a progress report is
+    // not screen state, so both are left out of the comparison.
+    let mut before = original.clone();
+    for dump in [&mut before, &mut after] {
+        dump.clipboard_writes = None;
+        dump.progress = None;
+    }
     Ok(RepaintRow {
         model: spec.name.to_owned(),
         repaint_bytes: Some(bytes.len()),
-        differences: diff_dumps(fixture.trace.records.len(), original, &after),
+        differences: diff_dumps(fixture.trace.records.len(), &before, &after),
     })
 }
 
@@ -549,11 +556,18 @@ impl Report {
         let mut out = String::from("# Spike report: screen models over PTY traces\n\n");
         let _ = writeln!(out, "Models: {}\n", self.models.join(", "));
         out.push_str("## Assertion outcomes\n\n");
-        let mut totals: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        // Width-method assertions are not a plain correctness count, so they
+        // get their own group instead of mixing into the spec and contract rows.
+        let mut totals: BTreeMap<(&str, &str), (usize, usize)> = BTreeMap::new();
         for trace in &self.traces {
             for row in &trace.assertions {
+                let group = if row.width_method.is_some() {
+                    "width-method"
+                } else {
+                    row.basis.as_str()
+                };
                 for (model, outcome) in &row.outcome {
-                    let entry = totals.entry(model).or_default();
+                    let entry = totals.entry((model.as_str(), group)).or_default();
                     entry.1 += 1;
                     if outcome == "pass" {
                         entry.0 += 1;
@@ -561,8 +575,16 @@ impl Report {
                 }
             }
         }
-        out.push_str("| model | passed | total |\n|---|---|---|\n");
-        for (model, (passed, total)) in &totals {
+        out.push_str("| model | group | passed | total |\n|---|---|---|---|\n");
+        let mut overall: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for ((model, group), (passed, total)) in &totals {
+            let _ = writeln!(out, "| {model} | {group} | {passed} | {total} |");
+            let entry = overall.entry(model).or_default();
+            entry.0 += passed;
+            entry.1 += total;
+        }
+        out.push_str("\nAll groups together (includes width-method and assertions a model cannot observe):\n\n| model | passed | total |\n|---|---|---|\n");
+        for (model, (passed, total)) in &overall {
             let _ = writeln!(out, "| {model} | {passed} | {total} |");
         }
         for group in ["spec", "pohunek-contract"] {
