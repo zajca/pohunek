@@ -682,6 +682,18 @@ pub struct SessionListParams {
     /// Exact-match filters applied with AND semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<SessionListFilter>,
+    /// Maximum number of sessions to return. Sessions are ordered by id; a
+    /// page holds the first `limit` sessions after `cursor`. Absent means the
+    /// whole matching set in one response, which the daemon refuses with
+    /// `session_list_too_large` when it does not fit one control line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub limit: Option<u32>,
+    /// The `id` of the last session of the previous page; the page starts
+    /// with the first matching session whose id sorts after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub cursor: Option<String>,
 }
 
 /// A single exact-match session-list filter.

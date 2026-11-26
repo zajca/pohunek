@@ -286,6 +286,7 @@ async fn resolve_targets_via(
         let matches = sdk
             .call::<protocol::method::SessionList>(SessionListParams {
                 filters: vec![SessionListFilter::Id(target.session_id.clone())],
+                ..SessionListParams::default()
             })
             .await?;
         resolved.push(
@@ -301,6 +302,7 @@ async fn resolve_targets_via(
     let sessions = sdk
         .call::<protocol::method::SessionList>(SessionListParams {
             filters: Vec::new(),
+            ..SessionListParams::default()
         })
         .await?;
     targets
@@ -1053,6 +1055,7 @@ pub(crate) async fn ensure_lifecycle_allowed(
     let sessions = sdk
         .call::<protocol::method::SessionList>(SessionListParams {
             filters: vec![SessionListFilter::Id(target.session_id.clone())],
+            ..SessionListParams::default()
         })
         .await?;
     let unknown = sessions.iter().any(|session| {
@@ -2198,6 +2201,7 @@ const NOT_A_WORK_TREE_MESSAGES: [&str; 2] = ["not a git repository", "must be ru
 fn list_params(filters: &[ListFilter]) -> SessionListParams {
     SessionListParams {
         filters: filters.iter().map(ListFilter::to_protocol_filter).collect(),
+        ..SessionListParams::default()
     }
 }
 

@@ -488,6 +488,7 @@ async fn session_lifecycle_over_tcp() {
                 SessionListFilter::State(SessionState::Running),
                 SessionListFilter::Id(created.id.0.clone()),
             ],
+            ..SessionListParams::default()
         })
         .expect("serialize list params"),
     );

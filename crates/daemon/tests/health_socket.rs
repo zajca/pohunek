@@ -2477,7 +2477,11 @@ async fn session_list_filters_metadata_at_the_socket_boundary() {
         let request = Request::make(
             id,
             method::SESSION_LIST,
-            serde_json::to_value(SessionListParams { filters }).expect("serialize filters"),
+            serde_json::to_value(SessionListParams {
+                filters,
+                ..SessionListParams::default()
+            })
+            .expect("serialize filters"),
         );
         let sessions: Vec<SessionInfo> =
             serde_json::from_value(ok_payload(exchange(&mut client, &request).await))
@@ -2834,6 +2838,7 @@ async fn session_lifecycle_over_socket() {
                 SessionListFilter::State(SessionState::Running),
                 SessionListFilter::Id(created.id.0.clone()),
             ],
+            ..SessionListParams::default()
         })
         .expect("serialize list params"),
     );

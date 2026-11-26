@@ -461,6 +461,7 @@ fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError
                 method::SESSION_LIST,
                 json_value(&SessionListParams {
                     filters: vec![values.session_filter.clone()],
+                    ..SessionListParams::default()
                 })?,
             )
             .expect("fixture request id and method are valid"),

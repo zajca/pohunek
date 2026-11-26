@@ -79,7 +79,11 @@ async fn listed(
     let request = Request::make(
         "session-list-tree",
         method::SESSION_LIST,
-        serde_json::to_value(SessionListParams { filters }).expect("serialize params"),
+        serde_json::to_value(SessionListParams {
+            filters,
+            ..SessionListParams::default()
+        })
+        .expect("serialize params"),
     );
     serde_json::from_value(ok_payload(exchange(control, &request).await)).expect("session list")
 }
@@ -259,6 +263,7 @@ async fn children_stays_list_only() {
         method::SESSION_LIST,
         serde_json::to_value(SessionListParams {
             filters: Vec::new(),
+            ..SessionListParams::default()
         })
         .expect("serialize params"),
     );

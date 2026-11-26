@@ -10,4 +10,16 @@ export type SessionListParams = {
    * Exact-match filters applied with AND semantics.
    */
   filters?: Array<SessionListFilter>;
+  /**
+   * Maximum number of sessions to return. Sessions are ordered by id; a
+   * page holds the first `limit` sessions after `cursor`. Absent means the
+   * whole matching set in one response, which the daemon refuses with
+   * `session_list_too_large` when it does not fit one control line.
+   */
+  limit?: number;
+  /**
+   * The `id` of the last session of the previous page; the page starts
+   * with the first matching session whose id sorts after it.
+   */
+  cursor?: string;
 };

@@ -93,6 +93,23 @@ predicates as repeatable
 AND semantics; equality splits at the first `=` and opaque keys or values may
 be empty.
 
+`session.list` answers sessions ordered by id. `SessionListParams` accepts
+`limit` (at least 1) and `cursor`, the `id` of the last session of the previous
+page: a page holds the first `limit` matching sessions whose id sorts after
+`cursor`, and a page shorter than `limit` is the last. Filters and `children`
+apply to the whole set before paging. A result whose sessions do not fit one
+control line answers `runtime/session_list_too_large`, with a recovery hint to
+request fewer sessions with `limit` and continue with `cursor`; both fields are
+additive, so a daemon of this release serves clients that send neither as long
+as the set fits one response. A caller that omits `limit` and must list a
+growing set pages: the SDK `session_list` (and so `pohunek session list`)
+follows `cursor` with pages of 200 sessions and halves the page size when the
+daemon answers `session_list_too_large`. A daemon that predates paging ignores
+`limit` and answers the whole set at once, which the client takes as complete.
+The walk is bounded on the client: `session_list_cursor_repeated` (a page that
+does not follow its cursor) and `session_list_walk_limit` (more than 100000
+sessions collected) are client-raised `daemon`-class errors, never daemon replies.
+
 The window is bounded. When a later bump adds a previous version to it, the
 adapters translate shape only (renames and moved fields, and withholding events
 and enum values the older version never defined). A semantic change (a new
@@ -4707,7 +4724,7 @@ observation behavior: `agent_kind_unsupported`,
 `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
 `session_read_ansi_unavailable`, `session_output_limit_exceeded`,
-`session_wait_limit_exceeded`,
+`session_wait_limit_exceeded`, `session_list_too_large`,
 `session_waiter_limit_reached`, `worker_feature_unavailable`, and
 `plugin_self_target_denied`, `session_right_denied`, `session_adopt_refused`, `agent_runtime_unsupported`,
 `session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,

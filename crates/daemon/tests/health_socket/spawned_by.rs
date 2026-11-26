@@ -68,7 +68,11 @@ async fn listed_ids(
     let request = Request::make(
         "session-list-filtered",
         method::SESSION_LIST,
-        serde_json::to_value(SessionListParams { filters }).expect("serialize params"),
+        serde_json::to_value(SessionListParams {
+            filters,
+            ..SessionListParams::default()
+        })
+        .expect("serialize params"),
     );
     let sessions: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(control, &request).await))
