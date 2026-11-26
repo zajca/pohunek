@@ -167,8 +167,9 @@ other key on another session.
 Profiles are created only through `pohunek plugin profile create`, never by
 writing files, and only for a clear extra-home signal:
 
-- The user names a second Claude or Codex config home. Ask the user for it;
-  never look for one on disk: no shell loop, glob, `ls`, `test` or `find` over
+- The user names a second Claude or Codex config home. Ask the user for it
+  (in automatic mode only with the `profiles` grant, together with the profile
+  confirmation; without it, propose no profile); never look for one on disk: no shell loop, glob, `ls`, `test` or `find` over
   `~/.claude-*` or `~/.codex-*`, and no listing of the user's home directory.
   Those commands are not in the allowlist, so each one stops the session on a
   permission prompt.
