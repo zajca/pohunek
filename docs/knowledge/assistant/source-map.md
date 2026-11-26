@@ -651,6 +651,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/detect/manifest/mod.rs`
 - `crates/daemon/src/detect/manifests/shell.toml`
 - `crates/terminal/src/screen.rs`
+- `crates/terminal/src/links.rs`
 
 Runtime package archive format:
 

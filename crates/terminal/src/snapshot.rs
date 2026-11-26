@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::links::{screen_links, AnchorLog, Hyperlink, ScreenLink};
 use crate::program_status::{ProbeSpan, PROGRAM_STATUS_COMMAND};
 
 // Rust guideline compliant 2026-07-23
@@ -43,6 +44,7 @@ pub struct TerminalSnapshot {
 pub struct TerminalTracker {
     parser: vt100::Parser,
     osc: OscTracker,
+    anchors: AnchorLog,
 }
 
 impl std::fmt::Debug for TerminalTracker {
@@ -50,6 +52,7 @@ impl std::fmt::Debug for TerminalTracker {
         f.debug_struct("TerminalTracker")
             .field("size", &self.parser.screen().size())
             .field("osc", &self.osc)
+            .field("anchors", &self.anchors)
             .finish()
     }
 }
@@ -61,13 +64,35 @@ impl TerminalTracker {
         Self {
             parser: vt100::Parser::new(rows, cols, 0),
             osc: OscTracker::new(),
+            anchors: AnchorLog::default(),
         }
     }
 
     /// Applies the next ordered PTY output bytes.
+    ///
+    /// The VT parser is advanced up to the end of each OSC 8 sequence before
+    /// the sequence is applied, so an anchor records the cursor cell the
+    /// hyperlink takes effect at.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-        self.osc.feed(bytes);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (used, hyperlink) = self.osc.feed_until_hyperlink(rest);
+            self.parser.process(&rest[..used]);
+            rest = &rest[used..];
+            if let Some(hyperlink) = hyperlink {
+                self.anchors.apply(self.parser.screen(), hyperlink);
+            }
+        }
+    }
+
+    /// Returns the links on the visible screen, in reading order.
+    ///
+    /// OSC 8 anchors are reported while the text they covered is still in the
+    /// cells where it was printed; a scroll, clear, overwrite or buffer switch
+    /// drops them, because the VT model keeps no per-cell hyperlink state.
+    #[must_use]
+    pub fn links(&self) -> Vec<ScreenLink> {
+        screen_links(self.parser.screen(), &self.anchors)
     }
 
     /// Takes the OSC 7501 probes completed since the previous call.
@@ -80,6 +105,7 @@ impl TerminalTracker {
     /// Updates the modeled terminal dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
+        self.anchors.clear();
     }
 
     /// Captures a complete state and ANSI repaint at `watermark`.
@@ -128,6 +154,8 @@ struct OscTracker {
     /// Index of the `ESC` that introduced the current OSC.
     osc_start: u64,
     probes: Vec<ProbeSpan>,
+    /// OSC 8 sequence completed by the byte just advanced, not yet taken.
+    hyperlink: Option<Hyperlink>,
 }
 
 impl OscTracker {
@@ -142,14 +170,23 @@ impl OscTracker {
             escape_at: 0,
             osc_start: 0,
             probes: Vec::new(),
+            hyperlink: None,
         }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
+    /// Advances over `bytes` up to and including the byte that completes an
+    /// OSC 8 sequence, or over all of them when none completes.
+    ///
+    /// Returns the number of bytes consumed and the completed sequence.
+    fn feed_until_hyperlink(&mut self, bytes: &[u8]) -> (usize, Option<Hyperlink>) {
+        for (index, &byte) in bytes.iter().enumerate() {
             self.advance(byte);
             self.consumed += 1;
+            if let Some(hyperlink) = self.hyperlink.take() {
+                return (index + 1, Some(hyperlink));
+            }
         }
+        (bytes.len(), None)
     }
 
     fn advance(&mut self, byte: u8) {
@@ -219,6 +256,7 @@ impl OscTracker {
         match command {
             Some("0" | "2") => self.title = Some(payload),
             Some("9") => self.progress = Some(payload),
+            Some("8") => self.hyperlink = Hyperlink::parse(&self.payload),
             Some(number)
                 if number.as_bytes() == PROGRAM_STATUS_COMMAND
                     && self.payload.first() == Some(&b'?') =>

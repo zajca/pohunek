@@ -295,6 +295,14 @@ pub struct HostCapabilities {
     /// the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_adopt_supported: bool,
+    /// Whether `session.screen` reports `links`.
+    ///
+    /// A daemon that predates the field omits the flag, which decodes as
+    /// `false`; its screen result has no `links`, so a client cannot tell a
+    /// screen without links from a daemon that does not look for them without
+    /// this flag. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_screen_links_supported: bool,
     /// The `heartbeat_ms` bounds `subscribe` accepts, when the daemon serves
     /// heartbeats.
     ///

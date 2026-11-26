@@ -36,6 +36,7 @@ use protocol::{
     ReportedLaunchIdentity, ReportedNativeReference, RequestId, RequestKind, ResponseKind,
     RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
     SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
+    TerminalLink as WireTerminalLink, TerminalLinkSource as WireTerminalLinkSource,
     TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
     WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, BACKGROUND_MAX_ITEMS, SUPPORTED_RANGE,
 };
@@ -1783,13 +1784,43 @@ async fn terminal_snapshot_request(
 ) -> Result<ResponseKind, ControlError> {
     observation_capability(connection)?;
     let pty = scoped_pty(shared, connection, scope).await?;
-    let snapshot = wire_terminal(&pty.output().terminal_snapshot())
+    let (terminal, links) = pty.output().terminal_snapshot_with_links();
+    let mut snapshot = wire_terminal(&terminal)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     validate_terminal_snapshot_dimensions(&snapshot, &shared.config)?;
+    snapshot.links = fit_links(&snapshot, links, shared.config.max_snapshot_bytes)
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     Ok(ResponseKind::TerminalSnapshot {
         worker_instance_id: scope.worker_instance_id.clone(),
         snapshot: Box::new(snapshot),
     })
+}
+
+/// Bytes the control-response envelope and the `links` member add around a
+/// snapshot; links are fitted below the snapshot limit minus this margin.
+const SNAPSHOT_LINKS_HEADROOM_BYTES: usize = 1024;
+
+/// Keeps the leading links that fit the snapshot byte limit beside the
+/// snapshot's own text, so links never turn a screen read into a limit error.
+/// The first link that does not fit ends the list.
+fn fit_links(
+    snapshot: &WireTerminalSnapshot,
+    links: Vec<pohunek_terminal::ScreenLink>,
+    max_snapshot_bytes: usize,
+) -> Result<Vec<WireTerminalLink>, serde_json::Error> {
+    let base = serde_json::to_vec(snapshot)?.len();
+    let mut remaining = max_snapshot_bytes.saturating_sub(base + SNAPSHOT_LINKS_HEADROOM_BYTES);
+    let mut fitted = Vec::new();
+    for link in links.into_iter().map(wire_link) {
+        // One byte for the separating comma.
+        let cost = serde_json::to_vec(&link)?.len() + 1;
+        if cost > remaining {
+            break;
+        }
+        remaining -= cost;
+        fitted.push(link);
+    }
+    Ok(fitted)
 }
 
 fn validate_terminal_snapshot_dimensions(
@@ -7755,7 +7786,20 @@ fn wire_terminal(snapshot: &crate::TerminalSnapshot) -> Result<WireTerminalSnaps
         title: snapshot.title.clone(),
         progress: snapshot.progress.clone(),
         visible_lines: snapshot.visible_text.lines().map(str::to_owned).collect(),
+        links: Vec::new(),
     })
+}
+
+fn wire_link(link: pohunek_terminal::ScreenLink) -> WireTerminalLink {
+    WireTerminalLink {
+        url: link.url,
+        source: match link.source {
+            pohunek_terminal::LinkSource::Text => WireTerminalLinkSource::Text,
+            pohunek_terminal::LinkSource::Osc8 => WireTerminalLinkSource::Osc8,
+        },
+        row: link.row,
+        column: link.col,
+    }
 }
 
 fn exit_status(exit: &Exit, stopped_by_user: bool) -> ExitStatus {
@@ -11322,6 +11366,7 @@ mod tests {
             title: Some("Unicode 界".to_owned()),
             progress: Some("50%".to_owned()),
             visible_lines: vec!["wide 界".to_owned(), "lossy �".to_owned()],
+            links: Vec::new(),
         };
         let response = ControlResponse {
             request_id: RequestId::new("snapshot-boundary").expect("request id"),
@@ -11759,6 +11804,7 @@ mod tests {
             title: None,
             progress: None,
             visible_lines: vec!["bounded repaint".to_owned()],
+            links: Vec::new(),
         };
         let stream_id = StreamId::new("stream-1").expect("valid stream");
         let worker_instance_id = WorkerInstanceId::new("runtime-1").expect("valid runtime");

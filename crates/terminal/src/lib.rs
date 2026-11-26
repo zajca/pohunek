@@ -13,6 +13,7 @@
 // Rust guideline compliant 2026-10-03
 
 mod compositor;
+mod links;
 mod menu;
 mod program_status;
 mod screen;
@@ -20,6 +21,8 @@ mod snapshot;
 
 #[doc(inline)]
 pub use compositor::{Compositor, OverlayFrame, OverlayLine, MIN_ROWS};
+#[doc(inline)]
+pub use links::{LinkSource, ScreenLink, MAX_LINK_URL_BYTES, MAX_SCREEN_LINKS};
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 pub use program_status::{

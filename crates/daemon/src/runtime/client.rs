@@ -2489,6 +2489,7 @@ mod tests {
                     title: None,
                     progress: None,
                     visible_lines: Vec::new(),
+                    links: Vec::new(),
                 }),
             },
         )
@@ -2907,6 +2908,7 @@ mod tests {
                         title: None,
                         progress: None,
                         visible_lines: Vec::new(),
+                        links: Vec::new(),
                     }),
                 },
             }))
@@ -3505,6 +3507,7 @@ mod tests {
                             title: None,
                             progress: None,
                             visible_lines: Vec::new(),
+                            links: Vec::new(),
                         }),
                     },
                 }))

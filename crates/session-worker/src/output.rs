@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::Notify;
 
-use pohunek_terminal::{ProbeGuard, TerminalSnapshot, TerminalTracker};
+use pohunek_terminal::{ProbeGuard, ScreenLink, TerminalSnapshot, TerminalTracker};
 use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
 
 use crate::probe::ProbeReplies;
@@ -452,6 +452,18 @@ impl OutputHub {
     pub fn terminal_snapshot(&self) -> TerminalSnapshot {
         let mut state = lock(&self.inner);
         (*state.current_snapshot()).clone()
+    }
+
+    /// Returns the current terminal snapshot with the links on its screen.
+    ///
+    /// The links are computed on demand rather than with every snapshot, which
+    /// the output path rebuilds after each feed. Both come from one lock hold,
+    /// so they describe the same terminal state.
+    #[must_use]
+    pub fn terminal_snapshot_with_links(&self) -> (TerminalSnapshot, Vec<ScreenLink>) {
+        let mut state = lock(&self.inner);
+        let snapshot = (*state.current_snapshot()).clone();
+        (snapshot, state.terminal.links())
     }
 }
 

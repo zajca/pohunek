@@ -310,6 +310,7 @@ fn host_inspect_adds_only_the_two_optional_keys() {
             "package_setup_supported",
             "runtime_api",
             "runtime_features",
+            "session_screen_links_supported",
             "subscribe_heartbeat",
         ]
     );

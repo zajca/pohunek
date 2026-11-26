@@ -382,6 +382,16 @@ pub const DEFAULT_TURN_EVENT_CAPACITY: usize = 1_024;
 pub const DEFAULT_SCREEN_ROWS: u16 = 200;
 /// Default maximum rendered terminal column count accepted by the daemon.
 pub const DEFAULT_SCREEN_COLS: u16 = 500;
+/// Default maximum number of links one `session.screen` result carries.
+///
+/// A dev-server banner or a build log holds a handful of URLs; 64 covers a
+/// busy screen without letting a URL-filled one dominate the response.
+pub const DEFAULT_SCREEN_LINKS: usize = 64;
+/// Default maximum UTF-8 bytes of one reported link URL.
+///
+/// Longer than any URL a person types or a dev server prints, and half the
+/// worker's hard bound; a longer URL is omitted, never truncated.
+pub const DEFAULT_SCREEN_LINK_BYTES: usize = 2_048;
 
 const MAX_SESSION_METADATA_KEYS: usize = 32;
 const MAX_SESSION_METADATA_KEY_BYTES: usize = 64;
@@ -499,6 +509,10 @@ pub struct SessionRegistryConfig {
     pub observation_screen_cols: u16,
     /// Maximum serialized `session.screen` result size.
     pub observation_screen_bytes: usize,
+    /// Maximum links in a `session.screen` result.
+    pub observation_screen_links: usize,
+    /// Maximum URL bytes of one link in a `session.screen` result.
+    pub observation_screen_link_bytes: usize,
     /// Maximum concurrent bounded observation waiters.
     pub observation_global_waiters: usize,
     /// Maximum concurrent bounded waiters for one session.
@@ -797,6 +811,8 @@ impl Default for SessionRegistryConfig {
             observation_screen_rows: DEFAULT_SCREEN_ROWS,
             observation_screen_cols: DEFAULT_SCREEN_COLS,
             observation_screen_bytes: protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES,
+            observation_screen_links: DEFAULT_SCREEN_LINKS,
+            observation_screen_link_bytes: DEFAULT_SCREEN_LINK_BYTES,
             observation_global_waiters: DEFAULT_GLOBAL_WAITERS,
             observation_session_waiters: DEFAULT_SESSION_WAITERS,
             turn_wait_default: DEFAULT_TURN_WAIT,
@@ -11130,6 +11146,9 @@ fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), Pro
         || config.observation_screen_cols == 0
         || config.observation_screen_bytes == 0
         || config.observation_screen_bytes > protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES
+        || config.observation_screen_links > pohunek_terminal::MAX_SCREEN_LINKS
+        || config.observation_screen_link_bytes == 0
+        || config.observation_screen_link_bytes > pohunek_terminal::MAX_LINK_URL_BYTES
         || config.observation_global_waiters == 0
         || config.observation_session_waiters == 0
         || config.observation_session_waiters > config.observation_global_waiters

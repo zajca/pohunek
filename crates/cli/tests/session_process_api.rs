@@ -808,7 +808,8 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             "cursor": {"row": 1, "col": 4, "visible": true},
             "alternate_screen": false,
             "title": "fixture terminal",
-            "visible_lines": ["pohunek fixture"]
+            "visible_lines": ["pohunek fixture"],
+            "links": [{"url": "http://localhost:5173/", "source": "text", "row": 0, "col": 8}]
         }),
         protocol::method::SESSION_READ => json!({
             "text": "pohunek fixture",
@@ -1590,6 +1591,23 @@ fn assert_typed_session_json(method: &str, ok: &Value) {
         }
         method => panic!("unexpected tested method: {method}"),
     }
+}
+
+#[test]
+fn screen_json_carries_links_and_the_text_output_stays_the_visible_lines() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let (json_output, _requests) =
+        run(&home, fixture, &["session", "screen", SESSION_ID, "--json"]);
+    let ok = assert_json_success(&json_output);
+    assert_eq!(
+        ok["links"],
+        json!([{"url": "http://localhost:5173/", "source": "text", "row": 0, "col": 8}])
+    );
+
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let (text_output, _requests) = run(&home, fixture, &["session", "screen", SESSION_ID]);
+    assert_eq!(utf8(&text_output.stdout), "pohunek fixture\n");
 }
 
 #[test]

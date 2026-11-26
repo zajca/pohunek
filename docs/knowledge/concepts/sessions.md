@@ -18,7 +18,9 @@ input with `pohunek session input`, stop with `pohunek session stop`, and attach
 with `pohunek attach`.
 
 Automation can observe a managed terminal without attaching. Use
-`pohunek session screen <target> --json` for one rendered snapshot,
+`pohunek session screen <target> --json` for one rendered snapshot (its optional
+`links` array lists the `http(s)` URLs in the text and the OSC 8 hyperlinks with
+their first cell; they are data only, nothing opens a URL),
 `pohunek session detection <target> --json` for the active detector's region
 previews and complete supported region-kind set,
 `pohunek session read <target> --source recent --lines 100 --json` for the newest
