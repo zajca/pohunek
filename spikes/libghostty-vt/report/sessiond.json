@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "what": "pohunek-sessiond cold release build without and with libghostty-vt linked into TerminalTracker",
+  "measurement_branch": {
+    "name": "2538-s6s7-sessiond-measure-local-only",
+    "sha": "cff827ece91c93e69510dc65fbff3e7a3264a664",
+    "base": "077589c0e",
+    "published": false,
+    "change": "crates/terminal gains an opt-in feature that links libghostty-vt: the spike's ffi.rs and ghostty.rs are copied in, TerminalTracker feeds a headless libghostty terminal instead of a vt100 parser, and snapshot() reads the visible text and the repaint from the libghostty formatters. vt100 stays linked because Compositor and ScreenTracker still use it."
+  },
+  "host": {
+    "system": "Linux 7.3.5",
+    "machine": "x86_64",
+    "cpu": "AMD Ryzen 9 9900X 12-Core Processor",
+    "logical_cpus": 24,
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)"
+  },
+  "command": "cargo build --release --target TARGET -p pohunek-session-worker --bin pohunek-sessiond [--features ghostty-measure], fresh CARGO_TARGET_DIR, strip",
+  "targets": {
+    "x86_64-unknown-linux-gnu": {
+      "without_feature": { "build_seconds": 21, "unstripped_bytes": 10935008, "stripped_bytes": 7747888 },
+      "with_feature": { "build_seconds": 25, "unstripped_bytes": 12891576, "stripped_bytes": 9655624 },
+      "delta_stripped_bytes": 1907736,
+      "delta_build_seconds": 4,
+      "highest_glibc_version": "2.39",
+      "highest_glibc_version_without_feature": "2.39"
+    },
+    "x86_64-unknown-linux-musl": {
+      "without_feature": { "build_seconds": 22, "unstripped_bytes": 10182056, "stripped_bytes": 7545288 },
+      "with_feature": { "build_seconds": 22, "unstripped_bytes": 12144624, "stripped_bytes": 9458272 },
+      "delta_stripped_bytes": 1912984,
+      "delta_build_seconds": 0,
+      "static_pie": true
+    }
+  },
+  "not_measured": ["aarch64-apple-darwin"]
+}

@@ -35,6 +35,17 @@ ghostty_continuation_max_bytes = 65536
 ghostty_clipboard_write_max_bytes = 1048576
 # Cell size in pixels reported on resize; only size reports use it.
 ghostty_cell_px = 1
+# Scrollback of the `vt100-scrollback` model: the usual terminal default.
+vt100_scrollback_rows = 10000
+# Throughput measurement. The agent trace is replayed back to back in one
+# model, so one run feeds about 40 MiB of real agent output.
+throughput_agent_trace = "claude"
+throughput_agent_replays = 16384
+# The synthetic flood is generated in memory from a fixed seed.
+throughput_flood_bytes = 67108864
+throughput_flood_chunk_bytes = 4096
+throughput_flood_seed = 20261126
+throughput_runs = 5
 # A neutral assertion source starts with one of these prefixes.
 allowed_source_prefixes = [
     "https://www.unicode.org/reports/",

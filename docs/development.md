@@ -81,8 +81,26 @@ uses it) and through libghostty-vt?
   `abi-layout.txt` with the host C compiler, for a library cross-built on a host
   that cannot run the target (the macOS job). Kitty graphics are
   compiled out, and the headless terminal installs no reply callback.
+- **Measure.** `vt100-scrollback` (`--models vt100,vt100-scrollback,libghostty`)
+  is the same parser with the scrollback rows of `config/model.toml`.
+  `scripts/measure --target T --ghostty-dir DIR --runner LABEL --scratch DIR --out FILE`
+  builds `size-probe` and `throughput` cold in release mode with and without
+  the feature, records build wall time, unstripped and stripped sizes, link
+  checks (no C++ runtime symbol, static musl, glibc ceiling, macOS `minos`) and
+  the median of the configured runs of `throughput` per model and workload (the
+  recorded agent trace replayed back to back, and a seeded synthetic flood), with
+  the resident memory of the first run. It writes nothing and prints no table
+  unless every step succeeded; `--merge` combines per-target files. Its
+  settings are in `config/measure.toml`. The numbers describe the named runner
+  and are indicative.
+- **Report.** [libghostty-vt spike report](design/libghostty-vt-spike.md) holds
+  the method, the results, the adoption criteria and the recommendation; the
+  generated `report.json`, `measurements.json` and `sessiond.json` it cites are
+  in `spikes/libghostty-vt/report/`.
 - **CI.** `.github/workflows/libghostty-spike.yml` runs on dispatch and on pull
-  requests that touch the spike. It is not part of `ci.yml`.
+  requests that touch the spike. The measurements and the macOS job run on
+  dispatch, or on a pull request that touches a build or measurement input.
+  It is not part of `ci.yml`.
 
 Read **[AGENTS.md](../AGENTS.md)** first, then follow its task-specific
 instruction routes.

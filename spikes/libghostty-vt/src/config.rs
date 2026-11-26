@@ -51,6 +51,20 @@ pub struct ModelConfig {
     pub ghostty_clipboard_write_max_bytes: usize,
     /// Cell size in pixels passed to libghostty on resize.
     pub ghostty_cell_px: u32,
+    /// Scrollback rows of the `vt100-scrollback` model.
+    pub vt100_scrollback_rows: usize,
+    /// Fixture the throughput measurement uses as the agent trace.
+    pub throughput_agent_trace: String,
+    /// Times the agent trace is replayed in one throughput run.
+    pub throughput_agent_replays: usize,
+    /// Size of the synthetic flood of one throughput run.
+    pub throughput_flood_bytes: usize,
+    /// Chunk size the flood is fed in, like a PTY read.
+    pub throughput_flood_chunk_bytes: usize,
+    /// Seed of the flood generator.
+    pub throughput_flood_seed: u64,
+    /// Runs per model and workload; the report keeps the median.
+    pub throughput_runs: usize,
     /// Prefixes a neutral assertion source starts with.
     pub allowed_source_prefixes: Vec<String>,
     /// Words an assertion source must not contain (case-insensitive).
@@ -123,6 +137,16 @@ impl ModelConfig {
         }
         if config.read_chunk_bytes == 0 || config.read_chunk_bytes > config.max_record_bytes {
             return Err(invalid("read_chunk_bytes must be 1..=max_record_bytes"));
+        }
+        if config.throughput_runs == 0
+            || config.throughput_agent_replays == 0
+            || config.throughput_flood_bytes == 0
+            || config.throughput_flood_chunk_bytes == 0
+            || config.vt100_scrollback_rows == 0
+        {
+            return Err(invalid(
+                "the throughput runs, replays, flood size, flood chunk and the vt100 scrollback rows must be positive",
+            ));
         }
         if config.resize_marker.is_empty() {
             return Err(invalid("resize_marker must not be empty"));

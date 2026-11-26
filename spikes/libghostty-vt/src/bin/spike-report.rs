@@ -2,7 +2,7 @@
 //! `report.json` and `report.md`.
 //!
 //! ```text
-//! spike-report --models vt100[,libghostty] [--fixtures DIR] [--out DIR] [--config FILE]
+//! spike-report --models vt100[,vt100-scrollback][,libghostty] [--fixtures DIR] [--out DIR] [--config FILE]
 //! ```
 
 // Rust guideline compliant 2026-06-26
@@ -11,33 +11,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use pohunek_libghostty_spike::config::ModelConfig;
-use pohunek_libghostty_spike::model::GridModel;
-use pohunek_libghostty_spike::report::{build_report, load_fixtures, ModelSpec};
-use pohunek_libghostty_spike::vt100_model::Vt100Model;
-
-fn spec(name: &str, config: &ModelConfig) -> Result<ModelSpec, String> {
-    let _ = config;
-    match name {
-        "vt100" => Ok(ModelSpec {
-            name: "vt100",
-            make: Box::new(|rows, cols| {
-                Ok(Box::new(Vt100Model::new(rows, cols)) as Box<dyn GridModel>)
-            }),
-        }),
-        #[cfg(feature = "libghostty")]
-        "libghostty" => {
-            let config = config.clone();
-            Ok(ModelSpec {
-                name: "libghostty",
-                make: Box::new(move |rows, cols| {
-                    pohunek_libghostty_spike::ghostty_model::GhosttyModel::new(&config, rows, cols)
-                        .map(|model| Box::new(model) as Box<dyn GridModel>)
-                }),
-            })
-        }
-        other => Err(format!("unknown or disabled model {other}")),
-    }
-}
+use pohunek_libghostty_spike::registry::model_spec;
+use pohunek_libghostty_spike::report::{build_report, load_fixtures};
 
 fn run() -> Result<(), String> {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -48,7 +23,7 @@ fn run() -> Result<(), String> {
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
         if flag == "--help" {
-            return Err("usage: spike-report [--models vt100[,libghostty]] [--fixtures DIR] [--out DIR] [--config FILE]\n\n  --models    comma list of models (default: vt100; libghostty needs the feature)\n  --fixtures  directory of *.trace and *.expect.toml (default: the spike's fixtures/)\n  --out       directory for report.json and report.md (default: .)\n  --config    config file (default: config/model.toml)".to_owned());
+            return Err("usage: spike-report [--models vt100[,vt100-scrollback][,libghostty]] [--fixtures DIR] [--out DIR] [--config FILE]\n\n  --models    comma list of models: vt100, vt100-scrollback, libghostty (default: vt100; libghostty needs the feature)\n  --fixtures  directory of *.trace and *.expect.toml (default: the spike's fixtures/)\n  --out       directory for report.json and report.md (default: .)\n  --config    config file (default: config/model.toml)".to_owned());
         }
         let value = argv.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
@@ -62,7 +37,7 @@ fn run() -> Result<(), String> {
     let config = ModelConfig::load(&config).map_err(|e| e.to_string())?;
     let specs = models
         .split(',')
-        .map(|name| spec(name, &config))
+        .map(|name| model_spec(name, &config))
         .collect::<Result<Vec<_>, _>>()?;
     let fixtures = load_fixtures(&fixtures, &config).map_err(|e| e.to_string())?;
     let report = build_report(&fixtures, &specs).map_err(|e| e.to_string())?;

@@ -48,6 +48,8 @@ the original.
 > The GUI (deferred) will use `libghostty-vt`. For Phase 1 we deliberately use a
 > pure-Rust VT crate (no Zig toolchain) for screen extraction. Re-evaluate
 > sharing `libghostty-vt` for both when the GUI work starts.
+> The measured comparison of `libghostty-vt` 1.0.2 with `vt100` is in
+> [libghostty-vt spike report](design/libghostty-vt-spike.md).
 
 ## Cargo Workspace Layout
 

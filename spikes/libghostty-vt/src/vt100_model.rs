@@ -1,4 +1,5 @@
-//! The model Pohunek ships today: `vt100` without scrollback.
+//! The model Pohunek ships today (`vt100` without scrollback) and the same
+//! parser with a scrollback buffer.
 
 // Rust guideline compliant 2026-06-26
 
@@ -6,8 +7,10 @@ use pohunek_terminal::TerminalTracker;
 
 use crate::model::{CellDump, GridDump, GridModel, ModelError};
 
-/// Model name used in reports.
+/// Name of the model without scrollback in reports.
 const NAME: &str = "vt100";
+/// Name of the model with scrollback in reports.
+const NAME_SCROLLBACK: &str = "vt100-scrollback";
 
 /// `TerminalTracker`, which the worker uses, next to a second
 /// `vt100::Parser::new(rows, cols, 0)` that exposes cells.
@@ -16,6 +19,7 @@ const NAME: &str = "vt100";
 /// fails when the two disagree on the visible text, which keeps the dump a
 /// description of what Pohunek really uses.
 pub struct Vt100Model {
+    name: &'static str,
     tracker: TerminalTracker,
     parser: vt100::Parser,
 }
@@ -29,19 +33,41 @@ impl std::fmt::Debug for Vt100Model {
 }
 
 impl Vt100Model {
-    /// Creates a model of `rows` x `cols` cells.
+    /// Creates a model of `rows` x `cols` cells without scrollback, as Pohunek
+    /// runs it.
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
+            name: NAME,
             tracker: TerminalTracker::new(rows, cols),
             parser: vt100::Parser::new(rows, cols, 0),
         }
+    }
+
+    /// Creates a model whose parser keeps up to `scrollback_rows` scrolled-off
+    /// rows. The tracker is the shipped one and keeps none.
+    #[must_use]
+    pub fn with_scrollback(rows: u16, cols: u16, scrollback_rows: usize) -> Self {
+        Self {
+            name: NAME_SCROLLBACK,
+            tracker: TerminalTracker::new(rows, cols),
+            parser: vt100::Parser::new(rows, cols, scrollback_rows),
+        }
+    }
+
+    /// Rows the parser retains above the screen.
+    fn retained_scrollback(&self) -> usize {
+        // The scrollback offset is clamped to the retained rows, so asking for
+        // the largest offset reads the count back.
+        let mut probe = self.parser.screen().clone();
+        probe.set_scrollback(usize::MAX);
+        probe.scrollback()
     }
 }
 
 impl GridModel for Vt100Model {
     fn name(&self) -> &'static str {
-        NAME
+        self.name
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -63,7 +89,7 @@ impl GridModel for Vt100Model {
         let screen = self.parser.screen();
         if snapshot.visible_text != screen.contents() {
             return Err(ModelError {
-                model: NAME,
+                model: self.name,
                 reason: "the tracker and the cell parser disagree on the visible text".to_owned(),
             });
         }
@@ -74,7 +100,7 @@ impl GridModel for Vt100Model {
             let mut line = Vec::with_capacity(usize::from(cols));
             for col in 0..cols {
                 let cell = screen.cell(row, col).ok_or_else(|| ModelError {
-                    model: NAME,
+                    model: self.name,
                     reason: format!("no cell at {row},{col} of a {rows}x{cols} screen"),
                 })?;
                 line.push(CellDump {
@@ -96,8 +122,7 @@ impl GridModel for Vt100Model {
             alternate_screen: screen.alternate_screen(),
             title: snapshot.title,
             progress: snapshot.progress,
-            // The parser is created with zero scrollback rows, so none is retained.
-            scrollback_rows: 0,
+            scrollback_rows: self.retained_scrollback(),
             cells,
             row_wrapped,
             hyperlinks: None,

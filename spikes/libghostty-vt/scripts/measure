@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Measure the cost of linking libghostty-vt into a Rust release binary.
+
+usage: python3 -I scripts/measure --target RUST_TARGET --ghostty-dir DIR
+           --runner LABEL --scratch DIR --out FILE
+       python3 -I scripts/measure --merge --out FILE INPUT...
+
+For one target, builds `size-probe` and `throughput` in release mode twice,
+each time into a new empty target directory under --scratch (a cold build):
+without the `libghostty` feature and with it, linked against the prebuilt
+library in --ghostty-dir (the output of `scripts/build-libghostty-vt`). It
+records the build wall time and the unstripped and stripped binary sizes, takes
+the library facts from the library's BUILD_INFO, and runs `throughput` for
+every model and workload of `config/measure.toml`.
+
+Nothing is written, and no table is printed, unless every step succeeded: a
+missing input, a failed build or a failed run exits non-zero without output
+files. `--merge` combines per-target files into one document.
+
+The numbers are indicative: they describe the machine named by --runner.
+"""
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SPIKE = HERE.parent
+CONFIG = SPIKE / "config" / "measure.toml"
+MANIFEST = SPIKE / "Cargo.toml"
+CONFIG_KEYS = {
+    "build_timeout_seconds",
+    "run_timeout_seconds",
+    "bins",
+    "models",
+    "workloads",
+    "schema_version",
+    "glibc_ceiling",
+    "macos_minos",
+    "cxx_runtime_symbol_prefixes",
+}
+BUILD_INFO_KEYS = (
+    "library_version",
+    "zig_version",
+    "rust_target",
+    "zig_target",
+    "archive_bytes",
+    "zig_build_seconds",
+)
+
+
+def fail(message: str) -> "None":
+    print(f"measure: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config() -> dict:
+    with CONFIG.open("rb") as handle:
+        config = tomllib.load(handle)
+    if set(config) != CONFIG_KEYS:
+        fail(f"{CONFIG} must hold exactly the keys {sorted(CONFIG_KEYS)}")
+    return config
+
+
+def run(command: list, timeout: int, env: dict | None = None) -> str:
+    try:
+        done = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        fail(f"timed out after {timeout}s: {' '.join(map(str, command))}")
+    except OSError as error:
+        fail(f"cannot run {command[0]}: {error}")
+    if done.returncode != 0:
+        sys.stderr.write(done.stderr[-4000:])
+        fail(f"exit {done.returncode}: {' '.join(map(str, command))}")
+    return done.stdout
+
+
+def build_info(ghostty_dir: Path, target: str) -> dict:
+    path = ghostty_dir / "BUILD_INFO"
+    if not path.is_file():
+        fail(f"{path} is missing; build the library with scripts/build-libghostty-vt")
+    info = {}
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep and not line.startswith("#"):
+            info[key.strip()] = value.strip()
+    for key in BUILD_INFO_KEYS:
+        if key not in info:
+            fail(f"{path} has no {key}")
+    if info["rust_target"] != target:
+        fail(f"{path} was built for {info['rust_target']}, not {target}")
+    archive = ghostty_dir / "lib" / "libghostty-vt.a"
+    if not archive.is_file():
+        fail(f"{archive} is missing")
+    if archive.stat().st_size != int(info["archive_bytes"]):
+        fail(f"{archive} does not match archive_bytes of BUILD_INFO")
+    return info
+
+
+def cargo_build(target: str, feature: bool, scratch: Path, ghostty_dir: Path, config: dict) -> dict:
+    target_dir = scratch / ("target-with" if feature else "target-without")
+    if target_dir.exists():
+        fail(f"{target_dir} exists; --scratch must be empty so the build is cold")
+    command = [
+        "cargo", "build", "--locked", "--release",
+        "--target", target,
+        "--manifest-path", str(MANIFEST),
+    ]
+    for name in config["bins"]:
+        command += ["--bin", name]
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target_dir))
+    if feature:
+        command += ["--features", "libghostty"]
+        env["LIBGHOSTTY_VT_DIR"] = str(ghostty_dir)
+    else:
+        env.pop("LIBGHOSTTY_VT_DIR", None)
+    start = time.monotonic()
+    run(command, config["build_timeout_seconds"], env)
+    seconds = round(time.monotonic() - start, 1)
+    release = target_dir / target / "release"
+    probe = release / "size-probe"
+    if not probe.is_file():
+        fail(f"{probe} was not built")
+    stripped = scratch / ("size-probe-with.stripped" if feature else "size-probe-without.stripped")
+    shutil.copyfile(probe, stripped)
+    run(["strip", str(stripped)], config["run_timeout_seconds"])
+    return {
+        "build_seconds": seconds,
+        "unstripped_bytes": probe.stat().st_size,
+        "stripped_bytes": stripped.stat().st_size,
+        "release_dir": str(release),
+    }
+
+
+def version_key(version: str) -> tuple:
+    return tuple(int(part) for part in version.split("."))
+
+
+def runtime_symbols(binary: Path, config: dict) -> set:
+    """Undefined symbols of `binary` that start with a C++ runtime prefix."""
+    prefixes = tuple(config["cxx_runtime_symbol_prefixes"])
+    names = set()
+    for line in run(["nm", "-u", str(binary)], config["run_timeout_seconds"]).splitlines():
+        fields = line.split()
+        if fields and fields[-1].startswith(prefixes):
+            names.add(fields[-1])
+    return names
+
+
+def link_checks(target: str, without: Path, binary: Path, config: dict) -> dict:
+    """Checks the linked binary; a failed check stops the measurement."""
+    timeout = config["run_timeout_seconds"]
+    checks = {}
+    if "apple-darwin" in target:
+        listing = run(["otool", "-l", str(binary)], timeout)
+        minos = None
+        lines = listing.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() == "cmd LC_BUILD_VERSION":
+                for follow in lines[index : index + 8]:
+                    if follow.split()[:1] == ["minos"]:
+                        minos = follow.split()[1]
+        if minos != config["macos_minos"]:
+            fail(f"{binary} has minos {minos}, not {config['macos_minos']}")
+        checks["minos"] = minos
+        return checks
+    # The glibc runtime itself exports __cxa_finalize and similar names, which
+    # Rust std references with or without the library; only names the library
+    # adds count.
+    added = sorted(runtime_symbols(binary, config) - runtime_symbols(without, config))
+    if added:
+        fail(f"{binary} references the C++ runtime through the library: {added}")
+    checks["cxx_runtime_symbols_added"] = 0
+    if target.endswith("-musl"):
+        described = run(["file", str(binary)], timeout)
+        if "statically linked" not in described and "static-pie linked" not in described:
+            fail(f"{binary} is not statically linked: {described.strip()}")
+        checks["static"] = True
+    else:
+        versions = set()
+        for line in run(["objdump", "-T", str(binary)], timeout).splitlines():
+            for word in line.replace("(", " ").replace(")", " ").split():
+                if word.startswith("GLIBC_") and word[6:7].isdigit():
+                    versions.add(word[6:])
+        highest = max(versions, key=version_key) if versions else None
+        if highest is None or version_key(highest) > version_key(config["glibc_ceiling"]):
+            fail(f"{binary} needs GLIBC_{highest}; the ceiling is {config['glibc_ceiling']}")
+        checks["highest_glibc_version"] = highest
+    return checks
+
+
+def host_facts() -> dict:
+    cpu = ""
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text().splitlines():
+            if line.startswith("model name"):
+                cpu = line.partition(":")[2].strip()
+                break
+    elif platform.system() == "Darwin":
+        cpu = run(["sysctl", "-n", "machdep.cpu.brand_string"], 60).strip()
+    return {
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "cpu": cpu,
+        "logical_cpus": os.cpu_count(),
+        "rustc": run(["rustc", "-V"], 60).strip(),
+    }
+
+
+def throughput(release: Path, config: dict) -> list:
+    rows = []
+    for model in config["models"]:
+        for workload in config["workloads"]:
+            out = run(
+                [str(release / "throughput"), "--model", model, "--workload", workload],
+                config["run_timeout_seconds"],
+            )
+            row = json.loads(out)
+            if row["model"] != model or row["workload"] != workload:
+                fail(f"throughput answered for {row['model']}/{row['workload']}, not {model}/{workload}")
+            rows.append(row)
+    return rows
+
+
+def measure(args: argparse.Namespace) -> dict:
+    config = load_config()
+    ghostty_dir = Path(args.ghostty_dir).resolve()
+    scratch = Path(args.scratch).resolve()
+    scratch.mkdir(parents=True, exist_ok=True)
+    info = build_info(ghostty_dir, args.target)
+    without = cargo_build(args.target, False, scratch, ghostty_dir, config)
+    with_feature = cargo_build(args.target, True, scratch, ghostty_dir, config)
+    probe_out = run([str(Path(with_feature["release_dir"]) / "size-probe")], config["run_timeout_seconds"])
+    linked = [line.split()[0] for line in probe_out.splitlines() if line.strip()]
+    if "libghostty" not in linked:
+        fail(f"the size-probe built with the feature does not link libghostty: {linked}")
+    checks = link_checks(
+        args.target,
+        Path(without["release_dir"]) / "size-probe",
+        Path(with_feature["release_dir"]) / "size-probe",
+        config,
+    )
+    rows = throughput(Path(with_feature["release_dir"]), config)
+    for part in (without, with_feature):
+        del part["release_dir"]
+    return {
+        "schema_version": config["schema_version"],
+        "target": args.target,
+        "runner": args.runner,
+        "host": host_facts(),
+        "library": {
+            "version": info["library_version"],
+            "zig_version": info["zig_version"],
+            "zig_target": info["zig_target"],
+            "archive_bytes": int(info["archive_bytes"]),
+            "zig_build_seconds_cold": float(info["zig_build_seconds"]),
+        },
+        "size_probe": {
+            "without_feature": without,
+            "with_feature": with_feature,
+            "delta_stripped_bytes": with_feature["stripped_bytes"] - without["stripped_bytes"],
+            "delta_unstripped_bytes": with_feature["unstripped_bytes"] - without["unstripped_bytes"],
+            "delta_build_seconds": round(with_feature["build_seconds"] - without["build_seconds"], 1),
+        },
+        "link_checks": checks,
+        "throughput": rows,
+    }
+
+
+def merge(args: argparse.Namespace) -> dict:
+    config = load_config()
+    targets = {}
+    for name in args.inputs:
+        document = json.loads(Path(name).read_text())
+        if document.get("schema_version") != config["schema_version"]:
+            fail(f"{name} has another schema_version")
+        if document["target"] in targets:
+            fail(f"two inputs for {document['target']}")
+        targets[document["target"]] = document
+    if not targets:
+        fail("--merge needs at least one input")
+    return {"schema_version": config["schema_version"], "targets": dict(sorted(targets.items()))}
+
+
+def table(document: dict) -> str:
+    lines = []
+    for target, item in document["targets"].items():
+        probe = item["size_probe"]
+        lines.append(
+            f"{target} ({item['runner']}): archive {item['library']['archive_bytes']} B, "
+            f"zig build {item['library']['zig_build_seconds_cold']} s, "
+            f"size-probe stripped +{probe['delta_stripped_bytes']} B, "
+            f"cargo build +{probe['delta_build_seconds']} s"
+        )
+        for row in item["throughput"]:
+            lines.append(
+                f"  {row['model']:<17} {row['workload']:<6} "
+                f"{row['median_mib_per_second']:8.1f} MiB/s  rss +{row['resident_delta_kib']} KiB"
+            )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--merge", action="store_true")
+    parser.add_argument("--target")
+    parser.add_argument("--ghostty-dir")
+    parser.add_argument("--runner")
+    parser.add_argument("--scratch")
+    parser.add_argument("inputs", nargs="*")
+    args = parser.parse_args()
+    if args.merge:
+        document = merge(args)
+    else:
+        for name in ("target", "ghostty_dir", "runner", "scratch"):
+            if getattr(args, name) is None:
+                fail(f"--{name.replace('_', '-')} is required")
+        if args.inputs:
+            fail("positional inputs belong to --merge")
+        document = measure(args)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temporary = out.with_name(out.name + ".partial")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    temporary.replace(out)
+    targets = document["targets"] if args.merge else {document["target"]: document}
+    print(table({"targets": targets}))
+
+
+if __name__ == "__main__":
+    main()
