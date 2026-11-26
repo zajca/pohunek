@@ -11,7 +11,9 @@ use crate::ClientError;
 /// The path is the one the daemon binds. An existing runtime directory or
 /// socket must be private to the caller: not a symlink, owned by the effective
 /// user, and without group or other access. A missing entry passes, because
-/// connecting then reports that no daemon is listening.
+/// connecting then reports that no daemon is listening. The check inspects the
+/// two entries by name at call time; it does not cover ancestor directories or
+/// ACLs, and it does not verify the peer of a later connect.
 ///
 /// # Errors
 ///

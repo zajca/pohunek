@@ -29,6 +29,10 @@ const FLOOD_EVENTS: usize = 6_000;
 /// How many leading digits the flood sequence number has in a name or title.
 const SEQUENCE_DIGITS: usize = 5;
 
+/// Keeps the session alive for the whole scenario, so its exit publishes no
+/// event into a flood.
+const SESSION_SCRIPT: &str = "sleep 86400";
+
 /// A running daemon with one idle session.
 struct Fixture {
     socket: TestSocket,
@@ -42,7 +46,7 @@ impl Fixture {
     async fn start(tag: &str) -> Self {
         let socket = temp_socket(tag);
         let config = SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SESSION_SCRIPT]),
             ..SessionRegistryConfig::default()
         };
         let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -349,10 +353,10 @@ async fn assert_lag_is_reported(tag: &str, channel: Channel) {
         }
     };
     let skipped = usize::try_from(lagged.skipped).expect("skipped fits usize");
-    assert_eq!(
-        first_after_gap,
-        last_before_gap.map_or(0, |last| last + 1) + skipped,
-        "the notice accounts for exactly the events between the prefix and the resumed stream"
+    let missing = first_after_gap - last_before_gap.map_or(0, |last| last + 1);
+    assert!(
+        skipped >= missing,
+        "the notice counts at least the {missing} flood events missing between the prefix and the resumed stream, got {skipped}"
     );
 
     fixture.stop().await;

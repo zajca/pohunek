@@ -418,8 +418,10 @@ pub const DEFAULT_SUBSCRIPTION_SETTINGS: SubscriptionSettings = SubscriptionSett
     heartbeat_max_ms: 60_000,
 };
 
-/// Smallest accepted event channel capacity under `[subscriptions]`.
-pub const MIN_EVENT_CHANNEL_CAPACITY: u64 = 2;
+/// Smallest accepted event channel capacity under `[subscriptions]`. The
+/// channels also feed the event journal and the notification projector, which
+/// record a gap when they lag, so the floor keeps ordinary bursts lossless.
+pub const MIN_EVENT_CHANNEL_CAPACITY: u64 = 16;
 
 /// Largest accepted event channel capacity under `[subscriptions]`; events are
 /// shared, so a bound of 64 Ki keeps a stalled subscriber's backlog small.

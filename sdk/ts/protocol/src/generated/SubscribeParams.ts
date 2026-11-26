@@ -3,8 +3,7 @@
 /**
  * Optional parameters of the `subscribe` request.
  *
- * A request with `null` or `{}` params behaves as before and receives no
- * heartbeat.
+ * A request with `null` or `{}` params receives no heartbeat.
  */
 export type SubscribeParams = {
   /**

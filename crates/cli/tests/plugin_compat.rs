@@ -280,7 +280,8 @@ fn host_inspect_carries_the_runtime_report() {
 /// Row 5 of #1659 D3: an old client decodes the new daemon's `host.inspect`
 /// unchanged. The answer adds only optional keys to what an N-1 answer can
 /// hold: the runtime contract pair, and the two capability flags of the
-/// package setup entries and `plugin profile create --program`. The old client
+/// package setup entries and `plugin profile create --program`, and the
+/// `subscribe_heartbeat` bounds. The old client
 /// ignores keys it does not know (`HostCapabilities` has no `deny_unknown_fields`).
 #[test]
 fn host_inspect_adds_only_the_two_optional_keys() {
@@ -309,6 +310,7 @@ fn host_inspect_adds_only_the_two_optional_keys() {
             "package_setup_supported",
             "runtime_api",
             "runtime_features",
+            "subscribe_heartbeat",
         ]
     );
 

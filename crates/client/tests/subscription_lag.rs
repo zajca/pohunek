@@ -4,7 +4,7 @@
 //! The fixture daemon records every request it serves and streams fixed event
 //! lines after a subscribe. The scenarios pin that a client sends
 //! `heartbeat_ms` only to a daemon that advertises the capability, that a
-//! subscriber without options sends the unchanged `null` params, and that a
+//! subscriber without options sends `null` params, and that a
 //! lag notice decodes from the stream, also for a channel this build does not
 //! know.
 

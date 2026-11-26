@@ -11,8 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Optional parameters of the `subscribe` request.
 ///
-/// A request with `null` or `{}` params behaves as before and receives no
-/// heartbeat.
+/// A request with `null` or `{}` params receives no heartbeat.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SubscribeParams.ts"))]
