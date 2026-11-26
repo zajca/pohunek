@@ -163,8 +163,8 @@ pub(crate) async fn plan_with_cause(
                         Some(GapCause::Other),
                     );
                 }
-                Decision::Install { replaces: replaced } => {
-                    replaces = replaced.map(|info| info.package.version.to_string());
+                Decision::Install { replaces: selection } => {
+                    replaces = selection.map(|info| info.package.version.to_string());
                 }
             }
         }

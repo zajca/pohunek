@@ -3151,7 +3151,8 @@ login shell fails, hangs or prints junk or yields no usable directory (the
 fallback list never replaces a recorded path), `service_search_path_unmanaged`
 where the host records no path, `service_refresh_blocked_by_transaction` while an
 install or upgrade record is pending, `service_refresh_config_schema` for a `service.toml` of another
-schema than this release writes (nothing is rewritten; run the installed release's own
+schema than this release writes (`service check` and `service upgrade` give it for a
+pending `refresh-path` record over such a file; nothing is rewritten; run the installed release's own
 `refresh-path` when it has the command, otherwise stop the live sessions, save a copy of `service.toml`, uninstall, install the
 installed version from its archive with the same `--prefix`, reapply the non-default settings
 except the recorded `search_path`, and rerun the upgrade), and `service_not_installed`. A set but relative `$SHELL`, or a

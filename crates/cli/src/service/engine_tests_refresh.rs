@@ -1047,12 +1047,12 @@ async fn a_check_of_an_upgrade_refuses_a_previous_schema_file_under_a_pending_re
     let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
     // Schema 7 is the last one without `namespace.session_tmp_root`, so the
     // file stays readable as an upgrade source.
-    let older: String = text
+    let older = text
         .replacen("schema_version = 8", "schema_version = 7", 1)
         .lines()
         .filter(|line| !line.starts_with("session_tmp_root"))
-        .map(|line| format!("{line}\n"))
-        .collect();
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 7");
     let (bytes, record) = (config_bytes(harness), record_bytes(harness));

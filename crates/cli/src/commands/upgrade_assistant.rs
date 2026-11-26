@@ -163,7 +163,10 @@ async fn install(
         Decision::Revoked(detail) => failed(detail),
         Decision::Held(hold) => outcome(
             AssistantInstallResult::Held,
-            Some(format!("{}, which the upgrade leaves as it is", hold.detail)),
+            Some(format!(
+                "{}, which the upgrade leaves as it is",
+                hold.detail
+            )),
             Some(hold.command),
         ),
         Decision::Install { replaces } => {

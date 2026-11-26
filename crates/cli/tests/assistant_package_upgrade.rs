@@ -826,7 +826,9 @@ async fn a_revoked_listed_digest_is_refused_like_setup_refuses_it() {
     let document = document_of_upgrade(&rig).await;
     let install = install_of(&document);
     assert_eq!(install["result"], "failed", "{document}");
-    let detail = install["detail"].as_str().expect("the refusal has a detail");
+    let detail = install["detail"]
+        .as_str()
+        .expect("the refusal has a detail");
     assert!(
         detail.contains(&format!(
             "version {VERSION} is revoked; wait for a release whose index lists a newer version"
@@ -885,7 +887,9 @@ async fn a_faulted_listed_digest_is_installed_again_like_setup_installs_it() {
     let document = document_of_upgrade(&rig).await;
     let install = install_of(&document);
     assert_eq!(install["result"], "failed", "{document}");
-    let detail = install["detail"].as_str().expect("the outcome has a detail");
+    let detail = install["detail"]
+        .as_str()
+        .expect("the outcome has a detail");
     assert!(
         detail.contains("installed but is not enabled and selected"),
         "the digest was installed again and left unselected: {detail}"
