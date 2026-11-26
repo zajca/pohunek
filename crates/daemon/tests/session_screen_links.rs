@@ -322,6 +322,95 @@ async fn a_redrawn_osc8_anchor_is_reported_once_with_its_latest_url() {
     assert_eq!(links(&screen), vec![link("file:///b/README", "osc8", 0, 0)]);
 }
 
+#[tokio::test]
+async fn an_osc8_anchor_is_dropped_when_the_session_is_resized() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let screen = screen_of(
+        b"\x1b]8;;http://gone.test/p\x1b\\click\x1b]8;;\x1b\\\r\nhttp://keep.test/k\r\n",
+        Setup {
+            resize_to: Some((100, 30)),
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    assert_eq!(screen["dimensions"]["cols"], 100, "the session was resized");
+    assert_eq!(urls(&screen), ["http://keep.test/k"]);
+}
+
+#[tokio::test]
+async fn a_buffer_switch_drops_the_anchors_in_both_directions_and_restores_nothing() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let anchor = "\x1b]8;;http://gone.test/p\x1b\\click\x1b]8;;\x1b\\";
+    let alt_anchor = "\x1b]8;;http://alt.test/a\x1b\\other\x1b]8;;\x1b\\";
+    let keep = "http://keep.test/k\r\n";
+    // Out of the alternate screen and back, in one write: the anchor made
+    // before the switch is not reported when the primary screen returns.
+    let round_trip = format!("{anchor}\x1b[?1049h\x1b[?1049l\r\n{keep}");
+    // An anchor made on the alternate screen over the same cells does not
+    // bring the primary one back or replace it after the switch back.
+    let overlapping = format!("{anchor}\x1b[?1049h\x1b[H{alt_anchor}\x1b[?1049l\r\n{keep}");
+    // Still on the alternate screen: only its own anchor is reported.
+    let on_alternate = format!("{anchor}\x1b[?1049h\x1b[3;1H{alt_anchor}\r\n");
+    for (name, bytes, expected) in [
+        ("round trip", round_trip, vec!["http://keep.test/k"]),
+        ("overlapping", overlapping, vec!["http://keep.test/k"]),
+        ("on alternate", on_alternate, vec!["http://alt.test/a"]),
+    ] {
+        let screen = screen_of(bytes.as_bytes(), Setup::default()).await;
+        assert_eq!(urls(&screen), expected, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn format_characters_are_rejected_in_osc8_uris_and_end_a_text_url() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let bytes = "\x1b]8;;http://spoof.test/\u{202e}evil\x1b\\spoof\x1b]8;;\x1b\\\r\n\
+                 \x1b]8;;http://zero.test/a\u{200b}b\x1b\\zero\x1b]8;;\x1b\\\r\n\
+                 http://text.test/\u{202e}evil\r\n\
+                 http://ok.test/fine\r\n";
+    let screen = screen_of(bytes.as_bytes(), Setup::default()).await;
+
+    assert_eq!(
+        urls(&screen),
+        ["http://text.test/", "http://ok.test/fine"],
+        "no reported URL carries a format character"
+    );
+}
+
+#[tokio::test]
+async fn a_screen_of_bare_schemes_stops_the_text_scan_at_its_candidate_bound() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    // One logical line of 1200 scheme-only fragments that wraps over 48 rows,
+    // between a link before it and a link after it.
+    let mut bytes = b"http://early.test/a\r\n".to_vec();
+    bytes.extend_from_slice("http:// ".repeat(1_200).as_bytes());
+    bytes.extend_from_slice(b"\r\nhttp://late.test/z\r\n");
+    let screen = screen_of(
+        &bytes,
+        Setup {
+            cols: 200,
+            rows: 60,
+            ..Setup::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        urls(&screen),
+        ["http://early.test/a"],
+        "the scan examined its bounded number of candidates and stopped"
+    );
+}
+
 /// A tracing writer that keeps what the daemon logs.
 #[derive(Clone, Default)]
 struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -961,13 +961,38 @@ impl Worker {
     pub async fn terminal_snapshot(
         &self,
     ) -> Result<pohunek_worker_protocol::TerminalSnapshot, WorkerError> {
+        self.terminal_snapshot_request(None).await
+    }
+
+    /// Returns the current rendered terminal with the links on its screen,
+    /// none with a URL longer than `max_link_url_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::terminal_snapshot`]. A worker that predates links
+    /// answers without any.
+    pub async fn terminal_snapshot_with_links(
+        &self,
+        max_link_url_bytes: u32,
+    ) -> Result<pohunek_worker_protocol::TerminalSnapshot, WorkerError> {
+        self.terminal_snapshot_request(Some(max_link_url_bytes))
+            .await
+    }
+
+    async fn terminal_snapshot_request(
+        &self,
+        link_url_bytes: Option<u32>,
+    ) -> Result<pohunek_worker_protocol::TerminalSnapshot, WorkerError> {
         let mut inner = self.inner.lock().await;
         ensure_observation(&inner)?;
         let scope = scope(&inner)?;
         let response = request_locked(
             &mut inner,
             self.next_request_id("terminal-snapshot")?,
-            RequestKind::TerminalSnapshot { scope },
+            RequestKind::TerminalSnapshot {
+                scope,
+                link_url_bytes,
+            },
         )
         .await?;
         match response {

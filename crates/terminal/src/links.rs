@@ -29,8 +29,49 @@ const MAX_OSC8_ANCHORS: usize = 256;
 /// was recorded, so a long anchor is not worth the memory.
 const MAX_ANCHOR_TEXT_BYTES: usize = 1024;
 
+/// Scheme occurrences examined on one screen before the text scan stops.
+///
+/// Every occurrence counts, including a bare `http://` that yields no link, so
+/// a screen full of fragments costs a bounded number of candidates.
+const MAX_TEXT_CANDIDATES: usize = 1024;
+
 /// Schemes recognised in plain text, matched case-insensitively.
 const TEXT_SCHEMES: [&str; 2] = ["https://", "http://"];
+
+/// Unicode format characters (general category Cf), which `char::is_control`
+/// does not cover. Bidi overrides and zero-width characters can make a
+/// displayed URL differ from the one a client opens.
+const FORMAT_RANGES: [(u32, u32); 20] = [
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// Whether `c` may not appear in a reported URL: a control or format character.
+fn is_unsafe_char(c: char) -> bool {
+    let code = u32::from(c);
+    c.is_control()
+        || FORMAT_RANGES
+            .iter()
+            .any(|(low, high)| (*low..=*high).contains(&code))
+}
 
 /// Characters that end a plain-text URL, besides whitespace and controls.
 const TEXT_URL_TERMINATORS: &str = "<>\"`\\";
@@ -120,9 +161,9 @@ impl Hyperlink {
     /// Parses the payload after `OSC 8 ;`, which is `params ; URI`.
     ///
     /// Returns `None` for a malformed sequence: no second `;`, a URI that is
-    /// not UTF-8, longer than [`MAX_LINK_URL_BYTES`] or containing a control
-    /// character. A URI is rejected rather than cleaned, because removing a
-    /// control character can build a URL the sender never wrote.
+    /// not UTF-8, longer than [`MAX_LINK_URL_BYTES`] or containing a control or
+    /// format character. A URI is rejected rather than cleaned, because
+    /// removing such a character can build a URL the sender never wrote.
     pub(crate) fn parse(payload: &[u8]) -> Option<Self> {
         let separator = payload.iter().position(|byte| *byte == b';')?;
         let uri = &payload[separator + 1..];
@@ -133,7 +174,7 @@ impl Hyperlink {
             return None;
         }
         let uri = std::str::from_utf8(uri).ok()?;
-        if uri.chars().any(char::is_control) {
+        if uri.chars().any(is_unsafe_char) {
             return None;
         }
         Some(Self::Open(uri.to_owned()))
@@ -233,6 +274,14 @@ fn anchor_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> Op
     if start >= end || start.0 >= rows || end.0 >= rows || start.1 >= cols || end.1 > cols {
         return None;
     }
+    // A span of more cells than the text limit has no usable text, so it is
+    // rejected before the screen is walked to build it.
+    let cells = (usize::from(end.0) - usize::from(start.0)) * usize::from(cols)
+        + usize::from(end.1)
+        - usize::from(start.1);
+    if cells > MAX_ANCHOR_TEXT_BYTES {
+        return None;
+    }
     let text = screen.contents_between(start.0, start.1, end.0, end.1);
     (!text.trim().is_empty() && text.len() <= MAX_ANCHOR_TEXT_BYTES).then_some(text)
 }
@@ -242,9 +291,17 @@ fn anchor_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> Op
 /// Results are in reading order (row, then column), at most
 /// [`MAX_SCREEN_LINKS`]. A text match at the cell an OSC 8 anchor starts at
 /// is the same link and is reported once, as `osc8`.
-pub(crate) fn screen_links(screen: &vt100::Screen, anchors: &AnchorLog) -> Vec<ScreenLink> {
+pub(crate) fn screen_links(
+    screen: &vt100::Screen,
+    anchors: &AnchorLog,
+    max_url_bytes: usize,
+) -> Vec<ScreenLink> {
+    let max_url_bytes = max_url_bytes.min(MAX_LINK_URL_BYTES);
     let mut links = anchors.live(screen);
-    for link in text_links(screen) {
+    // The URL cap applies before the dedupe and the count cap, so a URL that
+    // is too long for the caller neither hides a text match nor takes a slot.
+    links.retain(|link| link.url.len() <= max_url_bytes);
+    for link in text_links(screen, max_url_bytes) {
         if !links
             .iter()
             .any(|known| (known.row, known.col) == (link.row, link.col))
@@ -268,9 +325,10 @@ struct Glyph {
 ///
 /// Rows joined by soft wrapping form one logical line, so a URL that wraps at
 /// the right margin is matched whole. A hard line break ends a URL.
-fn text_links(screen: &vt100::Screen) -> Vec<ScreenLink> {
+fn text_links(screen: &vt100::Screen, max_url_bytes: usize) -> Vec<ScreenLink> {
     let (rows, cols) = screen.size();
     let mut links = Vec::new();
+    let mut candidates = MAX_TEXT_CANDIDATES;
     let mut line: Vec<Glyph> = Vec::new();
     for row in 0..rows {
         for col in 0..cols {
@@ -288,42 +346,69 @@ fn text_links(screen: &vt100::Screen) -> Vec<ScreenLink> {
             line.push(Glyph { text, row, col });
         }
         if !screen.row_wrapped(row) {
-            match_line(&line, &mut links);
+            match_line(&line, max_url_bytes, &mut candidates, &mut links);
             line.clear();
-            if links.len() >= MAX_SCREEN_LINKS {
-                break;
+            if links.len() >= MAX_SCREEN_LINKS || candidates == 0 {
+                return links;
             }
         }
     }
-    match_line(&line, &mut links);
+    match_line(&line, max_url_bytes, &mut candidates, &mut links);
     links
 }
 
 /// Appends the URLs found in one logical line.
-fn match_line(line: &[Glyph], links: &mut Vec<ScreenLink>) {
+///
+/// One pass over the line: each scheme occurrence is examined once and the
+/// scan resumes after the candidate it consumed, so the cost is linear in the
+/// line. Every occurrence is charged to `candidates`.
+fn match_line(
+    line: &[Glyph],
+    max_url_bytes: usize,
+    candidates: &mut usize,
+    links: &mut Vec<ScreenLink>,
+) {
     let mut text = String::new();
     let mut starts = Vec::with_capacity(line.len());
     for glyph in line {
         starts.push(text.len());
         text.push_str(&glyph.text);
     }
-    let mut from = 0;
-    while from < text.len() && links.len() < MAX_SCREEN_LINKS {
-        let Some((begin, scheme_len)) = next_scheme(&text, from) else {
-            break;
+    let mut at = 0;
+    while at < text.len() && links.len() < MAX_SCREEN_LINKS && *candidates > 0 {
+        let Some(scheme_len) = scheme_at(&text, at) else {
+            at += 1;
+            continue;
         };
-        let rest = &text[begin..];
+        *candidates -= 1;
+        let continues_word = text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        if continues_word {
+            at += scheme_len;
+            continue;
+        }
+        let rest = &text[at..];
         let end = rest
-            .find(|c: char| c.is_whitespace() || c.is_control() || TEXT_URL_TERMINATORS.contains(c))
+            .find(|c: char| {
+                c.is_whitespace() || is_unsafe_char(c) || TEXT_URL_TERMINATORS.contains(c)
+            })
             .unwrap_or(rest.len());
+        let begin = at;
+        at += end.max(scheme_len);
+        // A candidate longer than the cap is skipped whole; it is checked
+        // before trimming, which is quadratic in the length it is given.
+        if end > max_url_bytes {
+            continue;
+        }
         let url = trim_url(&rest[..end]);
-        from = begin + end.max(scheme_len);
-        if url.len() <= scheme_len || url.len() > MAX_LINK_URL_BYTES {
+        if url.len() <= scheme_len {
             continue;
         }
         if let Some(glyph) = starts
-            .iter()
-            .position(|start| *start == begin)
+            .binary_search(&begin)
+            .ok()
             .and_then(|index| line.get(index))
         {
             links.push(ScreenLink {
@@ -336,35 +421,16 @@ fn match_line(line: &[Glyph], links: &mut Vec<ScreenLink>) {
     }
 }
 
-/// Finds the next scheme at or after `from` that does not continue a word.
-fn next_scheme(text: &str, from: usize) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for scheme in TEXT_SCHEMES {
-        let mut search = from;
-        while let Some(found) = find_ignore_ascii_case(&text[search..], scheme) {
-            let begin = search + found;
-            let continues_word = text[..begin]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric);
-            if !continues_word {
-                if best.is_none_or(|(current, _)| begin < current) {
-                    best = Some((begin, scheme.len()));
-                }
-                break;
-            }
-            search = begin + scheme.len();
-        }
-    }
-    best
-}
-
-/// Byte offset of the first ASCII-case-insensitive `needle` in `haystack`.
-fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+/// Length of the scheme that starts at byte `at` of `text`, if one does.
+fn scheme_at(text: &str, at: usize) -> Option<usize> {
+    let tail = &text.as_bytes()[at..];
+    TEXT_SCHEMES
+        .iter()
+        .find(|scheme| {
+            tail.get(..scheme.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(scheme.as_bytes()))
+        })
+        .map(|scheme| scheme.len())
 }
 
 /// Removes trailing prose punctuation; a `)` stays when the URL opens one.

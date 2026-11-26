@@ -91,7 +91,9 @@ impl SessionRegistry {
         let managed = self.managed_session(id).await?;
         let snapshot = managed
             .worker
-            .terminal_snapshot()
+            .terminal_snapshot_with_links(
+                u32::try_from(self.inner.config.observation_screen_link_bytes).unwrap_or(u32::MAX),
+            )
             .await
             .map_err(observation_worker_error)?;
         self.verify_managed_identity(id, &managed).await?;

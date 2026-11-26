@@ -70,29 +70,36 @@ impl TerminalTracker {
 
     /// Applies the next ordered PTY output bytes.
     ///
-    /// The VT parser is advanced up to the end of each OSC 8 sequence before
-    /// the sequence is applied, so an anchor records the cursor cell the
-    /// hyperlink takes effect at.
+    /// The VT parser is advanced up to the end of each OSC 8 sequence and of
+    /// each buffer-switch sequence before it is applied, so an anchor records
+    /// the cursor cell the hyperlink takes effect at, and a buffer switch drops
+    /// the anchors wherever the output is split into chunks.
     pub fn feed(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         while !rest.is_empty() {
-            let (used, hyperlink) = self.osc.feed_until_hyperlink(rest);
+            let (used, event) = self.osc.feed_until_event(rest);
             self.parser.process(&rest[..used]);
             rest = &rest[used..];
-            if let Some(hyperlink) = hyperlink {
-                self.anchors.apply(self.parser.screen(), hyperlink);
+            match event {
+                Some(TrackerEvent::Hyperlink(hyperlink)) => {
+                    self.anchors.apply(self.parser.screen(), hyperlink);
+                }
+                Some(TrackerEvent::BufferSwitch) => self.anchors.clear(),
+                None => {}
             }
         }
     }
 
-    /// Returns the links on the visible screen, in reading order.
+    /// Returns the links on the visible screen, in reading order, none with a
+    /// URL longer than `max_url_bytes`.
     ///
     /// OSC 8 anchors are reported while the text they covered is still in the
-    /// cells where it was printed; a scroll, clear, overwrite or buffer switch
-    /// drops them, because the VT model keeps no per-cell hyperlink state.
+    /// cells where it was printed; a scroll, clear, overwrite, resize or
+    /// buffer switch drops them, because the VT model keeps no per-cell
+    /// hyperlink state. Nothing is restored when the buffer is switched back.
     #[must_use]
-    pub fn links(&self) -> Vec<ScreenLink> {
-        screen_links(self.parser.screen(), &self.anchors)
+    pub fn links(&self, max_url_bytes: usize) -> Vec<ScreenLink> {
+        screen_links(self.parser.screen(), &self.anchors, max_url_bytes)
     }
 
     /// Takes the OSC 7501 probes completed since the previous call.
@@ -154,8 +161,29 @@ struct OscTracker {
     /// Index of the `ESC` that introduced the current OSC.
     osc_start: u64,
     probes: Vec<ProbeSpan>,
-    /// OSC 8 sequence completed by the byte just advanced, not yet taken.
-    hyperlink: Option<Hyperlink>,
+    /// Event completed by the byte just advanced, not yet taken.
+    event: Option<TrackerEvent>,
+    /// Parameter bytes of the private-mode CSI being read.
+    csi: Vec<u8>,
+}
+
+/// Something the tracker applies between two parser runs.
+#[derive(Debug)]
+enum TrackerEvent {
+    /// An OSC 8 sequence completed.
+    Hyperlink(Hyperlink),
+    /// A set or reset of an alternate-screen mode (`?47`, `?1047`, `?1049`).
+    BufferSwitch,
+}
+
+/// Longest private-mode parameter string examined for a buffer switch.
+const MAX_CSI_PARAM_BYTES: usize = 32;
+
+/// Whether the `;`-separated private-mode parameters name an alternate screen.
+fn selects_alternate_screen(params: &[u8]) -> bool {
+    params
+        .split(|byte| *byte == b';')
+        .any(|param| matches!(param, b"47" | b"1047" | b"1049"))
 }
 
 impl OscTracker {
@@ -170,20 +198,21 @@ impl OscTracker {
             escape_at: 0,
             osc_start: 0,
             probes: Vec::new(),
-            hyperlink: None,
+            event: None,
+            csi: Vec::new(),
         }
     }
 
     /// Advances over `bytes` up to and including the byte that completes an
-    /// OSC 8 sequence, or over all of them when none completes.
+    /// OSC 8 sequence or a buffer switch, or over all of them when none does.
     ///
-    /// Returns the number of bytes consumed and the completed sequence.
-    fn feed_until_hyperlink(&mut self, bytes: &[u8]) -> (usize, Option<Hyperlink>) {
+    /// Returns the number of bytes consumed and the completed event.
+    fn feed_until_event(&mut self, bytes: &[u8]) -> (usize, Option<TrackerEvent>) {
         for (index, &byte) in bytes.iter().enumerate() {
             self.advance(byte);
             self.consumed += 1;
-            if let Some(hyperlink) = self.hyperlink.take() {
-                return (index + 1, Some(hyperlink));
+            if let Some(event) = self.event.take() {
+                return (index + 1, Some(event));
             }
         }
         (bytes.len(), None)
@@ -198,15 +227,50 @@ impl OscTracker {
                 }
             }
             OscState::Escape => {
-                self.state = if byte == b']' {
-                    self.osc_start = self.escape_at;
-                    self.command.clear();
-                    self.payload.clear();
-                    OscState::Command
-                } else {
-                    OscState::Ground
+                self.state = match byte {
+                    b']' => {
+                        self.osc_start = self.escape_at;
+                        self.command.clear();
+                        self.payload.clear();
+                        OscState::Command
+                    }
+                    b'[' => OscState::Csi,
+                    0x1b => {
+                        self.escape_at = self.consumed;
+                        OscState::Escape
+                    }
+                    _ => OscState::Ground,
                 };
             }
+            OscState::Csi => {
+                self.state = match byte {
+                    b'?' => {
+                        self.csi.clear();
+                        OscState::CsiPrivate
+                    }
+                    0x1b => {
+                        self.escape_at = self.consumed;
+                        OscState::Escape
+                    }
+                    _ => OscState::Ground,
+                };
+            }
+            OscState::CsiPrivate => match byte {
+                b'0'..=b'9' | b';' if self.csi.len() < MAX_CSI_PARAM_BYTES => {
+                    self.csi.push(byte);
+                }
+                b'h' | b'l' => {
+                    if selects_alternate_screen(&self.csi) {
+                        self.event = Some(TrackerEvent::BufferSwitch);
+                    }
+                    self.state = OscState::Ground;
+                }
+                0x1b => {
+                    self.escape_at = self.consumed;
+                    self.state = OscState::Escape;
+                }
+                _ => self.state = OscState::Ground,
+            },
             OscState::Command => match byte {
                 b';' => self.state = OscState::Payload,
                 0x07 => self.finish(),
@@ -256,7 +320,9 @@ impl OscTracker {
         match command {
             Some("0" | "2") => self.title = Some(payload),
             Some("9") => self.progress = Some(payload),
-            Some("8") => self.hyperlink = Hyperlink::parse(&self.payload),
+            Some("8") => {
+                self.event = Hyperlink::parse(&self.payload).map(TrackerEvent::Hyperlink);
+            }
             Some(number)
                 if number.as_bytes() == PROGRAM_STATUS_COMMAND
                     && self.payload.first() == Some(&b'?') =>
@@ -278,6 +344,10 @@ impl OscTracker {
 enum OscState {
     Ground,
     Escape,
+    /// After `ESC [`.
+    Csi,
+    /// After `ESC [ ?`, reading private-mode parameters.
+    CsiPrivate,
     Command,
     Payload,
     PayloadEscape,

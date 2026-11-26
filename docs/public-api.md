@@ -2478,18 +2478,29 @@ logged.
 - `osc8` links are OSC 8 hyperlinks (`ESC ] 8 ; params ; URI ST`, any scheme).
   The `row` and `col` are where the anchor's text starts. The anchor is kept
   while its text is still in the cells where it was printed and is dropped after a
-  scroll, clear, overwrite, resize or screen-buffer switch, because the terminal
+  scroll, clear, overwrite, resize or screen-buffer switch in either direction
+  (nothing is restored when the buffer is switched back), because the terminal
   model keeps no per-cell hyperlink state; a link a client needs after such a
   change is not reported until the program prints it again. A sequence without
-  the second `;`, with a URI that is not UTF-8 or that contains a control
-  character, or that opens no visible text, is ignored. An OSC 8 link and a text
-  match at the same cell are reported once, as `osc8`.
+  the second `;`, with a URI that is not UTF-8 or that contains a control or
+  Unicode format character (bidi overrides, zero-width characters), or that
+  opens no visible text, is ignored. A format character also ends a `text` URL.
+  An OSC 8 link and a text match at the same cell are reported once, as `osc8`.
 - A URL longer than the cap is omitted whole, never truncated. The daemon
   reports at most 64 links of at most 2,048 URL bytes each by default
-  (`observation_screen_links` and `observation_screen_link_bytes` of the daemon's
-  observation limits; the hard bounds are 256 links and 4,096 bytes). The first
-  links in reading order win, and links that would not fit
-  `observation_screen_bytes` are dropped before the screen would fail.
+  (the `observation_screen_links` and `observation_screen_link_bytes` defaults
+  of `SessionRegistryConfig`; they have no `service.toml` key; the hard bounds
+  are 256 links and 4,096 bytes). The first links in reading order win, and
+  links that would not fit `observation_screen_bytes` are dropped before the
+  screen would fail. A screen is scanned for at most 1,024 `http://` or
+  `https://` occurrences, including bare ones that yield no link, so a screen
+  full of fragments does not report the links after them.
+- Only `session.screen` asks for links; `session.read` and `session.wait` do
+  not compute them.
+
+A reported URL is untrusted program output and `osc8` accepts any scheme (for
+example `file:` or `javascript:`). A client must allowlist the schemes it is
+willing to open before opening a link.
 
 `session.detection` accepts the same single-session parameter shape:
 

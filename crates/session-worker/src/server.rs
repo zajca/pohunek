@@ -1227,9 +1227,10 @@ async fn handle_request(
             )
             .await
         }
-        RequestKind::TerminalSnapshot { scope } => {
-            terminal_snapshot_request(shared, connection, &scope).await
-        }
+        RequestKind::TerminalSnapshot {
+            scope,
+            link_url_bytes,
+        } => terminal_snapshot_request(shared, connection, &scope, link_url_bytes).await,
         RequestKind::ReadOutput {
             scope,
             stream_id,
@@ -1781,10 +1782,17 @@ async fn terminal_snapshot_request(
     shared: &Shared,
     connection: &Connection,
     scope: &RuntimeScope,
+    link_url_bytes: Option<u32>,
 ) -> Result<ResponseKind, ControlError> {
     observation_capability(connection)?;
     let pty = scoped_pty(shared, connection, scope).await?;
-    let (terminal, links) = pty.output().terminal_snapshot_with_links();
+    // Links are computed only for a request that asks for them.
+    let (terminal, links) = match link_url_bytes {
+        Some(max) => pty
+            .output()
+            .terminal_snapshot_with_links(usize::try_from(max).unwrap_or(usize::MAX)),
+        None => (pty.output().terminal_snapshot(), Vec::new()),
+    };
     let mut snapshot = wire_terminal(&terminal)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     validate_terminal_snapshot_dimensions(&snapshot, &shared.config)?;

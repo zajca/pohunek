@@ -29,10 +29,13 @@ const SHELL_LINGER_SECONDS: u32 = 60;
 /// Terminal size of a scenario that needs no particular one.
 const DEFAULT_SIZE: (u16, u16) = (80, 24);
 
-/// What a scenario varies: terminal size and registry configuration.
+/// What a scenario varies: terminal size, registry configuration and an
+/// optional resize applied once the sentinel is on screen.
 pub(crate) struct Setup {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
+    /// `(cols, rows)` the session is resized to before the screen is read.
+    pub(crate) resize_to: Option<(u16, u16)>,
     pub(crate) tweak: Box<dyn Fn(&mut SessionRegistryConfig)>,
 }
 
@@ -41,6 +44,7 @@ impl Default for Setup {
         Self {
             cols: DEFAULT_SIZE.0,
             rows: DEFAULT_SIZE.1,
+            resize_to: None,
             tweak: Box::new(|_| {}),
         }
     }
@@ -115,7 +119,7 @@ pub(crate) async fn screen_of_script(body: &str, setup: Setup) -> Value {
             .await
             .expect("create the session")
     };
-    let screen = wait_until("the sentinel on the session screen", || async {
+    let mut screen = wait_until("the sentinel on the session screen", || async {
         let screen = registry.screen(&created.id).await.ok()?;
         let value = serde_json::to_value(&screen).expect("serialize the screen");
         value["visible_lines"]
@@ -125,6 +129,17 @@ pub(crate) async fn screen_of_script(body: &str, setup: Setup) -> Value {
             .then_some(value)
     })
     .await;
+    if let Some((cols, rows)) = setup.resize_to {
+        registry
+            .resize(&created.id, cols, rows)
+            .await
+            .expect("resize the session");
+        let resized = registry
+            .screen(&created.id)
+            .await
+            .expect("read the resized screen");
+        screen = serde_json::to_value(&resized).expect("serialize the screen");
+    }
     guard("stopping the session", Box::pin(registry.stop(&created.id)))
         .await
         .expect("stop the session");

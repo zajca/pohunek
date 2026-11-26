@@ -454,16 +454,20 @@ impl OutputHub {
         (*state.current_snapshot()).clone()
     }
 
-    /// Returns the current terminal snapshot with the links on its screen.
+    /// Returns the current terminal snapshot with the links on its screen,
+    /// none with a URL longer than `max_url_bytes`.
     ///
     /// The links are computed on demand rather than with every snapshot, which
     /// the output path rebuilds after each feed. Both come from one lock hold,
     /// so they describe the same terminal state.
     #[must_use]
-    pub fn terminal_snapshot_with_links(&self) -> (TerminalSnapshot, Vec<ScreenLink>) {
+    pub fn terminal_snapshot_with_links(
+        &self,
+        max_url_bytes: usize,
+    ) -> (TerminalSnapshot, Vec<ScreenLink>) {
         let mut state = lock(&self.inner);
         let snapshot = (*state.current_snapshot()).clone();
-        (snapshot, state.terminal.links())
+        (snapshot, state.terminal.links(max_url_bytes))
     }
 }
 
