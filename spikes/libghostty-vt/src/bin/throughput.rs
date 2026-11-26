@@ -144,7 +144,7 @@ impl Xorshift {
 }
 
 fn flood(bytes: usize, seed: u64) -> Vec<u8> {
-    let mut rng = Xorshift(seed.max(1));
+    let mut rng = Xorshift(seed);
     let mut out = Vec::with_capacity(bytes + 256);
     while out.len() < bytes {
         let words = 3 + rng.below(20);

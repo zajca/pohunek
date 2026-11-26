@@ -91,7 +91,10 @@ uses it) and through libghostty-vt?
   recorded agent trace replayed back to back, and a seeded synthetic flood), with
   the resident memory of the first run. It writes nothing and prints no table
   unless every step succeeded; `--merge` combines per-target files. Its
-  settings are in `config/measure.toml`. The numbers describe the named runner
+  settings are in `config/measure.toml`. `throughput --model
+  vt100|vt100-parser|vt100-scrollback|libghostty --workload agent|flood
+  [--fixtures DIR] [--config FILE]` prints one JSON line; `size-probe [--config
+  FILE]` prints one checksum line per linked model. The numbers describe the named runner
   and are indicative.
 - **Report.** [libghostty-vt spike report](design/libghostty-vt-spike.md) holds
   the method, the results, the adoption criteria and the recommendation; the

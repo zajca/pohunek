@@ -203,7 +203,7 @@ def link_checks(target: str, without: Path, binary: Path, config: dict) -> dict:
     return checks
 
 
-def host_facts() -> dict:
+def host_facts(timeout: int) -> dict:
     cpu = ""
     cpuinfo = Path("/proc/cpuinfo")
     if cpuinfo.is_file():
@@ -212,13 +212,13 @@ def host_facts() -> dict:
                 cpu = line.partition(":")[2].strip()
                 break
     elif platform.system() == "Darwin":
-        cpu = run(["sysctl", "-n", "machdep.cpu.brand_string"], 60).strip()
+        cpu = run(["sysctl", "-n", "machdep.cpu.brand_string"], timeout).strip()
     return {
         "system": platform.system(),
         "machine": platform.machine(),
         "cpu": cpu,
         "logical_cpus": os.cpu_count(),
-        "rustc": run(["rustc", "-V"], 60).strip(),
+        "rustc": run(["rustc", "-V"], timeout).strip(),
     }
 
 
@@ -262,7 +262,7 @@ def measure(args: argparse.Namespace) -> dict:
         "schema_version": config["schema_version"],
         "target": args.target,
         "runner": args.runner,
-        "host": host_facts(),
+        "host": host_facts(config["run_timeout_seconds"]),
         "library": {
             "version": info["library_version"],
             "zig_version": info["zig_version"],
@@ -334,13 +334,14 @@ def main() -> None:
         if args.inputs:
             fail("positional inputs belong to --merge")
         document = measure(args)
+    targets = document["targets"] if args.merge else {document["target"]: document}
+    rendered = table({"targets": targets})
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     temporary = out.with_name(out.name + ".partial")
     temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
     temporary.replace(out)
-    targets = document["targets"] if args.merge else {document["target"]: document}
-    print(table({"targets": targets}))
+    print(rendered)
 
 
 if __name__ == "__main__":

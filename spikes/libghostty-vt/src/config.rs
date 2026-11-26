@@ -143,9 +143,10 @@ impl ModelConfig {
             || config.throughput_flood_bytes == 0
             || config.throughput_flood_chunk_bytes == 0
             || config.vt100_scrollback_rows == 0
+            || config.throughput_flood_seed == 0
         {
             return Err(invalid(
-                "the throughput runs, replays, flood size, flood chunk and the vt100 scrollback rows must be positive",
+                "the throughput runs, replays, flood size, flood chunk and seed and the vt100 scrollback rows must be positive",
             ));
         }
         if config.resize_marker.is_empty() {
