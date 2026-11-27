@@ -42,6 +42,15 @@ const PROMPT_EXT: &str = "tmpl";
 const TEMPLATES_FILE: &str = "templates.toml";
 /// Action definitions file under each config layer.
 const ACTIONS_FILE: &str = "actions.toml";
+/// Maximum bytes of a prompt/action/template/agent/manifest name accepted from
+/// the wire or from an in-repo config value.
+///
+/// 128 bytes matches the other name bounds of the protocol
+/// (`MAX_SESSION_SECRET_ENV_NAME_BYTES`, `MAX_PROFILE_DISPLAY_NAME_BYTES`); a
+/// machine name never needs more, and the cap is what makes the per-record
+/// maximum of a `project.actions` reply provable (see [`MAX_PROJECT_ACTIONS`]).
+/// A name over the cap is refused with `invalid_name`, never truncated.
+pub(crate) const MAX_CONFIG_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Deserialize)]
 struct TemplatesFile {
@@ -90,21 +99,27 @@ struct LayeredActions {
     repo: HashMap<String, RawAction>,
 }
 
-/// Hard count bound on the resolved `project.actions` list: 1024 actions.
+/// Hard count bound on the resolved `project.actions` list: 3200 actions.
 ///
 /// The success reply is one control line of at most `MAX_CONTROL_LINE_BYTES`
 /// (1 MiB), envelope included. One [`ActionSummary`] serializes as
-/// `{"name":"…","provider":"…","template":"…","layer":"…"}`: `provider` is one
-/// of three fixed wire strings of at most 12 bytes, `layer` one of two of at
-/// most 7 bytes, and the keys, quotes and punctuation total 69 bytes, so a
-/// record costs its two name strings plus at most 69 bytes. Both name strings
-/// pass the single-segment charset guard ([`validate_name`]), so they are
-/// ASCII and JSON escaping never grows them. Sizing the largest record the
-/// count bound admits at 512 bytes, the worst case is 1024 × 512 B = 512 KiB,
-/// half of one control line. A reply that is still too large because fewer
-/// records carry longer names is refused by the reply's byte-level check with
-/// the same `project_actions_too_large` code.
-pub(crate) const MAX_PROJECT_ACTIONS: usize = 1024;
+/// `{"name":"…","provider":"…","template":"…","layer":"…"}`: 50 bytes of keys,
+/// quotes and punctuation, `provider` at most `"linear_issue"` (14 bytes),
+/// `layer` at most `"in_repo"` (9 bytes), and `name` and `template` at most
+/// [`MAX_CONFIG_NAME_BYTES`] (128 bytes) each because [`validate_name`] caps
+/// them, so a record is at most 325 bytes, 326 with its separating comma. The
+/// `{"actions":[…]}` wrapper adds 13 bytes and the response envelope at most
+/// `MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES` (158 bytes). The largest count whose
+/// worst case fits is (1 MiB − 158 − 13) / 326 = 3215; the constant is rounded
+/// down to 3200, whose worst case 3200 × 326 + 171 = 1,043,371 bytes stays
+/// below 1,048,576. A reply that is still too large is refused by the reply's
+/// byte-level check with the same `project_actions_too_large` code.
+pub(crate) const MAX_PROJECT_ACTIONS: usize = 3200;
+
+const _: () = assert!(
+    MAX_PROJECT_ACTIONS * 326 + 171 <= protocol::MAX_CONTROL_LINE_BYTES,
+    "the project.actions count bound must keep its worst-case reply inside one control line"
+);
 
 /// Resolves per-project config from the in-repo and host-default layers, applying
 /// the name + containment guards on every read.
@@ -308,10 +323,11 @@ fn parse_actions(
         .map_err(|err| invalid_action(error_name, &err.to_string()))
 }
 
-/// A.2.1.1 single-segment charset guard. A prompt/action/template/agent/manifest
-/// name must match `^[A-Za-z0-9._-]+$`, be non-empty, and not begin with `.` or
-/// `-`; any `/`, `\`, `..`, or control character is rejected with the neutral
-/// [`invalid_name`] code (one code for every name kind; the message says which).
+/// A.2.1.1 single-segment charset + length guard. A prompt/action/template/
+/// agent/manifest name must match `^[A-Za-z0-9._-]+$`, be non-empty, not begin
+/// with `.` or `-`, and be at most [`MAX_CONFIG_NAME_BYTES`] bytes; any `/`,
+/// `\`, `..`, or control character is rejected with the neutral [`invalid_name`]
+/// code (one code for every name kind; the message says which).
 ///
 /// Stricter than `validate_git_ref_arg` (`worktree/mod.rs`), which permits `/` and
 /// uses `invalid_branch` — do not reuse that guard. Run before any path join/read,
@@ -321,9 +337,15 @@ pub(crate) fn validate_name(kind: &str, name: &str) -> Result<(), ProtocolError>
     let charset_ok = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    // Non-empty, no leading `.`/`-`, charset-clean, and no embedded `..`. `/` and
-    // `\` are not in the charset, so a path separator can never pass.
-    if first.is_some() && first != Some('.') && first != Some('-') && charset_ok {
+    // Non-empty, no leading `.`/`-`, charset-clean, no embedded `..`, and within
+    // the name cap. `/` and `\` are not in the charset, so a path separator can
+    // never pass.
+    if first.is_some()
+        && first != Some('.')
+        && first != Some('-')
+        && charset_ok
+        && name.len() <= MAX_CONFIG_NAME_BYTES
+    {
         if name.contains("..") {
             return Err(invalid_name(kind, name));
         }

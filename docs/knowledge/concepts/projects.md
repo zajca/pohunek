@@ -23,6 +23,11 @@ large, and sort the result by label, then id. Pages follow the immutable id, so 
 rename during a walk neither hides nor repeats a project; a listing that takes
 several pages is still not a snapshot of projects registered or removed meanwhile.
 
+`project.actions` is hard-bounded at 3200 resolved actions: above the bound, or
+when the reply would exceed one control line, the daemon answers
+`project_actions_too_large`, and an action or template name over 128 bytes is
+refused with `invalid_name`.
+
 Projects give sessions stable targeting. A remote host can resolve a project id
 or label on that host without the local CLI sending a local filesystem path.
 Project records also carry the default base branch used when sessions create

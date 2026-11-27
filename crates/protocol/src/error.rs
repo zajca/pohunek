@@ -755,7 +755,7 @@ impl ProtocolError {
             Self::PROJECT_ACTIONS_TOO_LARGE,
             "the resolved project actions exceed the public response budget",
             Some(
-                "remove actions from the project's .pohunek/actions.toml or the host actions.toml so at most 1024 resolve"
+                "remove actions from the project's .pohunek/actions.toml or the host actions.toml so at most 3200 resolve (action and template names are capped at 128 bytes and refused with invalid_name above that)"
                     .to_owned(),
             ),
         )
@@ -773,7 +773,7 @@ impl ProtocolError {
             Self::HOST_DISCOVER_TOO_LARGE,
             "the discovered hosts exceed the public response budget",
             Some(
-                "the configured overlay reported more peers than one reply may carry; shrink the overlay or configure fewer peers"
+                "the configured overlay reported more peers than one reply may carry (the reply carries at most 1500 records; per-record fields are capped at build time and oversized fields are reported via the record's reason instead of echoed); shrink the overlay or configure fewer peers"
                     .to_owned(),
             ),
         )

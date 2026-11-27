@@ -71,7 +71,13 @@ pub use decimal::{
     ReportSequence, RuntimeGeneration, SubagentRevision, TerminalWatermark,
 };
 #[doc(inline)]
-pub use discovery::{HostClass, HostDiscoverParams, HostRecord, HostResolution, HostResolveParams};
+pub use discovery::{
+    HostClass, HostDiscoverParams, HostRecord, HostResolution, HostResolveParams,
+    MAX_HOST_DAEMON_VERSION_BYTES, MAX_HOST_FQDN_BYTES, MAX_HOST_NAME_BYTES,
+    MAX_HOST_PEER_ID_BYTES, MAX_HOST_REASON_BYTES, REASON_ADDRESS_AMBIGUOUS,
+    REASON_DAEMON_VERSION_TOO_LARGE, REASON_IDENTITY_TOO_LARGE, REASON_LOCAL_DAEMON_ERROR,
+    REASON_LOCAL_PROBE_FAILED, REASON_LOCAL_PROBE_TIMEOUT,
+};
 #[doc(inline)]
 pub use doctor::{DaemonDoctorResult, DaemonHealthResult, DoctorCheck, DoctorReport, DoctorStatus};
 #[doc(inline)]

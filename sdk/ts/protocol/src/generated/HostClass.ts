@@ -11,7 +11,8 @@ export type HostClass =
   | {
     "classification": "reachable_daemon";
     /**
-     * The daemon version the peer reported.
+     * The daemon version the peer reported. At most
+     * [`MAX_HOST_DAEMON_VERSION_BYTES`] bytes when present.
      */
     daemon_version: string;
   }

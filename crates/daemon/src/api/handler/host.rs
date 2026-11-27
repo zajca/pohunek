@@ -2,6 +2,7 @@
 
 use protocol::{
     HostDiscoverParams, HostInspectParams, HostResolveParams, ProtocolError, Request, Response,
+    MAX_CONTROL_LINE_BYTES,
 };
 
 use super::util::error_value;
@@ -13,19 +14,30 @@ use super::{ControlTransport, HealthInfo};
 use crate::discovery::DiscoveryCache;
 use crate::session::SessionRegistry;
 
-/// Hard count bound on the `host.discover` reply: 1024 peer records.
+/// Hard count bound on the `host.discover` reply: 1500 peer records.
 ///
-/// The success reply is one control line of at most `MAX_CONTROL_LINE_BYTES`
-/// (1 MiB), envelope included. One [`protocol::HostRecord`] serializes with at
-/// most a 63-byte first DNS label as `name`, a 253-byte DNS `fqdn`, a 45-byte
-/// IP `address`, a 5-digit `port`, a 9-byte known overlay id, a 64-byte provider
-/// `peer_id`, an 18-byte `reason`, a class tag of at most 48 bytes plus a
-/// 16-byte daemon version, and 85 bytes of keys, quotes and punctuation —
-/// 606 bytes, sized here at 640 with margin. The worst case is
-/// 1024 × 640 B = 640 KiB, below one control line. A reply that is still too
-/// large is refused by the reply's byte-level check with the same
-/// `host_discover_too_large` code.
-const MAX_HOST_DISCOVER_RECORDS: usize = 1024;
+/// The success reply is one control line of at most [`MAX_CONTROL_LINE_BYTES`]
+/// (1 MiB), envelope included. One [`protocol::HostRecord`] is capped at build
+/// time (see `crates/client/src/discovery.rs`): 93 bytes of keys, quotes and
+/// punctuation, `name` at most [`protocol::MAX_HOST_NAME_BYTES`] + 2,
+/// `fqdn` at most [`protocol::MAX_HOST_FQDN_BYTES`] + 2, `address` at most 47,
+/// `port` at most 5, `overlay` at most 11 (a known provider id), `peer_id` at
+/// most [`protocol::MAX_HOST_PEER_ID_BYTES`] + 2, `local` at most 5, `reason`
+/// at most [`protocol::MAX_HOST_REASON_BYTES`] + 2, and the flattened class at
+/// most 89 bytes (`reachable_daemon` with a capped 32-byte version) — at most
+/// 670 bytes, 671 with its separating comma. The bare array adds 2 brackets and
+/// the response envelope at most `MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES`
+/// (158 bytes). The largest count whose worst case fits is
+/// (1 MiB − 158 − 2) / 671 = 1562; the constant is rounded down to 1500, whose
+/// worst case 1500 × 671 + 160 = 1,006,660 bytes stays below 1,048,576. A reply
+/// that is still too large is refused by the reply's byte-level check with the
+/// same `host_discover_too_large` code.
+const MAX_HOST_DISCOVER_RECORDS: usize = 1500;
+
+const _: () = assert!(
+    MAX_HOST_DISCOVER_RECORDS * 671 + 160 <= MAX_CONTROL_LINE_BYTES,
+    "the host.discover count bound must keep its worst-case reply inside one control line"
+);
 
 /// `host.inspect`: report this host's live capability snapshot.
 ///
