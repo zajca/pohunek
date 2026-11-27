@@ -4,9 +4,10 @@
 //! `.pohunek/actions.toml` defines the actions: one more than the bound answers
 //! the typed `project_actions_too_large` error, while exactly the bound lists
 //! completely in one reply. An action name over the daemon's byte cap answers
-//! the typed `invalid_name` error instead. All outcomes are observed through
-//! raw `project.actions` requests on the daemon's control socket and through
-//! the `pohunek` binary.
+//! the typed `invalid_name` error instead — even a name longer than a whole
+//! control line, whose refusal never echoes the name and so stays frameable.
+//! All outcomes are observed through raw `project.actions` requests on the
+//! daemon's control socket and through the `pohunek` binary.
 
 // Rust guideline compliant 2026-11-27
 
@@ -18,7 +19,7 @@ use std::path::Path;
 
 use pohunek_client::Client;
 use pohunek_test_support::tempdir;
-use protocol::{method, ProjectAddParams, Request, Response};
+use protocol::{method, ProjectAddParams, Request, Response, MAX_CONTROL_LINE_BYTES};
 use serde_json::json;
 
 #[path = "support/plugin_harness.rs"]
@@ -81,10 +82,11 @@ async fn register_project(harness: &Harness, repo: &Path) -> String {
     added.id
 }
 
-/// Sends one raw `project.actions` request and returns the parsed response. The
-/// reader accepts a line of any length, so a daemon that answers the whole set
-/// is observed rather than refused as a framing error.
-fn raw_actions(harness: &Harness, reference: &str) -> Response {
+/// Sends one raw `project.actions` request and returns the raw reply line with
+/// the parsed response. The reader accepts a line of any length, so a daemon
+/// that answers the whole set is observed rather than refused as a framing
+/// error.
+fn raw_actions_line(harness: &Harness, reference: &str) -> (String, Response) {
     let mut stream = UnixStream::connect(harness.socket()).expect("connect to the daemon");
     let request = Request::new(
         "actions-bound-scenario",
@@ -99,7 +101,13 @@ fn raw_actions(harness: &Harness, reference: &str) -> Response {
     BufReader::new(stream)
         .read_line(&mut reply)
         .expect("read the response line");
-    serde_json::from_str(&reply).expect("parse the response")
+    let response = serde_json::from_str(&reply).expect("parse the response");
+    (reply, response)
+}
+
+/// Sends one raw `project.actions` request and returns the parsed response.
+fn raw_actions(harness: &Harness, reference: &str) -> Response {
+    raw_actions_line(harness, reference).1
 }
 
 #[tokio::test]
@@ -132,6 +140,51 @@ async fn an_action_name_over_the_byte_cap_is_refused_with_invalid_name() {
     let (code, shown) = harness.json(&["project", "actions", &reference]).await;
     assert_ne!(code, 0, "{shown}");
     assert_eq!(shown["err"]["code"], "invalid_name", "{shown}");
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_action_name_over_one_control_line_is_refused_in_a_bounded_frame() {
+    let harness = Harness::start_durable().await;
+    let root = tempdir().expect("create the repository root");
+    let repo = init_repo(root.path(), "repo-hugename");
+    // A name longer than one control line: the refusal must not echo it, so
+    // the error reply itself stays inside one control line.
+    let dir = repo.join(".pohunek");
+    std::fs::create_dir_all(&dir).expect("create .pohunek");
+    std::fs::write(
+        dir.join("templates.toml"),
+        "[template.t]\nagent = \"shell\"\nprompt = \"p\"\n",
+    )
+    .expect("write templates.toml");
+    let huge_name = "a".repeat(MAX_CONTROL_LINE_BYTES + 1);
+    std::fs::write(
+        dir.join("actions.toml"),
+        format!("[action.{huge_name}]\ntemplate = \"t\"\nprovider = \"none\"\n"),
+    )
+    .expect("write actions.toml");
+    let reference = register_project(&harness, &repo).await;
+
+    let (line, response) = raw_actions_line(&harness, &reference);
+    assert!(
+        line.len() <= MAX_CONTROL_LINE_BYTES,
+        "the error reply stays inside one control line: {} bytes",
+        line.len()
+    );
+    let error = response
+        .into_result()
+        .expect_err("a huge action name does not list");
+    assert_eq!(error.code, "invalid_name", "{error:?}");
+    assert!(
+        !error.msg.contains(&huge_name),
+        "the over-cap name is not echoed: {:.120}",
+        error.msg
+    );
+    assert!(
+        error.msg.contains("128-byte limit"),
+        "the message names the byte cap: {error:?}"
+    );
 
     harness.stop().await;
 }

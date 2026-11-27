@@ -410,13 +410,24 @@ fn prompt_not_found(name: &str) -> ProtocolError {
 
 /// `runtime/invalid_name`: the shared neutral bad-name code (A.2.1.1). The `kind`
 /// names which sort of name failed (prompt/action/template/agent/manifest).
+/// A name within the cap is echoed; an over-cap name is never echoed — the
+/// message carries only its byte length and the limit — so the error reply
+/// itself stays inside one control line.
 pub(crate) fn invalid_name(kind: &str, name: &str) -> ProtocolError {
+    let detail = if name.len() > MAX_CONFIG_NAME_BYTES {
+        format!(
+            "{} bytes, over the {MAX_CONFIG_NAME_BYTES}-byte limit; the name is not echoed",
+            name.len()
+        )
+    } else {
+        format!(
+            "{name:?}: must be a single segment matching [A-Za-z0-9._-] and not start with '.' or '-'"
+        )
+    };
     ProtocolError::new(
         ErrorClass::Runtime,
         "invalid_name",
-        format!(
-            "invalid {kind} name {name:?}: must be a single segment matching [A-Za-z0-9._-] and not start with '.' or '-'"
-        ),
+        format!("invalid {kind} name: {detail}"),
         None,
     )
 }

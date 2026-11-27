@@ -393,7 +393,16 @@ async fn classify_local(
             (HostClass::Unreachable, None) => REASON_LOCAL_DAEMON_ERROR,
             (class, probe_reason) => return (class, probe_reason),
         },
-        Ok(Err(_error)) => REASON_LOCAL_PROBE_FAILED,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                overlay = %overlay,
+                %addr,
+                reason = REASON_LOCAL_PROBE_FAILED,
+                error = %error,
+                "the local daemon did not answer its own overlay probe"
+            );
+            return (HostClass::Unreachable, Some(REASON_LOCAL_PROBE_FAILED));
+        }
         Err(_elapsed) => REASON_LOCAL_PROBE_TIMEOUT,
     };
     tracing::warn!(
