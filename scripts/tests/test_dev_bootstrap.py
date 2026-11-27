@@ -1435,7 +1435,7 @@ class DevBootstrapSubprocessTests(unittest.TestCase):
         # then every suite that job runs against the real supervisor.
         checks, doc = self.checks_of("native")
         focused = [check for check in checks if check["kind"] == "focused"]
-        build = "cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins"
+        build = "cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins -p pohunek-test-support --bin pohunek-test-reaper"
         if IS_LINUX:
             self.assertEqual(
                 [check["command"] for check in focused],

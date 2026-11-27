@@ -402,16 +402,21 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
     Ok(entries)
 }
 
-/// Words before the command in a line of `ps -o pid=,ppid=,lstart=,args=`: the
-/// PID, the parent PID and the five words of `lstart` ("Mon Oct  7 22:06:00 2026").
+/// Words before the command in a line of `ps -o pid=,ppid=,pgid=,lstart=,args=`:
+/// the PID, the parent PID, the process group and the five words of `lstart`
+/// ("Mon Oct  7 22:06:00 2026").
 #[cfg(any(not(target_os = "linux"), test))]
-const PS_LEADING_WORDS: usize = 7;
+const PS_LEADING_WORDS: usize = 8;
 
-/// Parses one line of `ps -axww -o pid=,ppid=,lstart=,args=`.
+/// Parses one line of `ps -axww -o pid=,ppid=,pgid=,lstart=,args=`.
 ///
 /// `ps` has lost the argument boundaries, so the complete command column is
 /// kept as the single `argv` element and matched as text
 /// ([`command_is_worker_below`]).
+///
+/// The process group stands in for the session: macOS `ps` reports `sess` as 0
+/// for every process, while a session leader is always the leader of its own
+/// process group, so the group ID identifies the session a process belongs to.
 #[cfg(any(not(target_os = "linux"), test))]
 fn parse_ps_line(line: &str) -> Option<ProcessEntry> {
     let mut rest = line.trim_start();
@@ -427,10 +432,8 @@ fn parse_ps_line(line: &str) -> Option<ProcessEntry> {
     Some(ProcessEntry {
         pid: words[0].parse().ok()?,
         parent_pid: words[1].parse().ok()?,
-        // `ps` has no portable session column; without one only descendants
-        // are part of a worker's workload.
-        session: 0,
-        start: words[2..].join(" "),
+        session: words[2].parse().unwrap_or(0),
+        start: words[3..].join(" "),
         executable: None,
         argv: vec![OsString::from(rest.trim_end())],
     })
@@ -440,7 +443,7 @@ fn parse_ps_line(line: &str) -> Option<ProcessEntry> {
 #[cfg(not(target_os = "linux"))]
 fn process_table() -> io::Result<Vec<ProcessEntry>> {
     let output = std::process::Command::new(PS_PROGRAM)
-        .args(["-axww", "-o", "pid=,ppid=,lstart=,args="])
+        .args(["-axww", "-o", "pid=,ppid=,pgid=,lstart=,args="])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -494,6 +497,17 @@ pub fn try_child_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
         .into_iter()
         .filter(|worker| worker.parent_pid == own_pid)
         .collect())
+}
+
+/// Returns the start identity of `pid` as the process table spells it, or
+/// `None` when the process is gone.
+///
+/// The spelling is platform-dependent (clock ticks on Linux, the `lstart`
+/// text of `ps` elsewhere), so it is only comparable with a start identity
+/// reported by this module.
+#[must_use]
+pub fn try_start_of(pid: u32) -> Option<String> {
+    start_of(pid)
 }
 
 /// [`try_workers_under`] that also follows the sessions in `retained`.
@@ -1223,10 +1237,13 @@ mod tests {
     #[test]
     fn a_captured_ps_line_reaches_the_matcher_with_its_complete_command() {
         let line =
-            "  4242     1 Wed Oct  7 22:06:00 2026 /Users/a b/target/debug/pohunek-sessiond \
+            "  4242     1  4242 Wed Oct  7 22:06:00 2026 /Users/a b/target/debug/pohunek-sessiond \
                     --session-id s-1 --daemon-socket-path /private/tmp/pw s/r/pohunek/daemon.sock";
         let entry = parse_ps_line(line).expect("ps line");
-        assert_eq!((entry.pid, entry.parent_pid), (4242, 1));
+        assert_eq!(
+            (entry.pid, entry.parent_pid, entry.session),
+            (4242, 1, 4242)
+        );
         assert_eq!(entry.start, "Wed Oct 7 22:06:00 2026");
         assert_eq!(entry.argv.len(), 1, "the command stays one string");
         let command = entry.argv[0].to_str().expect("utf-8");
@@ -1238,7 +1255,7 @@ mod tests {
             command,
             Path::new("/private/tmp/pw")
         ));
-        assert_eq!(parse_ps_line("1 2 Wed Oct  7 22:06:00 2026"), None);
+        assert_eq!(parse_ps_line("1 2 3 Wed Oct  7 22:06:00 2026"), None);
     }
 
     #[test]

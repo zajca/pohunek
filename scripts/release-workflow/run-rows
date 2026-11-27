@@ -37,7 +37,8 @@ checks that the row left nothing behind that a later row could see:
   `security dump-keychain` without `-d`, which reads attributes only; a change
   is reported by class and label alone;
 - the manifest of everything a later row trusts is unchanged: xtask, the
-  consumer, run-row and this script, the downloaded archives, the attestations
+  consumer and the test-owner reaper beside it, run-row and this script, the
+  downloaded archives, the attestations
   and reports of earlier rows, the Node, uv and Python installs on PATH and
   where each resolves, the commands the guards, run-row and the upstream
   staging resolve through PATH (path and content), the entries of every PATH
@@ -920,6 +921,7 @@ def main() -> int:
     trusted = [
         Path(os.environ["XTASK"]),
         Path(os.environ["CONSUMER"]),
+        Path(os.environ["CONSUMER"]).with_name("pohunek-test-reaper"),
         RUN_ROW,
         SELF,
         Path(os.environ["DAEMON_DIR"]),

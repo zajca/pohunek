@@ -65,6 +65,13 @@ fi
 consumer_copy=$RUNNER_TEMP/smoke-consumer
 cp -- "$CONSUMER" "$consumer_copy"
 chmod 0755 "$consumer_copy"
+# The consumer's TestEnv arms the test-owner reaper and resolves it beside the
+# test executable, so the reaper must travel with the consumer copy; a missing
+# reaper is an error here, not a later TestEnv::new failure.
+reaper_beside_consumer="$(dirname -- "$CONSUMER")/pohunek-test-reaper"
+[ -f "$reaper_beside_consumer" ] || fail "the test-owner reaper is not beside the consumer: $reaper_beside_consumer"
+cp -- "$reaper_beside_consumer" "$RUNNER_TEMP/pohunek-test-reaper"
+chmod 0755 "$RUNNER_TEMP/pohunek-test-reaper"
 
 if [ "$(uname -s)" = Darwin ]; then
     /usr/bin/sudo -n true || fail "the macOS smoke needs passwordless sudo (CI runner only)"

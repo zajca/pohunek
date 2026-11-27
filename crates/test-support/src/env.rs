@@ -60,6 +60,7 @@ use std::path::{Component, Path, PathBuf};
 
 use tempfile::TempDir;
 
+use crate::owner::OwnerReaper;
 use crate::workers::WorkerGuard;
 use crate::{make_private, PRIVATE_DIR_MODE};
 
@@ -240,9 +241,10 @@ pub fn check_socket_path(path: &Path) -> Result<(), SocketPathError> {
 ///
 /// Dropping the value first terminates any `pohunek-sessiond` worker whose
 /// control socket is below the root and fails the test that left it (see
-/// [`WorkerGuard`]), then removes the root and everything beneath it, on
-/// success and while a panic unwinds. A test process that is killed or aborts
-/// cannot run the drop and leaves its root and workers behind.
+/// [`WorkerGuard`]), then stops the owner reaper, then removes the root and
+/// everything beneath it, on success and while a panic unwinds. A test process
+/// that is killed or aborts cannot run the drop: an owner reaper armed at
+/// creation sweeps the root instead (see [`crate::owner::OwnerReaper`]).
 ///
 /// The `Debug` output lists the directories and the names of the child
 /// environment variables, never their values: the parent environment can hold
@@ -251,6 +253,10 @@ pub struct TestEnv {
     // Declared before `root` so the guard reaps workers while the root still
     // exists; fields drop in declaration order.
     workers: WorkerGuard,
+    // Declared after `workers` and before `root`: the drop reaps leaked
+    // workers first, then stops the owner reaper (so a normal end never pays
+    // a sweep), and only then removes the root the reaper swept.
+    reaper: OwnerReaper,
     root: TempDir,
     cwd: PathBuf,
     home: PathBuf,
@@ -267,6 +273,7 @@ impl fmt::Debug for TestEnv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TestEnv")
             .field("workers", &self.workers)
+            .field("reaper", &self.reaper)
             .field("root", &self.root.path())
             .field("cwd", &self.cwd)
             .field("home", &self.home)
@@ -363,8 +370,10 @@ impl TestEnv {
         ]
         .map(|(name, dir)| (OsString::from(name), dir.clone().into_os_string()));
         let environment = scrubbed(parent, pinned);
+        let reaper = OwnerReaper::arm(root.path())?;
         Ok(Self {
             workers: WorkerGuard::watch(root.path()),
+            reaper,
             root,
             cwd,
             home,

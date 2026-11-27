@@ -76,6 +76,12 @@ path = "tests/release_consumer.rs"
 name = "release_upgrade"
 path = "tests/release_upgrade.rs"
 
+# The owner-death scenarios kill a child of this binary, so the binary must
+# stay small: it is not a module of `all`.
+[[test]]
+name = "session_owner_death"
+path = "tests/session_owner_death.rs"
+
 [dev-dependencies]
 # Enables `test-util` for this package's own integration tests.
 pohunek-cli = { path = ".", features = ["test-util"] }

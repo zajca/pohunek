@@ -52,6 +52,7 @@ test-group = 'unreadable-holders'
 # run where those tests find no worker.
 include = [
   { path = "debug/pohunek-sessiond", relative-to = "target", depth = 0, on-missing = "error" },
+  { path = "debug/pohunek-test-reaper", relative-to = "target", depth = 0, on-missing = "error" },
 ]
 
 [profile.ci]
@@ -67,7 +68,15 @@ path = "junit.xml"
 [profile.local]
 # Unfiltered full suite; unlike fast, this needs worker and database fixtures.
 test-threads = "num-cpus"
-slow-timeout = { period = "30s" }
+# A hung scenario here held a test daemon with 70 real sessions for 10-12 h
+# (issue 2581): this profile is the unfiltered full suite, so it needs the same
+# backstop as every other profile. 10 periods of 60 s is above `HANG_GUARD`
+# (120 s, crates/test-support/src/wait.rs) by five times, so a hung readiness
+# wait fails with the condition it awaited, and above CI's proven ceiling (every
+# test of this suite passes under `ci`/`heavy` termination at 3 x 60 s = 180 s),
+# so no legitimate test is KILLED; a genuinely hung one ends in 10 min plus
+# nextest's 10 s kill grace.
+slow-timeout = { period = "60s", terminate-after = 10 }
 
 # Cost boundary shared by local aliases and scripts/test-partitions. Whole
 # fixture-owning modules stay heavy, including future tests added within them.

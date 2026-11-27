@@ -8,6 +8,7 @@ cargo fmt --all --check
 scripts/check-rust-toolchain-pin                        # no floating Rust channel in CI
 cargo clippy --workspace --all-targets --all-features   # must be clean under -D warnings
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
+cargo build -p pohunek-test-support --bin pohunek-test-reaper  # TestEnv arms it for every fixture root
 scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features
 # Sixteen threads through scripts/heavy-run (see docs/development.md, "Heavy
 # runs"): measured ~150 s for the full workspace suite (7764 tests) on the
@@ -19,6 +20,10 @@ cargo xtask docs check                                   # schema/log fragments/
 scripts/build-hermes-package /abs/hermes.tar.zst        # Hermes runtime package for the gate
 cargo xtask hermes compatibility --bin-dir ABS --package /abs/hermes.tar.zst  # pinned, model-free Hermes CLI/golden gate
 ```
+
+Start this command only when no earlier run of it is live (the slot locks and
+`pgrep -af 'cargo nextest run'` show one); a retry beside a live run is not
+evidence. The rule and why are in `docs/development.md`, "Heavy runs".
 
 The `platform contracts (arm64)` CI job runs natively on Apple Silicon macOS
 with `MACOSX_DEPLOYMENT_TARGET=14.0`. It lints nine packages with one clippy

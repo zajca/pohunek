@@ -132,6 +132,13 @@ node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
 
 cp -- "$CONSUMER" "$work/consumer"
 chmod 0755 "$work/consumer"
+# The consumer's TestEnv arms the test-owner reaper and resolves it beside the
+# test executable when the executable is not a Cargo build product; a missing
+# reaper is an error here, not a later TestEnv::new failure.
+reaper_beside_consumer="$(dirname -- "$CONSUMER")/pohunek-test-reaper"
+[ -f "$reaper_beside_consumer" ] || fail "the test-owner reaper is not beside the consumer: $reaper_beside_consumer"
+cp -- "$reaper_beside_consumer" "$work/pohunek-test-reaper"
+chmod 0755 "$work/pohunek-test-reaper"
 report=$work/report.json
 started=$(clock)
 status=0

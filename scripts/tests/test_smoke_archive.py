@@ -218,6 +218,8 @@ class _SmokeArchiveFixture:
         self.stage = self.base / "stage"
         self.stage.mkdir()
         self.consumer = self.base / "consumer"
+        # smoke-archive requires the test-owner reaper beside the consumer.
+        (self.base / "pohunek-test-reaper").write_text("#!/bin/sh\n")
         self.write_consumer(STUB_PREAMBLE + STUB_REPORT)
         self.archive = self.build_archive(["pi", "codex"])
         for runtime in ("pi", "codex"):

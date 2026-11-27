@@ -48,9 +48,9 @@ use std::time::{Duration, Instant};
 /// and a wait that reaches it is a hang. It is also below the nextest
 /// `terminate-after` of every profile in `.config/nextest.toml` (`default`,
 /// `ci`, `fast`, `heavy` and `package` terminate a test after 3
-/// periods of 60 s, 180 s in total), so the panic naming the awaited condition is what the
-/// developer sees rather than a nextest termination. The `local` profile
-/// only marks tests slow after 30 s and never terminates them.
+/// periods of 60 s, 180 s in total, `local` after 10 periods of 60 s, 600 s in
+/// total), so the panic naming the awaited condition is what the
+/// developer sees rather than a nextest termination.
 ///
 /// The ceiling bounds one wait, not a whole test: a test that spends more than
 /// the 60 s margin before a hanging wait is terminated by nextest first. Raising
@@ -361,6 +361,37 @@ mod tests {
                 path.display()
             );
         }
+        let unbounded = slow_timeouts_without_termination(&text);
+        assert!(
+            unbounded.is_empty(),
+            "profiles of {} declare a `slow-timeout` without a `terminate-after`, so a hung \
+             test under them never ends: {}",
+            path.display(),
+            unbounded.join(", ")
+        );
+    }
+
+    #[test]
+    fn slow_timeouts_without_termination_lists_every_unbounded_profile() {
+        let text = r#"
+            [profile.a]
+            slow-timeout = { period = "60s", terminate-after = 3 }
+            [profile.b]
+            slow-timeout = { period = "30s" }
+            [profile.c]
+            slow-timeout = "45s"
+            [[profile.c.overrides]]
+            filter = "test(x)"
+            slow-timeout = { period = "2m" }
+        "#;
+        assert_eq!(
+            slow_timeouts_without_termination(text),
+            [
+                "profile.b.slow-timeout".to_owned(),
+                "profile.c.slow-timeout".to_owned(),
+                "profile.c.overrides[0].slow-timeout".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -446,6 +477,44 @@ mod tests {
             for (index, entry) in overrides.into_iter().flatten().enumerate() {
                 let location = format!("profile.{name}.overrides[{index}].slow-timeout");
                 found.extend(termination_of(&location, entry.get("slow-timeout")));
+            }
+        }
+        found
+    }
+
+    /// Returns the location of every `profile.<name>.slow-timeout` and
+    /// `profile.<name>.overrides[<i>].slow-timeout` that declares no
+    /// `terminate-after`, in a table or in the plain-string form.
+    ///
+    /// Panics on a TOML syntax error, so an unreadable configuration fails
+    /// the test instead of being skipped.
+    fn slow_timeouts_without_termination(text: &str) -> Vec<String> {
+        let config: toml::Table = text
+            .parse()
+            .unwrap_or_else(|error| panic!("nextest configuration is not valid TOML: {error}"));
+        // A `slow-timeout` is unbounded when it is not a table (the plain
+        // period string cannot set `terminate-after`) or its table lacks it.
+        let unbounded = |value: Option<&toml::Value>| {
+            value.is_some_and(|value| {
+                value
+                    .as_table()
+                    .is_none_or(|table| !table.contains_key("terminate-after"))
+            })
+        };
+        let mut found = Vec::new();
+        let profiles = config.get("profile").and_then(toml::Value::as_table);
+        for (name, profile) in profiles.into_iter().flatten() {
+            let Some(profile) = profile.as_table() else {
+                continue;
+            };
+            if unbounded(profile.get("slow-timeout")) {
+                found.push(format!("profile.{name}.slow-timeout"));
+            }
+            let overrides = profile.get("overrides").and_then(toml::Value::as_array);
+            for (index, entry) in overrides.into_iter().flatten().enumerate() {
+                if unbounded(entry.get("slow-timeout")) {
+                    found.push(format!("profile.{name}.overrides[{index}].slow-timeout"));
+                }
             }
         }
         found

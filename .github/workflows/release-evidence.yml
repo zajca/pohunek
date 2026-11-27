@@ -184,11 +184,14 @@ jobs:
       # The consumer leaves the job before any upstream code runs in it.
       # Every upload of this job overwrites its artifact, so that a rerun of
       # the failed job replaces what the failed attempt uploaded.
+      # Upload the consumer executable together with the test-owner reaper
+      # beside it: the consumer's TestEnv resolves the reaper beside the test
+      # executable, so the smoke job needs both files in the artifact.
       - name: Upload the consumer executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-consumer-${{ runner.os }}
-          path: ${{ runner.temp }}/consumer/release_consumer
+          path: ${{ runner.temp }}/consumer
           if-no-files-found: error
           overwrite: true
 

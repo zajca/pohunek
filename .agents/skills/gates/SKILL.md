@@ -34,6 +34,7 @@ scripts/check-rust-toolchain-pin                        # no floating Rust chann
 cargo clippy --workspace --all-targets --all-features   # under -D warnings
 scripts/darwin-check                                    # macOS-only code; needs zig on a Linux host
 cargo build -p pohunek-session-worker --bin pohunek-sessiond
+cargo build -p pohunek-test-support --bin pohunek-test-reaper
 scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features
 # Sixteen threads only through scripts/heavy-run (see "Heavy runs" in
 # docs/development.md): measured ~150 s for the full workspace suite

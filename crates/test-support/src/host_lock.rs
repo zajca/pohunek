@@ -288,12 +288,14 @@ fn current_holder(file: &mut File) -> String {
 
 /// Returns the per-user lock directory, creating it private when missing.
 ///
+/// Shared with [`crate::owner`], which places its reaper links there.
+///
 /// # Panics
 ///
 /// Panics when the path exists but is a symlink, not a directory, owned by
 /// another user, or writable by group or others, since such a directory could
 /// let another user swap the lock files.
-fn lock_dir() -> PathBuf {
+pub(crate) fn lock_dir() -> PathBuf {
     let uid = rustix::process::geteuid().as_raw();
     let dir = Path::new(LOCK_PARENT).join(format!("pohunek-test-locks-{uid}"));
     match DirBuilder::new().mode(PRIVATE_DIR_MODE).create(&dir) {
