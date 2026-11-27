@@ -459,8 +459,12 @@ inner_main() {
         root=$inputs/root
         /bin/cp "$consumer" "$inputs/consumer" || fail "cannot copy consumer to inputs"
         /bin/chmod 0755 "$inputs/consumer" || fail "cannot chmod consumer in inputs"
-        # The reaper travels with the consumer into the sandbox inputs.
-        /bin/cp "$reaper" "$inputs/pohunek-test-reaper" || fail "cannot copy reaper to inputs"
+        # The reaper travels with the consumer into the sandbox inputs; the
+        # inner run's $consumer is $work/consumer, beside which the outer run
+        # copied the reaper.
+        reaper_src="$(dirname -- "$consumer")/pohunek-test-reaper"
+        [ -f "$reaper_src" ] || fail "the test-owner reaper is not beside the consumer: $reaper_src"
+        /bin/cp "$reaper_src" "$inputs/pohunek-test-reaper" || fail "cannot copy reaper to inputs"
         /bin/chmod 0755 "$inputs/pohunek-test-reaper" || fail "cannot chmod reaper in inputs"
         consumer=$inputs/consumer
         mkdir "$inputs/node-bin" || fail "cannot create node-bin in inputs"
