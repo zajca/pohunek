@@ -482,7 +482,8 @@ pub(crate) fn try_reaper_binary() -> std::io::Result<PathBuf> {
             Err(_) => workspace_build_dir()
                 .ok_or_else(|| {
                     std::io::Error::other(format!(
-                        "cannot locate a Cargo profile directory of {exe:?}; set {REAPER_OVERRIDE_VAR} to the reaper binary"
+                        "cannot locate a Cargo profile directory of {}; set {REAPER_OVERRIDE_VAR} to the reaper binary",
+                        exe.display()
                     ))
                 })?
                 .join(REAPER_FILE_NAME),
