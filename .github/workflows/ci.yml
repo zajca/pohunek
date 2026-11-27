@@ -1369,6 +1369,8 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-mold/**'
+              - '.github/actions/setup-zig/**'
+              - '.github/actions/libghostty-vt/**'
               - '.github/actions/pinned-cache/**'
             # macOS platform, path, private-protocol, session-worker, daemon,
             # CLI, launchd, and Hermes filesystem contracts run on the native
