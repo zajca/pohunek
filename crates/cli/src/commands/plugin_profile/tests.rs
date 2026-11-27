@@ -85,10 +85,19 @@ fn profile_names_follow_the_daemons_charset_rule() {
     for good in ["work", "issue.v2-final", "a_b", "A1", "x.toml", "9"] {
         assert!(is_valid_profile_name(good), "{good:?}");
     }
-    assert!(is_valid_profile_name(&"a".repeat(PROFILE_NAME_MAX_BYTES)));
-    assert!(!is_valid_profile_name(
-        &"a".repeat(PROFILE_NAME_MAX_BYTES + 1)
+    // The byte bound is the shared protocol constant, so the daemon's
+    // validate_name refuses exactly the same range: 128 bytes accepted,
+    // 129-250 bytes (the old CLI-only bound) refused on both sides.
+    assert_eq!(PROFILE_NAME_MAX_BYTES, protocol::MAX_CONFIG_NAME_BYTES);
+    assert!(is_valid_profile_name(
+        &"a".repeat(protocol::MAX_CONFIG_NAME_BYTES)
     ));
+    for len in [protocol::MAX_CONFIG_NAME_BYTES + 1, 200, 250, 251] {
+        assert!(
+            !is_valid_profile_name(&"a".repeat(len)),
+            "{len} bytes must be refused like the daemon does"
+        );
+    }
 }
 
 // ----- parsing -------------------------------------------------------------

@@ -18,7 +18,7 @@ use std::process::ExitCode;
 
 use protocol::{
     method, CommandRunParams, HostCapabilities, HostClass, HostGovernanceStatus, HostOwner,
-    HostRecord, QuarantineReason,
+    HostRecord, QuarantineReason, REASON_ADDRESS_AMBIGUOUS, REASON_IDENTITY_TOO_LARGE,
 };
 
 use super::plugin::sanitize;
@@ -190,6 +190,14 @@ fn render_records_human(records: &[HostRecord]) -> String {
                 version = match record.class {
                     // No probe ran for a candidate; the reason says why.
                     HostClass::Candidate => reason.clone(),
+                    // The probe ran and answered, so a non-probe reason (an
+                    // over-cap identity field, an ambiguous address) is shown
+                    // next to the version, not as a probe failure.
+                    _ if reason == REASON_IDENTITY_TOO_LARGE
+                        || reason == REASON_ADDRESS_AMBIGUOUS =>
+                    {
+                        format!("{version}: {reason}")
+                    }
                     _ => format!("probe failed: {reason}"),
                 };
             }
@@ -380,6 +388,7 @@ mod tests {
     use protocol::{
         AgentRuntime, ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,
         HostId, OwnerRevision, PrincipalId, ProtocolVersion, RelayId, RuntimeRef, TeamId,
+        REASON_DAEMON_VERSION_TOO_LARGE,
     };
 
     use super::*;
@@ -673,5 +682,78 @@ mod tests {
         assert!(output.contains(&peer_route));
         assert!(output.contains(&fqdn_route));
         assert!(!output.contains("netbird://"));
+    }
+
+    #[test]
+    fn renders_non_probe_reasons_next_to_the_version_not_as_a_probe_failure() {
+        let records = vec![
+            // A reachable peer whose identity field was over cap: the probe
+            // succeeded, so the version stays and the reason sits next to it.
+            HostRecord {
+                name: Some("host-b".to_owned()),
+                fqdn: Some("host-b.netbird.cloud".to_owned()),
+                address: Some("100.92.30.40".to_owned()),
+                port: 18722,
+                overlay: "netbird".to_owned(),
+                peer_id: None,
+                local: false,
+                reason: Some(REASON_IDENTITY_TOO_LARGE.to_owned()),
+                class: HostClass::ReachableDaemon {
+                    daemon_version: "0.1.0".to_owned(),
+                },
+            },
+            // A candidate with an ambiguous address: no probe ran, the bare
+            // reason stands in the VERSION column as before.
+            HostRecord {
+                name: Some("host-c".to_owned()),
+                fqdn: Some("host-c.netbird.cloud".to_owned()),
+                address: None,
+                port: 18722,
+                overlay: "netbird".to_owned(),
+                peer_id: None,
+                local: false,
+                reason: Some(REASON_ADDRESS_AMBIGUOUS.to_owned()),
+                class: HostClass::Candidate,
+            },
+            // An unreachable peer with a probe reason: still a probe failure.
+            HostRecord {
+                name: Some("host-d".to_owned()),
+                fqdn: Some("host-d.netbird.cloud".to_owned()),
+                address: Some("100.92.30.42".to_owned()),
+                port: 18722,
+                overlay: "netbird".to_owned(),
+                peer_id: None,
+                local: false,
+                reason: Some(REASON_DAEMON_VERSION_TOO_LARGE.to_owned()),
+                class: HostClass::Unreachable,
+            },
+        ];
+        let output = render_records_human(&records);
+        let row_of = |name: &str| {
+            output
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}: {output}"))
+                .to_owned()
+        };
+        let host_b = row_of("host-b");
+        assert!(
+            host_b.contains("0.1.0") && host_b.contains(REASON_IDENTITY_TOO_LARGE),
+            "version and non-probe reason side by side: {host_b}"
+        );
+        assert!(
+            !host_b.contains("probe failed"),
+            "a successful probe is not rendered as failed: {host_b}"
+        );
+        let host_c = row_of("host-c");
+        assert!(
+            host_c.contains(REASON_ADDRESS_AMBIGUOUS) && !host_c.contains("probe failed"),
+            "candidate shows the bare reason: {host_c}"
+        );
+        let host_d = row_of("host-d");
+        assert!(
+            host_d.contains("probe failed") && host_d.contains(REASON_DAEMON_VERSION_TOO_LARGE),
+            "a probe-outcome reason is still a probe failure: {host_d}"
+        );
     }
 }

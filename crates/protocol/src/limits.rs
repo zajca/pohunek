@@ -74,6 +74,19 @@ pub const MAX_SESSION_SECRET_ENV_VALUE_BYTES: usize = 16 * 1024;
 /// bounded.
 pub const MAX_PROFILE_DISPLAY_NAME_BYTES: usize = 128;
 
+/// Maximum bytes of any config name accepted from the wire or from a config
+/// file: prompt, action, template, agent, manifest, option and profile names
+/// alike.
+///
+/// Shared by the daemon's `validate_name` and the CLI's profile-name check so
+/// both sides refuse exactly the same names. 128 bytes matches the other name
+/// bounds of the protocol (`MAX_SESSION_SECRET_ENV_NAME_BYTES`,
+/// `MAX_PROFILE_DISPLAY_NAME_BYTES`); a machine name never needs more, and
+/// the cap is what makes the per-record maximum of a `project.actions` reply
+/// provable. A name over the cap is refused with `invalid_name`, never
+/// truncated or echoed.
+pub const MAX_CONFIG_NAME_BYTES: usize = 128;
+
 /// Maximum options one agent profile declares under `[options]`.
 ///
 /// An option is one picker in a launch form (model, effort, permission

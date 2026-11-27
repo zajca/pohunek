@@ -42,15 +42,9 @@ const PROMPT_EXT: &str = "tmpl";
 const TEMPLATES_FILE: &str = "templates.toml";
 /// Action definitions file under each config layer.
 const ACTIONS_FILE: &str = "actions.toml";
-/// Maximum bytes of a prompt/action/template/agent/manifest name accepted from
-/// the wire or from an in-repo config value.
-///
-/// 128 bytes matches the other name bounds of the protocol
-/// (`MAX_SESSION_SECRET_ENV_NAME_BYTES`, `MAX_PROFILE_DISPLAY_NAME_BYTES`); a
-/// machine name never needs more, and the cap is what makes the per-record
-/// maximum of a `project.actions` reply provable (see [`MAX_PROJECT_ACTIONS`]).
-/// A name over the cap is refused with `invalid_name`, never truncated.
-pub(crate) const MAX_CONFIG_NAME_BYTES: usize = 128;
+/// The shared config-name cap; the doc lives on the protocol constant so the
+/// CLI's profile-name check and this daemon guard cannot drift apart.
+pub(crate) use protocol::MAX_CONFIG_NAME_BYTES;
 
 #[derive(Debug, Clone, Deserialize)]
 struct TemplatesFile {
@@ -585,6 +579,19 @@ mod tests {
         ] {
             let err = r.resolve_prompt(bad).expect_err("must reject");
             assert_eq!(err.code, "invalid_name", "name {bad:?}");
+        }
+        // Over the shared MAX_CONFIG_NAME_BYTES cap (129-250 bytes is the
+        // range the CLI's profile check used to accept alone): refused with
+        // the same code, and the name is not echoed in the message.
+        for len in [MAX_CONFIG_NAME_BYTES + 1, 200, 250] {
+            let bad = "a".repeat(len);
+            let err = r.resolve_prompt(&bad).expect_err("must reject");
+            assert_eq!(err.code, "invalid_name", "{len} bytes");
+            assert!(
+                !err.msg.contains(&bad),
+                "over-cap name must not be echoed: {:.80}",
+                err.msg
+            );
         }
     }
 
