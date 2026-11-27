@@ -17,6 +17,9 @@ tempfile.workspace = true
 # `workers` signals leaked worker processes through pidfds (`process`).
 # `host_lock` takes a `flock` on a file (`fs`).
 rustix = { workspace = true, features = ["fs", "process"] }
+# `owner` reads the same-user process table through the platform inspector when
+# it sweeps a test root whose owner died.
+pohunek-platform.workspace = true
 # The async waits use `tokio::time` and `TestEnv::tokio_command` returns a
 # `tokio::process::Command`; the workspace spec already enables every
 # feature the other crates use, so this adds no build weight to a workspace build.
@@ -30,6 +33,12 @@ getrandom = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Parses `.config/nextest.toml` to check the hang guard against `terminate-after`.
 toml = { workspace = true }
+
+# The test-owner reaper `TestEnv` arms for its root: it waits on the owner
+# lock and sweeps the root when the test process dies without unwinding.
+[[bin]]
+name = "pohunek-test-reaper"
+path = "src/bin/test_reaper.rs"
 
 [lints]
 workspace = true

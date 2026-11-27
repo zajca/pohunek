@@ -66,6 +66,12 @@
 //! `pohunek-sessiond` workers a fixture root owns when it drops and fails the
 //! test that left them running; [`env::TestEnv`] carries one for its root.
 //!
+//! The [`owner`] module holds [`owner::OwnerReaper`], which arms the
+//! `pohunek-test-reaper` helper for the root, so the processes of the root are
+//! swept when the test process dies without unwinding; [`env::TestEnv`] carries
+//! one for its root. [`reaper_binary`] resolves the helper beside the test
+//! profile like [`worker_binary`].
+//!
 //! This crate is a development dependency only; production code never picks
 //! its paths from here.
 //!
@@ -90,6 +96,7 @@ pub mod fs;
 pub mod git;
 pub mod hold;
 pub mod host_lock;
+pub mod owner;
 pub mod process_env;
 pub mod time;
 pub mod wait;
@@ -140,6 +147,15 @@ const DEPS_DIR_NAME: &str = "deps";
 
 /// Command that builds the session worker, quoted in the missing-worker panic.
 const WORKER_BUILD_HINT: &str = "cargo build -p pohunek-session-worker --bin pohunek-sessiond";
+
+/// Environment variable that points tests at an explicit reaper binary.
+const REAPER_OVERRIDE_VAR: &str = "POHUNEK_REAPER_BIN";
+
+/// File name of the test-owner reaper inside the Cargo profile directory.
+const REAPER_FILE_NAME: &str = "pohunek-test-reaper";
+
+/// Command that builds the test-owner reaper, quoted in the missing-reaper error.
+const REAPER_BUILD_HINT: &str = "cargo build -p pohunek-test-support --bin pohunek-test-reaper";
 
 /// Mode of every fixture directory.
 ///
@@ -426,6 +442,80 @@ pub fn worker_binary() -> PathBuf {
         path.display()
     );
     path
+}
+
+/// Returns the path of the `pohunek-test-reaper` helper binary, resolving it
+/// like [`worker_binary`]: `POHUNEK_REAPER_BIN` when set, else the binary
+/// beside the test's Cargo profile directory, so it works in an extracted
+/// nextest archive.
+///
+/// # Panics
+///
+/// Panics when the test executable is not under a profile `deps` directory, or
+/// when the resolved path is not a file; the message names
+/// `cargo build -p pohunek-test-support --bin pohunek-test-reaper`.
+#[must_use]
+pub fn reaper_binary() -> PathBuf {
+    try_reaper_binary().unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// [`reaper_binary`] as an I/O error, so [`owner::OwnerReaper::arm`] can fail
+/// the fixture instead of panicking.
+///
+/// # Errors
+///
+/// Returns a [`std::io::ErrorKind::NotFound`] error naming the build command
+/// when the reaper binary is missing.
+pub(crate) fn try_reaper_binary() -> std::io::Result<PathBuf> {
+    let path = if let Some(path) = std::env::var_os(REAPER_OVERRIDE_VAR) {
+        PathBuf::from(path)
+    } else {
+        let exe = std::env::current_exe().map_err(|error| {
+            std::io::Error::other(format!(
+                "cannot determine the test executable path: {error}"
+            ))
+        })?;
+        match profile_dir_of(&exe) {
+            Ok(profile) => profile.join(REAPER_FILE_NAME),
+            // A doctest executable is not under a profile `deps` directory, so
+            // resolve the helper in the workspace build instead.
+            Err(_) => workspace_build_dir()
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "cannot locate a Cargo profile directory of {exe:?}; set {REAPER_OVERRIDE_VAR} to the reaper binary"
+                    ))
+                })?
+                .join(REAPER_FILE_NAME),
+        }
+    };
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "test-owner reaper {} does not exist; build it with `{REAPER_BUILD_HINT}`",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+/// Returns the build directory of the workspace that holds the reaper binary,
+/// for a caller whose executable is not a Cargo target, such as a doctest.
+fn workspace_build_dir() -> Option<PathBuf> {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let manifest = PathBuf::from(std::env::var_os(MANIFEST_DIR_VAR)?);
+            workspace_root_of(&manifest).map(|root| root.join("target"))
+        })?;
+    for profile in ["debug", "release"] {
+        let dir = target.join(profile);
+        if dir.join(REAPER_FILE_NAME).is_file() {
+            return Some(dir);
+        }
+    }
+    Some(target.join("debug"))
 }
 
 #[cfg(test)]

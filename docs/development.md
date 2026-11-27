@@ -475,6 +475,7 @@ Run the full set before calling anything done:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
+cargo build -p pohunek-test-support --bin pohunek-test-reaper  # TestEnv arms it for every fixture root
 scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features  # the only 16-thread command; never plain cargo tw
 cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
@@ -527,6 +528,17 @@ the wrapper and
 the mount, 16 threads were never measured: do not raise the count on plain
 `TMPDIR`. 16 is sized for that host fixture root; CI shards still run on 4
 vCPUs with their profile defaults.
+
+**One run of a heavy command at a time.** Start a heavy command only when no
+earlier run of the same tests is still live. The wrapper bounds one run (a
+slot, a cgroup `MemoryMax`, a per-run `TMPDIR`), not two: a second full-suite
+run doubles the worker, session and memory load the same host must carry, and a
+hung first run keeps every test daemon and session it started until nextest
+terminates it. Before a retry, check for a live run -- `pgrep -af 'cargo
+nextest run'`, and a slot is free when `flock -n
+"$lock_dir/pohunek-heavy-slot-<n>.lock" true` succeeds -- and read the earlier
+run's result or wait for it to end. A retry started beside a live run is never
+evidence: its result says nothing about a clean host ([issue 2581](https://github.com/zajca/pohunek/issues/2581)).
 
 The wrapper takes no defaults; it reads the required config file
 `${XDG_CONFIG_HOME:-$HOME/.config}/pohunek/heavy-run.conf` with one
@@ -767,10 +779,11 @@ The report (`schema`, `runtime`, `package_digest`, `upstream_version`,
 the suite version of the `compat/matrix.json` this executable was built with
 and the SHA-256 of the three executed images, not strings from the lock.
 
-Prerequisite of the guard scenarios: this build's `pohunekd` and `pohunek-sessiond`
-must exist beside the test profile, as for the other daemon-backed tests
-(`cargo build -p pohunek-daemon --bin pohunekd` and `cargo build -p
-pohunek-session-worker --bin pohunek-sessiond`; CI builds every binary first,
+Prerequisite of the guard scenarios: this build's `pohunekd`, `pohunek-sessiond`
+and `pohunek-test-reaper` must exist beside the test profile, as for the other
+daemon-backed tests (`cargo build -p pohunek-daemon --bin pohunekd`, `cargo
+build -p pohunek-session-worker --bin pohunek-sessiond` and `cargo build -p
+pohunek-test-support --bin pohunek-test-reaper`; CI builds every binary first,
 and the failure message names these commands). They fail rather than skip when
 a binary is missing.
 
