@@ -477,17 +477,9 @@ async fn discover_peers(
         .await
 }
 
-async fn classify(
-    addr: SocketAddr,
-    timeout: Duration,
-    origin: Option<&RequestOrigin>,
-    range: ProtocolVersionRange,
-) -> HostClass {
-    classify_with_reason(addr, timeout, origin, range).await.0
-}
-
-/// [`classify`] together with the bounded `reason` code a refused record is
-/// reported with, when the probe failed in a way the classifier can name.
+/// Classify a probed peer together with the bounded `reason` code a refused
+/// record is reported with, when the probe failed in a way the classifier can
+/// name.
 async fn classify_with_reason(
     addr: SocketAddr,
     timeout: Duration,
@@ -606,6 +598,17 @@ mod tests {
         BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
         OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
+
+    /// Test shortcut for [`classify_with_reason`]: the class without the
+    /// bounded reason code.
+    async fn classify(
+        addr: SocketAddr,
+        timeout: Duration,
+        origin: Option<&RequestOrigin>,
+        range: ProtocolVersionRange,
+    ) -> HostClass {
+        classify_with_reason(addr, timeout, origin, range).await.0
+    }
 
     #[derive(Debug)]
     struct TestTransport {
