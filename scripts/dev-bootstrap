@@ -333,9 +333,11 @@ LAUNCHD_SUITES = word_list(
     file for _, files in LAUNCHD_SUITE_FILES for file in files
 )
 # Both native CI jobs build these before their suites, which spawn them by path.
+# The test-owner reaper is armed by every `TestEnv`, so the native suites need
+# it beside the test profile directory as well.
 NATIVE_BUILD_COMMAND = (
     "cargo build --locked -p pohunek-daemon -p pohunek-session-worker "
-    "-p pohunek-cli --bins"
+    "-p pohunek-cli --bins -p pohunek-test-support --bin pohunek-test-reaper"
 )
 # CI jobs (their `name:` in .github/workflows/ci.yml) that run what a host
 # cannot run locally.

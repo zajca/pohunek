@@ -21,8 +21,9 @@
 //! so a session leader whose working directory lies outside the root (a
 //! session started in its own temporary directory) is still covered. Every
 //! signal is preceded by a start-identity re-check, so a recycled PID is never
-//! signalled, and an implausible root (not absolute, the filesystem root, or
-//! fewer than two components) is refused. A production daemon's workers never
+//! signalled, and an implausible root (not absolute, fewer than two components,
+//! or `/`, `/tmp`, `/var/tmp` or `$HOME` themselves) is refused. A production
+//! daemon's workers never
 //! work under a test root, so the criterion cannot select them.
 //!
 //! On the normal path [`OwnerReaper::drop`] kills the helper before releasing
@@ -149,16 +150,25 @@ impl OwnerReaper {
         // share one.
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&lock_path, &link)?;
-        let mut command = Command::new(crate::try_reaper_binary()?);
-        command
-            .arg(&link)
-            .env_clear()
-            .current_dir("/")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let child = command.spawn()?;
+        let spawn: io::Result<std::process::Child> = (|| {
+            let mut command = Command::new(crate::try_reaper_binary()?);
+            command
+                .arg(&link)
+                .env_clear()
+                .current_dir("/")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            command.spawn()
+        })();
+        let child = match spawn {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&link);
+                return Err(error);
+            }
+        };
         Ok(Self {
             _lock: lock,
             child,
@@ -195,9 +205,10 @@ impl Drop for OwnerReaper {
 /// with `SIGKILL`, rescanning until none is left or [`SWEEP_DEADLINE`] passes.
 ///
 /// Returns how many signals were sent. The root is canonicalized first and
-/// refused when it is not absolute, resolves to the filesystem root, or has
-/// fewer than two path components, so a wrong argument can never select `/`
-/// or a top-level directory. Each signal is preceded by a start-identity
+/// refused when it is not absolute, has fewer than two path components, or is
+/// `/`, `/tmp`, `/var/tmp` or `$HOME` themselves, so a wrong argument can
+/// never select a directory whose death would take unrelated processes down.
+/// Each signal is preceded by a start-identity
 /// re-check of the PID, so a process that reused the PID after the snapshot is
 /// never signalled, and the reaper never signals itself.
 ///
@@ -315,7 +326,15 @@ fn canonical_root(root: &Path) -> io::Result<PathBuf> {
             format!("cannot resolve the sweep root {}: {error}", root.display()),
         )
     })?;
-    if canonical == Path::new("/") || canonical.components().count() < 2 {
+    let mut refused = vec![
+        PathBuf::from("/"),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        refused.push(PathBuf::from(home));
+    }
+    if refused.contains(&canonical) || canonical.components().count() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(

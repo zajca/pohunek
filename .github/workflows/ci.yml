@@ -3648,6 +3648,12 @@ jobs:
           # group-writable framework builds the harness refuses.
           printf 'python=%s\n' "${hermes_bin%/*}/python" >> "$GITHUB_OUTPUT"
 
+      # The hermes harness tests construct a `TestEnv`, which arms the
+      # test-owner reaper; a native nextest run builds no binaries, so build
+      # the reaper before the first test step.
+      - name: Build the test-owner reaper
+        run: cargo build --locked -p pohunek-test-support --bin pohunek-test-reaper
+
       # Every xtask lib test whose name contains `hermes`, one process each.
       # Each run keeps its JUnit report under its own name, because both runs
       # of this job write the macos profile's single report path; that path is

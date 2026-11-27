@@ -34,7 +34,7 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::owner::{
     self, HostInspector, ProcessIdentity, ProcessInspector, StartIdentity,
 };
-use pohunek_test_support::process_env::ProcessEnv;
+use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
 use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 use pohunek_test_support::workers;
 use protocol::{method, SessionNewParams, SessionSecretEnv};
@@ -112,6 +112,7 @@ async fn scenario_child_serving_workers() {
     // One session with a working directory under the root, one outside it: the
     // session leader of the second is still a descendant of its worker.
     let outside = pohunek_test_support::tempdir().expect("session cwd outside the root");
+    report(&format!("outside={}", outside.path().display()));
     let mut client = Client::connect_local(harness.socket())
         .await
         .expect("connect to the daemon");
@@ -146,6 +147,7 @@ async fn scenario_child_serving_workers() {
 /// A report line of the child, parsed: `root=<path>` or `<kind>=<pid>:<start>`.
 struct Report {
     root: PathBuf,
+    outside: Option<PathBuf>,
     processes: Vec<(String, u32, String)>,
 }
 
@@ -183,6 +185,7 @@ fn spawn_scenario_child(extra: &[&str]) -> (Child, Report) {
         }
     });
     let mut root = None;
+    let mut outside = None;
     let mut processes = Vec::new();
     loop {
         let line = rx
@@ -193,6 +196,10 @@ fn spawn_scenario_child(extra: &[&str]) -> (Child, Report) {
         }
         if let Some(path) = line.strip_prefix("root=") {
             root = Some(PathBuf::from(path));
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("outside=") {
+            outside = Some(PathBuf::from(path));
             continue;
         }
         for kind in ["worker", "session"] {
@@ -208,6 +215,7 @@ fn spawn_scenario_child(extra: &[&str]) -> (Child, Report) {
     }
     let report = Report {
         root: root.expect("the child reports its root"),
+        outside,
         processes,
     };
     (child, report)
@@ -262,6 +270,10 @@ fn end_and_assert_reaped(end: impl FnOnce(&mut Child), extra: &[&str]) -> ExitSt
     end(&mut child);
     let status = child.wait().expect("wait for the scenario child");
     assert_root_reaped(&report.root, &report.processes);
+    // The killed child never dropped the outside tempdir; remove it here.
+    if let Some(outside) = &report.outside {
+        let _ = std::fs::remove_dir_all(outside);
+    }
     status
 }
 
@@ -311,6 +323,9 @@ fn an_exiting_scenario_leaves_no_worker_or_session_of_its_root() {
 /// A missing reaper binary fails `TestEnv::new` fast, naming the build command.
 #[test]
 fn a_missing_reaper_binary_fails_testenv_creation_fast() {
+    if !in_own_process() {
+        return;
+    }
     let mut environment = ProcessEnv::lock();
     environment.set("POHUNEK_REAPER_BIN", "/nonexistent/pohunek-test-reaper");
     let error = TestEnv::new().expect_err("a missing reaper binary fails TestEnv::new");
