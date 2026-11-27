@@ -475,18 +475,26 @@ pub(crate) fn try_reaper_binary() -> std::io::Result<PathBuf> {
                 "cannot determine the test executable path: {error}"
             ))
         })?;
-        match profile_dir_of(&exe) {
-            Ok(profile) => profile.join(REAPER_FILE_NAME),
-            // A doctest executable is not under a profile `deps` directory, so
-            // resolve the helper in the workspace build instead.
-            Err(_) => workspace_build_dir()
-                .ok_or_else(|| {
-                    std::io::Error::other(format!(
-                        "cannot locate a Cargo profile directory of {}; set {REAPER_OVERRIDE_VAR} to the reaper binary",
-                        exe.display()
-                    ))
-                })?
-                .join(REAPER_FILE_NAME),
+        if let Ok(profile) = profile_dir_of(&exe) {
+            profile.join(REAPER_FILE_NAME)
+        } else {
+            // An executable copied beside the helper (the release consumer
+            // artifact ships both) resolves it next to itself; a doctest
+            // executable is not under a profile `deps` directory, so resolve
+            // the helper in the workspace build instead.
+            let beside = exe.with_file_name(REAPER_FILE_NAME);
+            if beside.is_file() {
+                beside
+            } else {
+                workspace_build_dir()
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "cannot locate a Cargo profile directory of {}; set {REAPER_OVERRIDE_VAR} to the reaper binary",
+                            exe.display()
+                        ))
+                    })?
+                    .join(REAPER_FILE_NAME)
+            }
         }
     };
     if !path.is_file() {

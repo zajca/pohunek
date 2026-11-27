@@ -1,5 +1,8 @@
 #!/bin/sh
-# Build the release consumer test executable and copy it to <output-dir>.
+# Build the release consumer test executable and copy it to <output-dir>,
+# together with the test-owner reaper the consumer's TestEnv arms (the row
+# jobs run the consumer under `env -i` from a copied path, so the reaper must
+# travel beside it).
 #
 # usage: build-consumer <output-dir>               (run from the repository root)
 #
@@ -27,3 +30,13 @@ esac
 [ -f "$executable" ] || fail "the reported executable does not exist: $executable"
 cp -- "$executable" "$output/release_consumer"
 chmod 0755 "$output/release_consumer"
+
+reaper=$(cargo build --locked --message-format=json -p pohunek-test-support --bin pohunek-test-reaper \
+    | jq -r 'select(.reason == "compiler-artifact" and .target.name == "pohunek-test-reaper" and .executable != null) | .executable' \
+    | tail -n 1)
+case $reaper in
+    '' | *'\n'*) fail "cargo did not report the pohunek-test-reaper executable" ;;
+esac
+[ -f "$reaper" ] || fail "the reported reaper does not exist: $reaper"
+cp -- "$reaper" "$output/pohunek-test-reaper"
+chmod 0755 "$output/pohunek-test-reaper"
