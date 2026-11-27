@@ -13,12 +13,13 @@
 //! - Kitty graphics are compiled out of the library; [`HeadlessTerminal::new`]
 //!   checks the build info and that setting a graphics option is unsupported.
 //! - Every size bound (scrollback, APC, unknown and continuation sequences,
-//!   clipboard transactions) comes from `config/model.toml`.
+//!   clipboard transactions) comes from [`crate::config::HeadlessConfig`].
 //!
 //! Ownership: the terminal handle and its callback state are freed on drop.
-//! Threading: the handle is not thread-safe, so the type is neither `Send` nor
-//! `Sync` (it holds raw pointers). A grid reference is used only inside one
-//! method call, before anything can mutate the terminal.
+//! Threading: the handle is not thread-safe, so the type is `Send` but not
+//! `Sync` (it holds raw pointers; see the `Send` impl below). A grid reference
+//! is used only inside one method call, before anything can mutate the
+//! terminal.
 
 // Rust guideline compliant 2026-06-26
 
@@ -30,7 +31,7 @@
 use std::ffi::{c_int, c_void, CStr};
 use std::ptr;
 
-use crate::config::ModelConfig;
+use crate::config::HeadlessConfig;
 use crate::ffi;
 
 /// A libghostty call failed.
@@ -106,6 +107,16 @@ impl std::fmt::Debug for HeadlessTerminal {
     }
 }
 
+// SAFETY: `HeadlessTerminal` is `Send` but not `Sync`, so at most one thread
+// holds the terminal or a reference to it at any time: every call into the C
+// library happens through `&mut self` or through a `&self` that cannot cross
+// threads without `Sync`. The library is therefore never called concurrently,
+// which is its only threading requirement, and it keeps no thread-local state,
+// so sequential calls from different threads behave like calls from one. The
+// callback state is owned by the terminal and freed in `Drop`, after the last
+// possible callback.
+unsafe impl Send for HeadlessTerminal {}
+
 unsafe extern "C" fn on_clipboard_write(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
@@ -165,7 +176,7 @@ impl HeadlessTerminal {
     ///
     /// Returns a [`GhosttyError`] when libghostty rejects a call, or when the
     /// linked library still has Kitty graphics compiled in.
-    pub fn new(config: &ModelConfig, rows: u16, cols: u16) -> Result<Self, GhosttyError> {
+    pub fn new(config: &HeadlessConfig, rows: u16, cols: u16) -> Result<Self, GhosttyError> {
         let mut graphics = true;
         // SAFETY: the build-info key takes a `bool *`.
         check("build_info", unsafe {
@@ -189,13 +200,13 @@ impl HeadlessTerminal {
         let mut terminal = Self {
             handle,
             state: Box::into_raw(Box::default()),
-            cell_px: config.ghostty_cell_px,
+            cell_px: config.cell_px,
         };
         terminal.configure(config)?;
         Ok(terminal)
     }
 
-    fn configure(&mut self, config: &ModelConfig) -> Result<(), GhosttyError> {
+    fn configure(&mut self, config: &HeadlessConfig) -> Result<(), GhosttyError> {
         // SAFETY: `handle` is live; USERDATA stores the pointer, which stays
         // valid because `state` is freed only after the terminal (see `Drop`).
         check("set userdata", unsafe {
@@ -220,27 +231,27 @@ impl HeadlessTerminal {
         for (option, value, name) in [
             (
                 ffi::OPT_SCROLLBACK_MAX_BYTES,
-                config.ghostty_scrollback_max_bytes,
+                config.scrollback_max_bytes,
                 "set scrollback bytes",
             ),
             (
                 ffi::OPT_APC_MAX_BYTES,
-                config.ghostty_apc_max_bytes,
+                config.apc_max_bytes,
                 "set apc max bytes",
             ),
             (
                 ffi::OPT_UNKNOWN_MAX_BYTES,
-                config.ghostty_unknown_max_bytes,
+                config.unknown_max_bytes,
                 "set unknown max bytes",
             ),
             (
                 ffi::OPT_CONTINUATION_MAX_BYTES,
-                config.ghostty_continuation_max_bytes,
+                config.continuation_max_bytes,
                 "set continuation max bytes",
             ),
             (
                 ffi::OPT_CLIPBOARD_WRITE_MAX_BYTES,
-                config.ghostty_clipboard_write_max_bytes,
+                config.clipboard_write_max_bytes,
                 "set clipboard write max bytes",
             ),
         ] {
@@ -534,11 +545,15 @@ impl HeadlessTerminal {
 
     /// The visible text, without styling.
     ///
+    /// UNWRAP joins soft-wrapped rows into one logical line and TRIM drops the
+    /// trailing spaces of each line, which is what the vt100 backend reports as
+    /// its visible text. History rows the library retained are included.
+    ///
     /// # Errors
     ///
     /// Returns a [`GhosttyError`] when formatting fails.
     pub fn format_plain(&self) -> Result<Vec<u8>, GhosttyError> {
-        self.format(ffi::FORMATTER_FORMAT_PLAIN, 0, None)
+        self.format(ffi::FORMATTER_FORMAT_PLAIN, 0, Some((true, true)))
     }
 
     /// A byte stream that recreates the screen, with cursor, modes, styles,

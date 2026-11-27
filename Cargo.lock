@@ -2039,10 +2039,19 @@ name = "pohunek-terminal"
 version = "0.45.0"
 dependencies = [
  "base64 0.22.1",
+ "pohunek-terminal-ghostty-sys",
+ "pohunek-test-support",
  "serde",
  "unicode-width",
  "vt100",
  "vte",
+]
+
+[[package]]
+name = "pohunek-terminal-ghostty-sys"
+version = "0.45.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]

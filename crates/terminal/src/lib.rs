@@ -1,18 +1,24 @@
 //! Terminal screen modeling shared by the pohunek daemon and CLI.
 //!
-//! Two `vt100`-backed concerns live here so the daemon and CLI share one screen
-//! model instead of drifting copies:
+//! Two concerns live here so the daemon and CLI share one screen model
+//! instead of drifting copies:
 //!
 //! - [`ScreenTracker`] scrapes visible text and agent prompt/rule structure from
 //!   a PTY byte stream; the daemon uses it for activity detection.
 //! - [`Compositor`] shadows raw attach output and temporarily draws the session
 //!   menu without sacrificing native terminal scrollback between menu opens.
+//!
+//! [`TerminalTracker`] runs one of two screen backends (issue #2538): the
+//! pure-Rust `vt100` parser by default, or libghostty-vt through the
+//! `libghostty` feature and `pohunek-terminal-ghostty-sys`.
 
 #![forbid(unsafe_code)]
 
 // Rust guideline compliant 2026-10-03
 
 mod compositor;
+#[cfg(feature = "libghostty")]
+mod ghostty_screen;
 mod links;
 mod menu;
 mod program_status;
@@ -32,5 +38,5 @@ pub use program_status::{
 };
 #[doc(inline)]
 pub use screen::{ScreenObservation, ScreenRegion, ScreenTracker};
-pub use snapshot::{TerminalSnapshot, TerminalTracker};
+pub use snapshot::{ModelKind, TerminalSnapshot, TerminalTracker};
 pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};

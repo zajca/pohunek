@@ -25,6 +25,7 @@ members = [
     "crates/overlay-tailscale",
     "crates/prompt",
     "crates/terminal",
+    "crates/terminal-ghostty-sys",
     "crates/worker-protocol",
     "crates/session-worker",
     "crates/client",
@@ -67,7 +68,11 @@ pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-service-config = { path = "crates/service-config" }
 pohunek-protocol = { path = "crates/protocol" }
-pohunek-terminal = { path = "crates/terminal" }
+# `default-features = false` so consumers forward the `libghostty` feature
+# themselves and one switch controls the product (issue #2538); the default
+# model flips in P3 of that issue.
+pohunek-terminal = { path = "crates/terminal", default-features = false }
+pohunek-terminal-ghostty-sys = { path = "crates/terminal-ghostty-sys", default-features = false }
 pohunek-test-support = { path = "crates/test-support" }
 plugin-kit = { package = "pohunek-plugin-kit", path = "crates/plugin-kit", default-features = false }
 # Dev-dependency only: the persisted-shape guard tests (never a normal dependency).

@@ -130,6 +130,7 @@ name = "pohunek-libghostty-spike"
 version = "0.0.0"
 dependencies = [
  "pohunek-terminal",
+ "pohunek-terminal-ghostty-sys",
  "portable-pty",
  "serde",
  "serde_json",
@@ -143,10 +144,18 @@ name = "pohunek-terminal"
 version = "0.45.0"
 dependencies = [
  "base64",
+ "pohunek-terminal-ghostty-sys",
  "serde",
  "unicode-width",
  "vt100",
  "vte",
+]
+
+[[package]]
+name = "pohunek-terminal-ghostty-sys"
+version = "0.45.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]

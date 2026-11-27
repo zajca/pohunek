@@ -13,6 +13,9 @@ publish = false
 
 [dependencies]
 pohunek-terminal = { path = "../../crates/terminal" }
+# The FFI crate that owns the unsafe libghostty-vt bindings (issue #2538 P2);
+# the spike drives it through pohunek-terminal's `with_model` seam.
+pohunek-terminal-ghostty-sys = { path = "../../crates/terminal-ghostty-sys", optional = true }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,7 +26,7 @@ vt100 = "=0.16.2"
 # Links the prebuilt libghostty-vt static library named by LIBGHOSTTY_VT_DIR
 # (see scripts/build-libghostty-vt). Off by default: no Zig, no C library.
 [features]
-libghostty = []
+libghostty = ["pohunek-terminal/libghostty", "pohunek-terminal-ghostty-sys/libghostty"]
 
 [lints.rust]
 missing_debug_implementations = "warn"

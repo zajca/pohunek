@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "libghostty")]
+use crate::ghostty_screen::GhosttyScreen;
 use crate::links::{screen_links, AnchorLog, Hyperlink, ScreenLink};
 use crate::program_status::{ProbeSpan, PROGRAM_STATUS_COMMAND};
 
@@ -48,9 +50,115 @@ pub struct TerminalSnapshot {
     pub ansi: Vec<u8>,
 }
 
+/// The screen model a [`TerminalTracker`] runs.
+///
+/// Non-exhaustive so a later release can add models without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ModelKind {
+    /// The pure-Rust `vt100` parser, the model Pohunek ships today.
+    Vt100,
+    /// libghostty-vt through `pohunek-terminal-ghostty-sys`, available only
+    /// with the `libghostty` feature.
+    #[cfg(feature = "libghostty")]
+    Libghostty,
+}
+
+/// The screen backend of a tracker: one VT parser per model. The `OscTracker`
+/// is shared and byte-driven, so OSC metadata does not depend on the backend.
+///
+/// The vt100 parser is boxed: it is by far the largest variant, and the tracker
+/// is held in one allocation per session either way.
+enum ScreenBackend {
+    Vt100(Box<vt100::Parser>),
+    #[cfg(feature = "libghostty")]
+    Ghostty(GhosttyScreen),
+}
+
+/// What `TerminalTracker::snapshot` fills a [`TerminalSnapshot`] from.
+pub(crate) struct ScreenState {
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub cursor_visible: bool,
+    pub alternate_screen: bool,
+    pub visible_text: String,
+    /// The backend's own repaint body, without the synchronized-output
+    /// bracket the tracker adds around it.
+    pub repaint: Vec<u8>,
+}
+
+impl ScreenBackend {
+    fn feed(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Vt100(parser) => parser.process(bytes),
+            #[cfg(feature = "libghostty")]
+            Self::Ghostty(screen) => screen.feed(bytes),
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        match self {
+            Self::Vt100(parser) => parser.screen_mut().set_size(rows, cols),
+            #[cfg(feature = "libghostty")]
+            Self::Ghostty(screen) => screen.resize(rows, cols),
+        }
+    }
+
+    fn size(&self) -> (u16, u16) {
+        match self {
+            Self::Vt100(parser) => parser.screen().size(),
+            #[cfg(feature = "libghostty")]
+            Self::Ghostty(screen) => screen.size(),
+        }
+    }
+
+    /// Applies a completed OSC 8 sequence. Only the vt100 backend records
+    /// anchors: the Ghostty backend keeps hyperlink state per cell.
+    fn apply_hyperlink(&mut self, anchors: &mut AnchorLog, hyperlink: Hyperlink) {
+        match self {
+            Self::Vt100(parser) => anchors.apply(parser.screen(), hyperlink),
+            #[cfg(feature = "libghostty")]
+            Self::Ghostty(_) => {}
+        }
+    }
+
+    fn state(&self) -> ScreenState {
+        match self {
+            Self::Vt100(parser) => {
+                let screen = parser.screen();
+                let (rows, cols) = screen.size();
+                let (cursor_row, cursor_col) = screen.cursor_position();
+                let alternate_screen = screen.alternate_screen();
+                let mut repaint = Vec::new();
+                if alternate_screen {
+                    repaint.extend_from_slice(b"\x1b[?1049h");
+                }
+                repaint.extend_from_slice(b"\x1b[2J\x1b[H");
+                repaint.extend_from_slice(&screen.input_mode_formatted());
+                repaint.extend_from_slice(&screen.contents_formatted());
+                repaint.extend_from_slice(&screen.cursor_state_formatted());
+                ScreenState {
+                    rows,
+                    cols,
+                    cursor_row,
+                    cursor_col,
+                    cursor_visible: !screen.hide_cursor(),
+                    alternate_screen,
+                    visible_text: screen.contents(),
+                    repaint,
+                }
+            }
+            #[cfg(feature = "libghostty")]
+            Self::Ghostty(screen) => screen.state(),
+        }
+    }
+}
+
 /// Tracks one provider-independent VT screen and bounded OSC metadata.
 pub struct TerminalTracker {
-    parser: vt100::Parser,
+    backend: ScreenBackend,
     osc: OscTracker,
     anchors: AnchorLog,
 }
@@ -58,7 +166,7 @@ pub struct TerminalTracker {
 impl std::fmt::Debug for TerminalTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalTracker")
-            .field("size", &self.parser.screen().size())
+            .field("size", &self.backend.size())
             .field("osc", &self.osc)
             .field("anchors", &self.anchors)
             .finish()
@@ -66,31 +174,60 @@ impl std::fmt::Debug for TerminalTracker {
 }
 
 impl TerminalTracker {
-    /// Creates an empty tracker with the initial terminal dimensions.
+    /// Creates an empty tracker with the initial terminal dimensions, running
+    /// the default model of this build: libghostty when the `libghostty`
+    /// feature is on, vt100 otherwise.
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
+        #[cfg(feature = "libghostty")]
+        let model = ModelKind::Libghostty;
+        #[cfg(not(feature = "libghostty"))]
+        let model = ModelKind::Vt100;
+        Self::with_model(model, rows, cols)
+    }
+
+    /// Creates an empty tracker that runs `model` explicitly, so one build can
+    /// drive or compare both screen models.
+    #[must_use]
+    pub fn with_model(model: ModelKind, rows: u16, cols: u16) -> Self {
+        let backend = match model {
+            ModelKind::Vt100 => ScreenBackend::Vt100(Box::new(vt100::Parser::new(rows, cols, 0))),
+            #[cfg(feature = "libghostty")]
+            ModelKind::Libghostty => ScreenBackend::Ghostty(GhosttyScreen::new(rows, cols)),
+        };
         Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            backend,
             osc: OscTracker::new(),
             anchors: AnchorLog::default(),
         }
     }
 
+    /// The screen model this tracker runs.
+    #[must_use]
+    pub fn model(&self) -> ModelKind {
+        match &self.backend {
+            ScreenBackend::Vt100(_) => ModelKind::Vt100,
+            #[cfg(feature = "libghostty")]
+            ScreenBackend::Ghostty(_) => ModelKind::Libghostty,
+        }
+    }
+
     /// Applies the next ordered PTY output bytes.
     ///
-    /// The VT parser is advanced up to the end of each OSC 8 sequence and of
-    /// each buffer-switch sequence before it is applied, so an anchor records
-    /// the cursor cell the hyperlink takes effect at, and a buffer switch drops
-    /// the anchors wherever the output is split into chunks.
+    /// The screen backend is advanced up to the end of each OSC 8 sequence and
+    /// of each buffer-switch sequence before it is applied, so an anchor
+    /// records the cursor cell the hyperlink takes effect at, and a buffer
+    /// switch drops the anchors wherever the output is split into chunks. The
+    /// Ghostty backend keeps OSC 8 state per cell and needs no anchor.
     pub fn feed(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         while !rest.is_empty() {
             let (used, event) = self.osc.feed_until_event(rest);
-            self.parser.process(&rest[..used]);
+            self.backend.feed(&rest[..used]);
             rest = &rest[used..];
             match event {
                 Some(TrackerEvent::Hyperlink(hyperlink)) => {
-                    self.anchors.apply(self.parser.screen(), hyperlink);
+                    self.backend.apply_hyperlink(&mut self.anchors, hyperlink);
                 }
                 Some(TrackerEvent::BufferSwitch) => self.anchors.clear(),
                 None => {}
@@ -107,7 +244,13 @@ impl TerminalTracker {
     /// hyperlink state. Nothing is restored when the buffer is switched back.
     #[must_use]
     pub fn links(&self, max_url_bytes: usize) -> Vec<ScreenLink> {
-        screen_links(self.parser.screen(), &self.anchors, max_url_bytes)
+        match &self.backend {
+            ScreenBackend::Vt100(parser) => {
+                screen_links(parser.screen(), &self.anchors, max_url_bytes)
+            }
+            #[cfg(feature = "libghostty")]
+            ScreenBackend::Ghostty(screen) => screen.links(max_url_bytes),
+        }
     }
 
     /// Takes the OSC 7501 probes completed since the previous call.
@@ -119,28 +262,19 @@ impl TerminalTracker {
 
     /// Updates the modeled terminal dimensions.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
+        self.backend.resize(rows, cols);
         self.anchors.clear();
     }
 
     /// Captures a complete state and ANSI repaint at `watermark`.
     #[must_use]
     pub fn snapshot(&self, watermark: u64) -> TerminalSnapshot {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let alternate_screen = screen.alternate_screen();
+        let state = self.backend.state();
         let mut ansi = Vec::new();
         // One bracket spans the whole repaint, so a terminal that implements
         // mode 2026 draws it as one frame however the bytes are chunked.
         ansi.extend_from_slice(SYNC_BEGIN);
-        if alternate_screen {
-            ansi.extend_from_slice(b"\x1b[?1049h");
-        }
-        ansi.extend_from_slice(b"\x1b[2J\x1b[H");
-        ansi.extend_from_slice(&screen.input_mode_formatted());
-        ansi.extend_from_slice(&screen.contents_formatted());
-        ansi.extend_from_slice(&screen.cursor_state_formatted());
+        ansi.extend_from_slice(&state.repaint);
         // A program that set mode 2026 keeps it: the bracket's begin already
         // left it set, and a reset here would end the program's own frame.
         if !self.osc.synchronized_output {
@@ -149,15 +283,15 @@ impl TerminalTracker {
 
         TerminalSnapshot {
             watermark,
-            rows,
-            cols,
-            cursor_row,
-            cursor_col,
-            cursor_visible: !screen.hide_cursor(),
-            alternate_screen,
+            rows: state.rows,
+            cols: state.cols,
+            cursor_row: state.cursor_row,
+            cursor_col: state.cursor_col,
+            cursor_visible: state.cursor_visible,
+            alternate_screen: state.alternate_screen,
             title: self.osc.title.clone(),
             progress: self.osc.progress.clone(),
-            visible_text: screen.contents(),
+            visible_text: state.visible_text,
             ansi,
         }
     }
@@ -406,11 +540,14 @@ enum OscState {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalTracker;
+    use super::{ModelKind, TerminalTracker};
 
     #[test]
     fn fragmented_vt_and_osc_sequences_produce_complete_snapshot() {
-        let mut tracker = TerminalTracker::new(3, 20);
+        // The vt100 model is selected explicitly: with the `libghostty`
+        // feature `new` runs the libghostty backend, whose repaint bytes
+        // differ.
+        let mut tracker = TerminalTracker::with_model(ModelKind::Vt100, 3, 20);
         tracker.feed(b"\x1b]2;build");
         tracker.feed(b"ing\x07\x1b[2;4Hok");
 
@@ -425,7 +562,7 @@ mod tests {
 
     #[test]
     fn oversized_osc_is_discarded_and_parser_recovers() {
-        let mut tracker = TerminalTracker::new(2, 10);
+        let mut tracker = TerminalTracker::with_model(ModelKind::Vt100, 2, 10);
         let oversized = vec![b'x'; super::MAX_OSC_BYTES + 1];
         tracker.feed(b"\x1b]2;");
         tracker.feed(&oversized);

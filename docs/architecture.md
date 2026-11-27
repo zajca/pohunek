@@ -1055,6 +1055,13 @@ onto both the Unix socket and the overlay TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
 
+The repaint is produced by the worker's screen model, `TerminalTracker` in
+`crates/terminal`: the vt100 parser by default, or libghostty-vt through
+`crates/terminal-ghostty-sys` when the product is built with the `libghostty`
+cargo feature (issue #2538). OSC metadata (title, progress, OSC 7501 probes) is
+tracked from the raw PTY bytes on both models, so the attach contract above
+does not depend on the screen model.
+
 While a worker answers every 7501 probe of its session's own runtime, it is the
 only responder for its PTY: it drops every complete `ESC ] 7501 ; ? ... (BEL | ESC \)` reply found inside one
 attach input frame, keeping the rest of the frame in order. A reply split across

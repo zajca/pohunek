@@ -16,6 +16,9 @@ path = "src/main.rs"
 # server, so the readiness-deadline hold travels in `SessionRegistryConfig`
 # instead of a registry method.
 test-util = []
+# The libghostty-vt screen model of the worker terminal snapshot (issue
+# #2538); forwarded so one feature switch controls the whole product.
+libghostty = ["pohunek-terminal/libghostty"]
 
 [dependencies]
 base64 = { workspace = true }
@@ -31,7 +34,7 @@ overlay = { workspace = true }
 pohunek-package = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-service-config = { workspace = true }
-pohunek-terminal = { workspace = true }
+pohunek-terminal = { workspace = true, default-features = false }
 pohunek-client = { workspace = true }
 pohunek-worker-protocol = { workspace = true }
 # Reads the liveness facts of a worker journal an older release wrote, so

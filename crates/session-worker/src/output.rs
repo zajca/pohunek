@@ -1158,11 +1158,19 @@ mod tests {
         assert_eq!(snapshot.terminal().cols, 60);
         assert!(snapshot.terminal().visible_text.contains("final-size"));
         assert!(!snapshot.terminal().visible_text.contains("first-size"));
-        assert!(matches!(
-            subscriber.recv().await,
-            Some(OutputEvent::Output(chunk))
-                if chunk.offset == watermark && &*chunk.bytes == b"-live"
-        ));
+        // The repaint may span several snapshot chunks (its length is
+        // screen-model specific, issue #2538); the live output follows it.
+        loop {
+            match subscriber.recv().await {
+                Some(OutputEvent::Output(chunk)) => {
+                    assert_eq!(chunk.offset, watermark);
+                    assert_eq!(&*chunk.bytes, b"-live");
+                    break;
+                }
+                Some(OutputEvent::TerminalSnapshot(_)) => {}
+                other => panic!("expected repaint chunks then the live output, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1200,7 +1208,11 @@ mod tests {
         assert_eq!(missing, 0..hub.next_offset());
         assert_eq!(terminal.watermark, hub.next_offset());
         assert!(terminal.visible_text.contains("counter:0042-after-outage"));
-        assert!(terminal.ansi.starts_with(b"\x1b[?2026h\x1b[2J\x1b[H"));
+        // The repaint opens and closes the synchronized-output bracket on both
+        // screen models (issue #2538); its body is model-specific, so the
+        // vt100 shape is pinned in pohunek-terminal's own tests.
+        assert!(terminal.ansi.starts_with(b"\x1b[?2026h"));
+        assert!(terminal.ansi.ends_with(b"\x1b[?2026l"));
 
         let expected_ansi = terminal.ansi;
         let mut subscriber = hub.subscribe(Some(0)).expect("gap subscribe");

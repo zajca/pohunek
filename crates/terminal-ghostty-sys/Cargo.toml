@@ -1,0 +1,33 @@
+[package]
+name = "pohunek-terminal-ghostty-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Safe Rust bindings to the pinned libghostty-vt static library (issue #2538); the only crate that touches its C ABI."
+
+[features]
+# Links the prebuilt libghostty-vt static library named by LIBGHOSTTY_VT_DIR
+# (the output of scripts/build-libghostty-vt). Off by default: no Zig and no
+# C library are needed to build this crate or anything that does not enable it.
+default = []
+libghostty = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+# This crate owns the unsafe FFI, so it declares its own lint table instead of
+# the workspace one (which has no `unsafe_code` entry): `unsafe_code` is denied
+# crate-wide and allowed again, with a reason, only in the `ffi` and `ghostty`
+# modules that were moved from the spike. `pohunek-terminal` keeps
+# `#![forbid(unsafe_code)]`.
+[lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+undocumented_unsafe_blocks = "warn"

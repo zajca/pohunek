@@ -175,11 +175,18 @@ impl Hyperlink {
             return None;
         }
         let uri = std::str::from_utf8(uri).ok()?;
-        if uri.chars().any(is_unsafe_char) {
+        if !valid_uri(uri) {
             return None;
         }
         Some(Self::Open(uri.to_owned()))
     }
+}
+
+/// Whether `uri` is a URL this crate reports: short enough and free of control
+/// or format characters. A URI is rejected rather than cleaned, because
+/// removing such a character can build a URL the sender never wrote.
+pub(crate) fn valid_uri(uri: &str) -> bool {
+    uri.len() <= MAX_LINK_URL_BYTES && !uri.chars().any(is_unsafe_char)
 }
 
 /// Bounded record of the OSC 8 anchors seen on one terminal.
@@ -297,12 +304,40 @@ pub(crate) fn screen_links(
     anchors: &AnchorLog,
     max_url_bytes: usize,
 ) -> Vec<ScreenLink> {
+    let (rows, cols) = screen.size();
+    let wrapped: Vec<bool> = (0..rows).map(|row| screen.row_wrapped(row)).collect();
+    let text = text_links(
+        rows,
+        cols,
+        &wrapped,
+        &|row, col| {
+            let cell = screen.cell(row, col)?;
+            if cell.is_wide_continuation() {
+                None
+            } else if cell.has_contents() {
+                Some(cell.contents().to_owned())
+            } else {
+                Some(" ".to_owned())
+            }
+        },
+        max_url_bytes,
+    );
+    combine_links(anchors.live(screen), text, max_url_bytes)
+}
+
+/// Joins OSC 8 anchors and plain-text matches into the reported link list.
+///
+/// The URL cap applies before the dedupe and the count cap, so a URL that is
+/// too long for the caller neither hides a text match nor takes a slot.
+pub(crate) fn combine_links(
+    osc8: Vec<ScreenLink>,
+    text: Vec<ScreenLink>,
+    max_url_bytes: usize,
+) -> Vec<ScreenLink> {
     let max_url_bytes = max_url_bytes.min(MAX_LINK_URL_BYTES);
-    let mut links = anchors.live(screen);
-    // The URL cap applies before the dedupe and the count cap, so a URL that
-    // is too long for the caller neither hides a text match nor takes a slot.
+    let mut links = osc8;
     links.retain(|link| link.url.len() <= max_url_bytes);
-    for link in text_links(screen, max_url_bytes) {
+    for link in text {
         if !links
             .iter()
             .any(|known| (known.row, known.col) == (link.row, link.col))
@@ -316,37 +351,35 @@ pub(crate) fn screen_links(
 }
 
 /// One cell of a logical line: its text and screen position.
-struct Glyph {
-    text: String,
-    row: u16,
-    col: u16,
+pub(crate) struct Glyph {
+    pub text: String,
+    pub row: u16,
+    pub col: u16,
 }
 
-/// Matches `http(s)` URLs in the rows of `screen`.
+/// Matches `http(s)` URLs in the screen's logical lines.
 ///
-/// Rows joined by soft wrapping form one logical line, so a URL that wraps at
-/// the right margin is matched whole. A hard line break ends a URL.
-fn text_links(screen: &vt100::Screen, max_url_bytes: usize) -> Vec<ScreenLink> {
-    let (rows, cols) = screen.size();
+/// `wrapped` says per row whether it soft-wraps into the next one, so a URL
+/// that wraps at the right margin is matched whole; a hard line break ends a
+/// URL. `cell` returns the text of one cell, or `None` to skip it (a wide-cell
+/// continuation); an empty cell is reported as a single space.
+pub(crate) fn text_links(
+    rows: u16,
+    cols: u16,
+    wrapped: &[bool],
+    cell: &dyn Fn(u16, u16) -> Option<String>,
+    max_url_bytes: usize,
+) -> Vec<ScreenLink> {
     let mut links = Vec::new();
     let mut candidates = MAX_TEXT_CANDIDATES;
     let mut line: Vec<Glyph> = Vec::new();
     for row in 0..rows {
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                continue;
+            if let Some(text) = cell(row, col) {
+                line.push(Glyph { text, row, col });
             }
-            let text = if cell.has_contents() {
-                cell.contents().to_owned()
-            } else {
-                " ".to_owned()
-            };
-            line.push(Glyph { text, row, col });
         }
-        if !screen.row_wrapped(row) {
+        if !wrapped[usize::from(row)] {
             match_line(&line, max_url_bytes, &mut candidates, &mut links);
             line.clear();
             if links.len() >= MAX_SCREEN_LINKS || candidates == 0 {

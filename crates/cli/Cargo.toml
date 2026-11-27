@@ -22,6 +22,9 @@ embed-agent-skill = ["pohunek-knowledge/agent-skill"]
 # Test-only seams of the `pohunek service` engine (M-TEST-UTIL); never enabled
 # by a release build.
 test-util = []
+# The libghostty-vt screen model of the worker terminal snapshot (issue
+# #2538); forwarded so one feature switch controls the whole product.
+libghostty = ["pohunek-terminal/libghostty"]
 
 [dependencies]
 reqwest.workspace = true
@@ -40,7 +43,7 @@ pohunek-session-worker = { workspace = true }
 pohunek-worker-protocol = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
-pohunek-terminal = { workspace = true }
+pohunek-terminal = { workspace = true, default-features = false }
 pohunek-assistant = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
