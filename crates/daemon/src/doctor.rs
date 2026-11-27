@@ -186,8 +186,9 @@ fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
     }
 }
 
-/// The version probes of one doctor run: when the first could start, which
-/// bounds the budget they share, and the clock their deadlines are read from.
+/// The version probes of one doctor run: the entry the budget they share is
+/// measured from, that budget, and the clock both the entry and every deadline
+/// are read from.
 #[derive(Clone, Copy)]
 struct DoctorProbes<'a> {
     started: Instant,
@@ -209,7 +210,10 @@ fn profile_checks(
     let mut checks = embedded_manifest_checks();
     checks.extend(manifest_override_checks(profiles));
     let probes = DoctorProbes {
-        started: Instant::now(),
+        // The entry is read from the same clock the probes are, so a scenario
+        // clock bounds the aggregate budget in virtual time and no real-time
+        // read can race the host.
+        started: clock.now(),
         budget,
         clock,
         search_path,
@@ -709,7 +713,9 @@ fn profile_runtime_check(
         );
     }
     let probe_timeout = if agent.definition.version_probe_parser().is_some() {
-        probes.budget.saturating_sub(probes.started.elapsed())
+        probes
+            .budget
+            .saturating_sub(probes.clock.now().saturating_duration_since(probes.started))
     } else {
         Duration::ZERO
     };
