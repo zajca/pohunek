@@ -65,6 +65,13 @@ fi
 consumer_copy=$RUNNER_TEMP/smoke-consumer
 cp -- "$CONSUMER" "$consumer_copy"
 chmod 0755 "$consumer_copy"
+# The consumer's TestEnv arms the test-owner reaper and resolves it beside the
+# test executable, so the reaper travels with the consumer copy.
+reaper_beside_consumer="$(dirname -- "$CONSUMER")/pohunek-test-reaper"
+if [ -f "$reaper_beside_consumer" ]; then
+    cp -- "$reaper_beside_consumer" "$RUNNER_TEMP/pohunek-test-reaper"
+    chmod 0755 "$RUNNER_TEMP/pohunek-test-reaper"
+fi
 
 if [ "$(uname -s)" = Darwin ]; then
     /usr/bin/sudo -n true || fail "the macOS smoke needs passwordless sudo (CI runner only)"
