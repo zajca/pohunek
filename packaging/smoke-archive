@@ -459,13 +459,9 @@ inner_main() {
         root=$inputs/root
         /bin/cp "$consumer" "$inputs/consumer" || fail "cannot copy consumer to inputs"
         /bin/chmod 0755 "$inputs/consumer" || fail "cannot chmod consumer in inputs"
-        # The consumer's TestEnv arms the test-owner reaper and resolves it
-        # beside the test executable, so the reaper travels with the consumer.
-        reaper_beside="$(dirname -- "$consumer")/pohunek-test-reaper"
-        if [ -f "$reaper_beside" ]; then
-            /bin/cp "$reaper_beside" "$inputs/pohunek-test-reaper" || fail "cannot copy reaper to inputs"
-            /bin/chmod 0755 "$inputs/pohunek-test-reaper" || fail "cannot chmod reaper in inputs"
-        fi
+        # The reaper travels with the consumer into the sandbox inputs.
+        /bin/cp "$reaper" "$inputs/pohunek-test-reaper" || fail "cannot copy reaper to inputs"
+        /bin/chmod 0755 "$inputs/pohunek-test-reaper" || fail "cannot chmod reaper in inputs"
         consumer=$inputs/consumer
         mkdir "$inputs/node-bin" || fail "cannot create node-bin in inputs"
         /bin/cp "$node_dir/node" "$inputs/node-bin/node" || fail "cannot copy node to inputs"
@@ -722,6 +718,11 @@ fi
 archive=$(cd "$(dirname -- "$archive")" && pwd -P)/$(basename -- "$archive")
 stage=$(cd "$stage" && pwd -P)
 consumer=$(cd "$(dirname -- "$consumer")" && pwd -P)/$(basename -- "$consumer")
+# The consumer's TestEnv arms the test-owner reaper and resolves it beside the
+# test executable. Resolve it beside the original --consumer input now, before
+# any copy reassigns $consumer, and fail loudly when it is missing.
+reaper=$(dirname -- "$consumer")/pohunek-test-reaper
+[ -f "$reaper" ] || fail "the test-owner reaper is not beside the consumer: $reaper"
 self=$(cd "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
 checkout=$(cd "$(dirname -- "$self")/.." && pwd -P)
 
@@ -972,13 +973,10 @@ expected_binary_sha() {
 # --- namespace ---------------------------------------------------------------
 cp -- "$consumer" "$work/consumer"
 chmod 755 "$work/consumer"
-# The consumer's TestEnv arms the test-owner reaper and resolves it beside the
-# test executable, so the reaper travels with every consumer copy.
-reaper_beside="$(dirname -- "$consumer")/pohunek-test-reaper"
-if [ -f "$reaper_beside" ]; then
-    cp -- "$reaper_beside" "$work/pohunek-test-reaper"
-    chmod 755 "$work/pohunek-test-reaper"
-fi
+# The reaper resolved beside the original consumer travels beside $work/consumer,
+# which is the executable the userns and sudo legs run.
+cp -- "$reaper" "$work/pohunek-test-reaper"
+chmod 755 "$work/pohunek-test-reaper"
 node_bin=$(command -v node) || fail "node is required on PATH (the upstreams are node programs)"
 node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
 if [ "$(uname -s)" = Linux ]; then

@@ -444,16 +444,18 @@ pub fn worker_binary() -> PathBuf {
     path
 }
 
-/// Returns the path of the `pohunek-test-reaper` helper binary, resolving it
-/// like [`worker_binary`]: `POHUNEK_REAPER_BIN` when set, else the binary
-/// beside the test's Cargo profile directory, so it works in an extracted
-/// nextest archive.
+/// Returns the path of the `pohunek-test-reaper` helper binary, resolved in
+/// order: `POHUNEK_REAPER_BIN` when set; else the binary beside the test's
+/// Cargo profile directory, so it works in an extracted nextest archive; else
+/// the binary beside the test executable itself, which is how the release
+/// consumer artifact ships it next to a copied test binary; else the workspace
+/// build directory, which covers doctest executables that are not under a
+/// profile `deps` directory.
 ///
 /// # Panics
 ///
-/// Panics when the test executable is not under a profile `deps` directory, or
-/// when the resolved path is not a file; the message names
-/// `cargo build -p pohunek-test-support --bin pohunek-test-reaper`.
+/// Panics when no lookup locates the binary or the resolved path is not a file;
+/// the message names `cargo build -p pohunek-test-support --bin pohunek-test-reaper`.
 #[must_use]
 pub fn reaper_binary() -> PathBuf {
     try_reaper_binary().unwrap_or_else(|error| panic!("{error}"))

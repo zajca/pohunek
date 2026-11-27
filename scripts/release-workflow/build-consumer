@@ -32,10 +32,10 @@ cp -- "$executable" "$output/release_consumer"
 chmod 0755 "$output/release_consumer"
 
 reaper=$(cargo build --locked --message-format=json -p pohunek-test-support --bin pohunek-test-reaper \
-    | jq -r 'select(.reason == "compiler-artifact" and .target.name == "pohunek-test-reaper" and .executable != null) | .executable' \
-    | tail -n 1)
+    | jq -r 'select(.reason == "compiler-artifact" and .target.name == "pohunek-test-reaper" and .executable != null) | .executable')
 case $reaper in
-    '' | *'\n'*) fail "cargo did not report the pohunek-test-reaper executable" ;;
+    '' | *'
+'*) fail "cargo did not report exactly one pohunek-test-reaper executable" ;;
 esac
 [ -f "$reaper" ] || fail "the reported reaper does not exist: $reaper"
 cp -- "$reaper" "$output/pohunek-test-reaper"

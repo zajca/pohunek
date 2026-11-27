@@ -234,6 +234,8 @@ class RowFixture:
             tool.chmod(0o755)
         self.tools = tools
         self.consumer_path = directory / "release_consumer"
+        # run-row requires the test-owner reaper beside the consumer.
+        (directory / "pohunek-test-reaper").write_text("#!/bin/sh\n")
         self.out_dir = directory / "row"
         # The fresh, owner-only root run-rows hands to each row.
         self.row_root = directory / "root"
@@ -425,6 +427,8 @@ class RowsFixture:
         mktemp.write_text(f'#!/bin/sh\n[ ! -e {self.no_mktemp} ] || exit 1\nexec /usr/bin/mktemp "$@"\n')
         mktemp.chmod(0o755)
         self.consumer_path = directory / "release_consumer"
+        # run-row requires the test-owner reaper beside the consumer.
+        (directory / "pohunek-test-reaper").write_text("#!/bin/sh\n")
         self.out_dir = directory / "rows"
         self.log = directory / "log"
         self.log.mkdir()

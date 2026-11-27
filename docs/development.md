@@ -845,13 +845,20 @@ release assemble` serves every official runtime with no network and no source
 tree. It runs the prebuilt consumer executable in smoke mode, once per runtime:
 
 ```sh
-cargo test --no-run -p pohunek-cli --test release_consumer   # prints the executable path
+scripts/release-workflow/build-consumer "$RUNNER_TEMP/consumer"   # consumer + reaper
 packaging/smoke-archive \
   --archive <bundle>/pohunek-daemon-<v>-<target>.tar.gz \
   --stage <stage-dir> \
-  --consumer <release_consumer-executable> \
+  --consumer "$RUNNER_TEMP/consumer/release_consumer" \
   [--runtime <id>]... [--isolation auto|userns|sudo|sandbox]
 ```
+
+The consumer's `TestEnv` arms the test-owner reaper and resolves it beside the
+test executable, so `pohunek-test-reaper` must sit beside the `--consumer`
+executable (`build-consumer` copies it there); `smoke-archive` fails when it is
+missing and carries it beside every consumer copy (`$work/consumer` and, in the
+sandbox leg, `$inputs/consumer`). A bare `cargo test --no-run` path does not
+work: the reaper is not next to that executable.
 
 `<stage-dir>/<runtime>/` is the staged upstream of each runtime: an npm prefix
 with `bin/<binary>` and a `STAGE.sha256` digest list. The runtime set is data:
