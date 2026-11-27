@@ -387,6 +387,23 @@ impl BindDir {
         }
     }
 
+    /// Whether a profile file exists under `name` even when `name` itself
+    /// fails [`validate_name`] (for example over the byte cap): a file that is
+    /// on disk must not read as absent.
+    ///
+    /// The probe only joins a single normal path component, so it stays inside
+    /// the agents directory for any `name`.
+    pub(crate) fn file_exists_unvalidated(&self, name: &str) -> bool {
+        let mut components = std::path::Path::new(name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return false;
+        }
+        std::fs::symlink_metadata(self.root.join(profile_file_name(name)))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+    }
+
     /// Reads the profile `name` through the daemon's shared acceptance rule.
     ///
     /// A symbolic link or a hard-linked file is refused, because the rewrite

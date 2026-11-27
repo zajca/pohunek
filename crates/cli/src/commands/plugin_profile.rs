@@ -350,6 +350,11 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 pub(super) fn parse_profile_name(value: &str) -> Result<String, String> {
     if is_valid_profile_name(value) {
         Ok(value.to_owned())
+    } else if value.len() > MAX_CONFIG_NAME_BYTES {
+        Err(format!(
+            "profile names are at most {MAX_CONFIG_NAME_BYTES} bytes ({} given)",
+            value.len()
+        ))
     } else {
         Err(
             "expected letters, digits, `.`, `_` and `-`, with no leading `.` or `-` and no `..`"

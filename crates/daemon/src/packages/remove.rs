@@ -59,14 +59,19 @@ fn remove_profile(
     params: &PackageRemoveProfileParams,
 ) -> Result<PackageRemoveProfileResult, PackageErrorKind> {
     let name = params.profile.as_str();
-    if validate_name("agent", name).is_err() {
-        return Err(PackageErrorKind::ProfileNotFound);
-    }
     let dir = match profiles.open_for_bind() {
         Ok(dir) => dir,
         Err(BindError::NotFound) => return Err(no_profile_file(profiles, name)),
         Err(error) => return Err(bind_kind(name, error).kind()),
     };
+    if validate_name("agent", name).is_err() {
+        // A file that is on disk under a name the daemon refuses must not
+        // read as absent: answer the typed invalid_name error.
+        if dir.file_exists_unvalidated(name) {
+            return Err(PackageErrorKind::ProfileNameInvalid);
+        }
+        return Err(no_profile_file(profiles, name));
+    }
     let file = match dir.read(name) {
         Ok(file) => file,
         Err(BindError::NotFound) => return Err(no_profile_file(profiles, name)),

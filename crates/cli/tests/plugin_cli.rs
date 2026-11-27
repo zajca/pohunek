@@ -1524,15 +1524,16 @@ fn a_profile_name_over_the_shared_cap_is_refused_identically_by_cli_and_daemon()
         .expect("the valid profile is listed normally");
     assert_ne!(work["state"], "unreadable", "{document}");
 
-    // A subcommand naming it is refused at parse time, before any daemon IO —
-    // the same refusal the daemon's own load gives (invalid_name, covered by
-    // the daemon's bad_names test over the same protocol constant).
+    // A subcommand naming it is refused at parse time with a message that
+    // names the shared 128-byte limit, before any daemon IO — the same
+    // refusal the daemon's own load and remove give (invalid_name, covered
+    // by the daemon tests over the same protocol constant).
     let output = fixture.run(&["plugin", "profile", "rm", &long_name]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    let stderr = stderr_text(&output);
     assert!(
-        stderr_text(&output).contains("expected letters, digits"),
-        "{}",
-        stderr_text(&output)
+        stderr.contains("at most 128 bytes"),
+        "the parse refusal names the byte limit: {stderr}"
     );
 
     drop(daemon.finish());

@@ -991,6 +991,11 @@ pub enum PackageErrorKind {
     ReloadFailed,
     /// The host has no agent profile of the requested name.
     ProfileNotFound,
+    /// The profile name fails the daemon's name rule (a single segment of at
+    /// most 128 bytes), so a file stored under that name exists but cannot be
+    /// loaded or removed. The name is never echoed. Answers the shared
+    /// `invalid_name` wire code.
+    ProfileNameInvalid,
     /// The profile cannot be rewritten: it fails the daemon's profile
     /// acceptance rule, is a symbolic or hard link, or is not valid TOML.
     ProfileUnusable,
@@ -1095,6 +1100,7 @@ impl PackageErrorKind {
             Self::LimitReached => "package_limit_reached",
             Self::ReloadFailed => "package_reload_failed",
             Self::ProfileNotFound => "package_profile_not_found",
+            Self::ProfileNameInvalid => "invalid_name",
             Self::ProfileUnusable => "package_profile_unusable",
             Self::ProfileBaseBuiltin => "package_profile_base_builtin",
             Self::ProfileTargetInvalid => "package_profile_target_invalid",
@@ -1163,6 +1169,9 @@ impl PackageErrorKind {
                 "the change was committed but the runtime registry was not rebuilt"
             }
             Self::ProfileNotFound => "the host has no agent profile of that name",
+            Self::ProfileNameInvalid => {
+                "the profile name is not a single segment of at most 128 bytes, so the file stored under it exists but cannot be loaded or removed"
+            }
             Self::ProfileUnusable => {
                 "the agent profile cannot be rewritten: it fails the profile acceptance rule or is not valid TOML"
             }
@@ -1264,6 +1273,9 @@ impl PackageErrorKind {
             Self::LimitReached => "uninstall packages that are no longer needed",
             Self::ReloadFailed => "run the package doctor, then retry or restart the daemon",
             Self::ProfileNotFound => "list the profiles with `pohunek plugin profile list`",
+            Self::ProfileNameInvalid => {
+                "rename the profile file to a valid name of at most 128 bytes, then retry"
+            }
             Self::ProfileUnusable => {
                 "make the profile a regular owner-private TOML file with a valid base, then retry"
             }
