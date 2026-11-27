@@ -2,7 +2,7 @@
 //!
 //! A real `pohunek-sessiond` runs with the variables systemd and launchd give a
 //! supervised job plus an unrelated variable, and a real PTY child prints its
-//! environment. Protocol version seven must hand the child exactly the base
+//! environment. The worker must hand the child exactly the base
 //! environment, the worker's `TERM`, the profile, and the worker's reserved
 //! `POHUNEK_*` values. A profile value overrides the base one, while a profile
 //! can neither shadow a reserved value nor pass a service-manager variable. The
@@ -1215,11 +1215,11 @@ async fn worker_socket_rejects_a_protocol_range_above_its_window() {
     assert_disjoint_range_rejected(above).await;
 }
 
-/// A daemon that only speaks protocol 6, the version that left the window, is
+/// A daemon that only speaks protocol 7, the version that left the window, is
 /// refused: the window is the previous and the current version.
 #[tokio::test]
-async fn worker_socket_rejects_a_daemon_that_only_speaks_protocol_six() {
-    let dropped = Version::new(6).expect("version six is nonzero");
+async fn worker_socket_rejects_a_daemon_that_only_speaks_protocol_seven() {
+    let dropped = Version::new(7).expect("version seven is nonzero");
     assert!(dropped < PREVIOUS_VERSION);
     assert_disjoint_range_rejected(dropped).await;
 }

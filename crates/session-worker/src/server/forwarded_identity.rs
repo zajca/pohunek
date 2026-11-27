@@ -12,7 +12,7 @@
 
 use pohunek_worker_protocol::{
     ActiveIdentityOutcome, ClaimOrigin, ForwardedActiveRelease, ForwardedActiveReport,
-    IdentityRejectReason, ACTIVE_IDENTITY_FORWARD_VERSION, MAX_FORWARDED_AGENT_LABEL_BYTES,
+    IdentityRejectReason, MAX_FORWARDED_AGENT_LABEL_BYTES,
 };
 
 use super::{
@@ -31,7 +31,6 @@ pub(super) async fn record_active_identity_request(
     scope: &RuntimeScope,
     report: ForwardedActiveReport,
 ) -> Result<ResponseKind, ControlError> {
-    require_forward_version(connection)?;
     validate_scope(shared, connection, scope).await?;
     let mut state = shared.state.lock().await;
     let outcome = match admit_report(shared, connection, &mut state, &report) {
@@ -49,23 +48,11 @@ pub(super) async fn release_active_identity_request(
     scope: &RuntimeScope,
     release: ForwardedActiveRelease,
 ) -> Result<ResponseKind, ControlError> {
-    require_forward_version(connection)?;
     validate_scope(shared, connection, scope).await?;
     let mut state = shared.state.lock().await;
     let outcome = commit_release(shared, connection, &mut state, &release).await?;
     drop(state);
     Ok(ResponseKind::ActiveIdentityRecorded { outcome })
-}
-
-fn require_forward_version(connection: &Connection) -> Result<(), ControlError> {
-    match connection.selected_version {
-        Some(version) if version >= ACTIVE_IDENTITY_FORWARD_VERSION => Ok(()),
-        _ => Err(control_error(
-            ControlCode::WorkerFeatureUnavailable,
-            "the negotiated protocol cannot forward an active identity",
-            false,
-        )),
-    }
 }
 
 /// Logs a refusal under the operation name and returns it.

@@ -29226,65 +29226,6 @@ async fn an_unbound_report_stays_in_memory_and_is_not_sent_to_the_worker() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
-/// A worker that negotiated protocol 7 cannot journal a forwarded claim: no
-/// request is sent, and the report is kept in memory.
-#[tokio::test]
-async fn a_report_for_a_protocol_7_worker_stays_in_memory() {
-    let (registry, inspector, created) = mock_direct_codex_registry("forward-v7").await;
-    let start = root_start_identity(&inspector, &created);
-    let current = session_worker(&registry, &created.id).await;
-    current
-        .release_controller()
-        .await
-        .expect("release the lease");
-    let previous = Worker::connect_with_range(
-        current.socket_path(),
-        &created.id.0,
-        registry.daemon_instance_id(),
-        pohunek_worker_protocol::PREVIOUS_VERSION,
-        pohunek_worker_protocol::PREVIOUS_VERSION,
-    )
-    .await
-    .expect("connect at the previous protocol");
-    registry
-        .inner
-        .sessions
-        .lock()
-        .await
-        .get_mut(&created.id)
-        .expect("entry")
-        .runtime = RuntimeHandle::Worker(previous.clone());
-
-    assert!(
-        registry
-            .report_agent(bound_report(&created, start, 1, "native-one"))
-            .await
-            .recorded
-    );
-
-    let snapshot = previous.inspect().await.expect("inspect at protocol 7");
-    assert!(
-        snapshot.active_identity.is_none(),
-        "the worker was not used"
-    );
-    assert_eq!(snapshot.active_identity_revision, None);
-    let sessions = registry.inner.sessions.lock().await;
-    assert!(sessions[&created.id]
-        .not_durable_logged
-        .contains(&crate::session::NotDurableCause::WorkerProtocolV7));
-    assert!(sessions[&created.id].identity_fence.is_none());
-    assert!(sessions[&created.id].pending_activity.is_none());
-    assert!(matches!(
-        sessions[&created.id]
-            .active_agent
-            .as_ref()
-            .map(|a| &a.origin),
-        Some(crate::session::claim::ClaimOrigin::Memory { .. })
-    ));
-    drop(sessions);
-    registry.stop(&created.id).await.expect("stop the session");
-}
-
 /// A runtime the daemon cannot reach leaves the report in memory with the
 /// forward-failure cause, and the report is still recorded.
 #[tokio::test]
