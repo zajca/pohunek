@@ -459,7 +459,6 @@ inner_main() {
         root=$inputs/root
         /bin/cp "$consumer" "$inputs/consumer" || fail "cannot copy consumer to inputs"
         /bin/chmod 0755 "$inputs/consumer" || fail "cannot chmod consumer in inputs"
-        consumer=$inputs/consumer
         # The consumer's TestEnv arms the test-owner reaper and resolves it
         # beside the test executable, so the reaper travels with the consumer.
         reaper_beside="$(dirname -- "$consumer")/pohunek-test-reaper"
@@ -467,6 +466,7 @@ inner_main() {
             /bin/cp "$reaper_beside" "$inputs/pohunek-test-reaper" || fail "cannot copy reaper to inputs"
             /bin/chmod 0755 "$inputs/pohunek-test-reaper" || fail "cannot chmod reaper in inputs"
         fi
+        consumer=$inputs/consumer
         mkdir "$inputs/node-bin" || fail "cannot create node-bin in inputs"
         /bin/cp "$node_dir/node" "$inputs/node-bin/node" || fail "cannot copy node to inputs"
         /bin/chmod 0755 "$inputs/node-bin/node" || fail "cannot chmod node in inputs"
@@ -972,6 +972,13 @@ expected_binary_sha() {
 # --- namespace ---------------------------------------------------------------
 cp -- "$consumer" "$work/consumer"
 chmod 755 "$work/consumer"
+# The consumer's TestEnv arms the test-owner reaper and resolves it beside the
+# test executable, so the reaper travels with every consumer copy.
+reaper_beside="$(dirname -- "$consumer")/pohunek-test-reaper"
+if [ -f "$reaper_beside" ]; then
+    cp -- "$reaper_beside" "$work/pohunek-test-reaper"
+    chmod 755 "$work/pohunek-test-reaper"
+fi
 node_bin=$(command -v node) || fail "node is required on PATH (the upstreams are node programs)"
 node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
 if [ "$(uname -s)" = Linux ]; then
