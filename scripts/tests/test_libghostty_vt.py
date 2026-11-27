@@ -37,6 +37,9 @@ CARGO_LANE = re.compile(
 )
 
 # Jobs that compile a crate which will link the library and already provide it.
+# The ci.yml lanes below run `--all-features` / the feature powerset, so the
+# `libghostty` feature of pohunek-terminal-ghostty-sys is among their builds
+# and their build script needs LIBGHOSTTY_VT_DIR (issue #2538 M1).
 WIRED_LANES = {
     "libghostty-spike.yml:spike-libghostty-linux",
     "libghostty-spike.yml:spike-libghostty-macos",
@@ -46,6 +49,12 @@ WIRED_LANES = {
     "release-build.yml:packages",
     "release-build.yml:rehearsal-macos",
     "release.yml:stage-macos",
+    "ci.yml:test",
+    "ci.yml:darwin-check",
+    "ci.yml:build-tests",
+    "ci.yml:doctests",
+    "ci.yml:feature-matrix",
+    "ci.yml:udeps",
 }
 # Jobs that never link the library.
 EXEMPT_LANES = {
@@ -60,13 +69,9 @@ PENDING_LANES = {
     "ci.yml:macos-tier",
     "ci.yml:macos-release-build",
     "ci.yml:macos-package",
-    "ci.yml:test",
-    "ci.yml:darwin-check",
     "ci.yml:test-selection",
-    "ci.yml:build-tests",
     "ci.yml:systemd-supervision",
     "ci.yml:test-selection-audit",
-    "ci.yml:doctests",
     "ci.yml:release-build",
     "ci.yml:ts-drift",
     "ci.yml:hermes-package",
@@ -79,8 +84,6 @@ PENDING_LANES = {
     "ci.yml:build-bins",
     "ci.yml:sdk-macos",
     "ci.yml:docs",
-    "ci.yml:feature-matrix",
-    "ci.yml:udeps",
     "gate-tests.yml:tests",
     # Both build the core checkout of a plugin repository; the action lives in
     # that checkout (`core/.github/actions/...`).

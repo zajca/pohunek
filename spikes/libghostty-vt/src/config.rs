@@ -51,12 +51,6 @@ pub struct ModelConfig {
     pub ghostty_clipboard_write_max_bytes: usize,
     /// Cell size in pixels passed to libghostty on resize.
     pub ghostty_cell_px: u32,
-    /// libghostty repaint: join soft-wrapped rows into one line.
-    pub ghostty_repaint_unwrap: bool,
-    /// libghostty repaint: trim trailing spaces of each line.
-    pub ghostty_repaint_trim: bool,
-    /// Bytes written to the fresh instance before the libghostty repaint.
-    pub ghostty_repaint_prefix: String,
     /// Scrollback rows of the `vt100-scrollback` model.
     pub vt100_scrollback_rows: usize,
     /// Fixture the throughput measurement uses as the agent trace.

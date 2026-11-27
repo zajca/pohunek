@@ -8,8 +8,10 @@
 //!   query; Pohunek forwards terminal queries to the attached client.
 //! - `CLIPBOARD_READ` stays NULL: an OSC 52 `?` read is ignored and an OSC
 //!   5522 read is refused.
-//! - `CLIPBOARD_WRITE` is a capture callback that records the decoded byte
-//!   length of each write and answers "denied". No clipboard is ever touched.
+//! - `CLIPBOARD_WRITE` is a capture callback that counts the writes and records
+//!   the decoded length of the last one, and answers "denied". No clipboard is
+//!   ever touched, and the record stays two scalars however many writes a
+//!   hostile PTY stream makes.
 //! - Kitty graphics are compiled out of the library; [`HeadlessTerminal::new`]
 //!   checks the build info and that setting a graphics option is unsupported.
 //! - Every size bound (scrollback, APC, unknown and continuation sequences,
@@ -85,9 +87,16 @@ pub struct CellInfo {
 }
 
 /// State the C callbacks write into; heap allocated so its address is stable.
+///
+/// PTY output is hostile input, so this holds two bounded scalars, never one
+/// entry per clipboard write: a program can make any number of OSC 52 writes
+/// and the worker's memory must not grow with them.
 #[derive(Debug, Default)]
 struct CallbackState {
-    clipboard_writes: Vec<usize>,
+    /// How many clipboard writes were answered "denied" so far.
+    clipboard_write_count: usize,
+    /// Decoded byte length of the last clipboard write.
+    last_clipboard_write_bytes: usize,
     progress: Option<String>,
 }
 
@@ -131,7 +140,8 @@ unsafe extern "C" fn on_clipboard_write(
         // SAFETY: `contents` points to `contents_len` entries, valid during the call.
         total += unsafe { (*write.contents.add(index)).data.len };
     }
-    state.clipboard_writes.push(total);
+    state.clipboard_write_count += 1;
+    state.last_clipboard_write_bytes = total;
     let reply = ffi::ClipboardWriteReply {
         size: std::mem::size_of::<ffi::ClipboardWriteReply>(),
         result: ffi::CLIPBOARD_WRITE_DENIED,
@@ -400,11 +410,21 @@ impl HeadlessTerminal {
         unsafe { (*self.state).progress.as_deref() }
     }
 
-    /// Decoded byte length of every clipboard write the program made.
+    /// How many clipboard writes the program made; each was answered "denied".
+    ///
+    /// A count, not a list: untrusted PTY output can produce any number of
+    /// writes, so the product never records one entry per write.
     #[must_use]
-    pub fn clipboard_writes(&self) -> &[usize] {
-        // SAFETY: as in `progress`.
-        unsafe { &(*self.state).clipboard_writes }
+    pub fn clipboard_write_count(&self) -> usize {
+        // SAFETY: `state` is live until `Drop`, and no callback runs during `&self`.
+        unsafe { (*self.state).clipboard_write_count }
+    }
+
+    /// Decoded byte length of the last clipboard write the program made.
+    #[must_use]
+    pub fn last_clipboard_write_bytes(&self) -> usize {
+        // SAFETY: as in `clipboard_write_count`.
+        unsafe { (*self.state).last_clipboard_write_bytes }
     }
 
     fn grid_ref(&self, row: u16, col: u16) -> Result<ffi::GridRef, GhosttyError> {

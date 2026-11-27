@@ -26,7 +26,9 @@
 )]
 
 use std::ffi::{c_char, c_int, c_void};
-use std::mem::{align_of, offset_of, size_of};
+// `size_of` and `align_of` are in the prelude of this toolchain; `offset_of`
+// is not.
+use std::mem::offset_of;
 
 #[allow(
     non_upper_case_globals,

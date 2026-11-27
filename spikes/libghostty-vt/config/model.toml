@@ -35,11 +35,8 @@ ghostty_continuation_max_bytes = 65536
 ghostty_clipboard_write_max_bytes = 1048576
 # Cell size in pixels reported on resize; only size reports use it.
 ghostty_cell_px = 1
-# libghostty repaint: the formatter UNWRAP and TRIM options, and bytes written
-# to the fresh instance before the repaint.
-ghostty_repaint_unwrap = true
-ghostty_repaint_trim = false
-ghostty_repaint_prefix = ""
+# The repaint options (UNWRAP, TRIM, prefix) are not configured here anymore:
+# the shipped seam pins them in crates/terminal/src/ghostty_screen.rs.
 # Scrollback of the `vt100-scrollback` model: the usual terminal default.
 vt100_scrollback_rows = 10000
 # Throughput measurement. The agent trace is replayed back to back in one

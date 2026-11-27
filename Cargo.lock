@@ -2051,6 +2051,7 @@ dependencies = [
 name = "pohunek-terminal-ghostty-sys"
 version = "0.45.0"
 dependencies = [
+ "base64 0.22.1",
  "thiserror 2.0.18",
 ]
 

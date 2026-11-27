@@ -16,18 +16,78 @@ libghostty = []
 [dependencies]
 thiserror = { workspace = true }
 
-# This crate owns the unsafe FFI, so it declares its own lint table instead of
-# the workspace one (which has no `unsafe_code` entry): `unsafe_code` is denied
-# crate-wide and allowed again, with a reason, only in the `ffi` and `ghostty`
-# modules that were moved from the spike. `pohunek-terminal` keeps
+[dev-dependencies]
+base64 = { workspace = true }
+
+# The workspace lint table, copied here (a crate cannot extend
+# `[lints] workspace = true` with its own entries) plus the one entry this
+# crate owns: `unsafe_code = "deny"`, allowed again with a reason only in the
+# `ffi` and `ghostty` modules. `pohunek-terminal` keeps
 # `#![forbid(unsafe_code)]`.
 [lints.rust]
+ambiguous_negative_literals = "warn"
 missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+# Not part of the upstream set, but the project relied on it via per-crate
+# headers before centralizing it here.
 unreachable_pub = "warn"
-rust_2018_idioms = { level = "warn", priority = -1 }
+rust_2018_idioms = "warn"
+# This crate owns the unsafe FFI, so it declares the posture explicitly.
 unsafe_code = "deny"
 
 [lints.clippy]
+disallowed_types = "deny"
+disallowed_methods = "deny"
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Restriction-group lints that drive up consistency and brevity.
 allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+# Replacement for the removed `string_to_string` lint from older guideline sets.
+implicit_clone = "warn"
 undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# Ownership lints outside the default groups: a clone of a value at its last
+# use (nursery) and an `Rc`/`Arc` around an owned buffer instead of a slice.
+redundant_clone = "warn"
+rc_buffer = "warn"
+
+# Avoids false positives with the structured-logging message templates.
+literal_string_with_formatting_args = "allow"
+
+# Custom opt-outs (case-by-case, per M-STATIC-VERIFICATION). These are binary
+# crates and unpublished internal libs, so the public-API doc lints below would
+# be pure noise rather than catching real contract gaps.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+# `assert!(x.is_empty())` is the idiomatic emptiness check in tests; the lint's
+# `assert_eq!(x, [] as [T; 0])` replacement needs a spelled-out element type at
+# every site and reads worse than the assertion it replaces.
+assert_is_empty = "allow"

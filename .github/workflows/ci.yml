@@ -771,6 +771,16 @@ jobs:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the `--all-features` clippy below compiles
+      # pohunek-terminal-ghostty-sys with its `libghostty` feature, whose
+      # build script links it. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
@@ -833,6 +843,22 @@ jobs:
         id: infra-1
         with:
           persist-credentials: false
+
+      # The pinned library cross-built for the linted target (cached on a hit;
+      # issue #2538). Exports LIBGHOSTTY_VT_DIR; this job only compiles, it
+      # never links or runs the library.
+      - name: Provide libghostty-vt
+        id: libghostty
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+
+      # The cross-built ABI probe cannot run on this Linux host, so record the
+      # layout with the host cc instead: both targets are LP64, and the const
+      # asserts in ffi.rs check the recorded layout at compile time.
+      - name: Record the ABI layout of the cross-built library
+        run: python3 -I scripts/build-libghostty-vt aarch64-apple-darwin "$LIBGHOSTTY_VT_DIR" --probe-native
 
       - name: Install zig
         uses: ./.github/actions/setup-zig
@@ -1092,6 +1118,16 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - uses: ./.github/actions/setup-rust
+
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the `--all-features` archive below links the test binaries of
+      # pohunek-terminal with the `libghostty` feature. Exports
+      # LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -2247,6 +2283,16 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - uses: ./.github/actions/setup-rust
+
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the `--all-features` doctests below compile
+      # pohunek-terminal-ghostty-sys with its `libghostty` feature, whose build
+      # script links it. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
 
       # Doctests link the debug library builds that the `test-debug` saver
       # (`build-tests`) persists; this job only restores them.
@@ -4345,6 +4391,16 @@ jobs:
         with:
           components: clippy
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the powerset below compiles every feature combination, among
+      # them `libghostty`, whose build script links the library. Exports
+      # LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -4395,6 +4451,16 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly-2026-10-12
+
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): `--all-features` compiles pohunek-terminal-ghostty-sys with its
+      # `libghostty` feature, whose build script links the library. Exports
+      # LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

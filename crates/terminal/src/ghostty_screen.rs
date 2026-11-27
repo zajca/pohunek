@@ -76,6 +76,13 @@ impl GhosttyScreen {
         let terminal = &self.terminal;
         let (rows, cols) = self.size();
         let (cursor_row, cursor_col) = terminal.cursor().expect("libghostty read the cursor");
+        let wrapped: Vec<bool> = (0..rows)
+            .map(|row| {
+                terminal
+                    .row_wrapped(row)
+                    .expect("libghostty read the row wrap flag")
+            })
+            .collect();
         let body = terminal
             .format_vt(REPAINT_UNWRAP, REPAINT_TRIM)
             .expect("libghostty format the repaint");
@@ -92,12 +99,10 @@ impl GhosttyScreen {
             alternate_screen: terminal
                 .alternate_screen()
                 .expect("libghostty read the active screen"),
-            visible_text: String::from_utf8_lossy(
-                &terminal
-                    .format_plain()
-                    .expect("libghostty format the plain text"),
-            )
-            .into_owned(),
+            // Active screen rows only: the library retains scrollback (up to
+            // the configured byte limit) and `format_plain` would include it,
+            // which would leak history into `session.screen`.
+            visible_text: active_screen_text(terminal, rows, cols, &wrapped),
             repaint,
         }
     }
@@ -159,4 +164,58 @@ impl GhosttyScreen {
         );
         combine_links(osc8, text, max_url_bytes)
     }
+}
+
+/// The visible text of the active screen, built cell by cell.
+///
+/// This mirrors what the vt100 backend's `Screen::contents()` reports (the
+/// `Grid::write_contents` algorithm), so the two backends agree on
+/// `visible_text`: a cell with text emits its graphemes, the gap before it
+/// is filled with spaces up to its column, a wide cell advances two columns
+/// and its spacer emits nothing, a soft-wrapped row joins the previous one
+/// instead of breaking the line, and trailing line breaks are removed. Only
+/// the active screen rows are read: the library's scrollback is never
+/// included, so a long history cannot grow the snapshot (issue #2538 M2).
+fn active_screen_text(
+    terminal: &HeadlessTerminal,
+    rows: u16,
+    cols: u16,
+    wrapped: &[bool],
+) -> String {
+    let mut text = String::new();
+    let mut wrapping = false;
+    for row in 0..rows {
+        let mut prev_was_wide = false;
+        let mut prev_col: u16 = 0;
+        for col in 0..cols {
+            let cell = terminal.cell(row, col).expect("libghostty read a cell");
+            if prev_was_wide {
+                // The spacer half of a wide cell emits nothing.
+                prev_was_wide = false;
+                continue;
+            }
+            prev_was_wide = cell.wide;
+            if !cell.text.is_empty() {
+                for _ in 0..(col - prev_col) {
+                    text.push(' ');
+                }
+                prev_col = col;
+                text.push_str(&cell.text);
+                prev_col += if cell.wide { 2 } else { 1 };
+            }
+        }
+        // An empty row that continues the previous soft-wrapped line still
+        // breaks the text line, as in the vt100 grid.
+        if prev_col == 0 && wrapping {
+            text.push('\n');
+        }
+        if !wrapped[usize::from(row)] {
+            text.push('\n');
+        }
+        wrapping = wrapped[usize::from(row)];
+    }
+    while text.ends_with('\n') {
+        text.pop();
+    }
+    text
 }

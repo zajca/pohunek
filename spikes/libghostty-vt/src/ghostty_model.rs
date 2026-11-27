@@ -7,6 +7,7 @@
 
 // Rust guideline compliant 2026-06-26
 
+use base64::Engine as _;
 use pohunek_terminal::{ModelKind, TerminalTracker};
 use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal};
 
@@ -15,16 +16,25 @@ use crate::model::{CellDump, GridDump, GridModel, ModelError};
 
 const NAME: &str = "libghostty";
 
+/// Largest OSC payload the recorder keeps; a longer sequence is dropped. The
+/// library caps one clipboard transaction at 1 MiB decoded (the pin), so a
+/// longer payload is refused there anyway.
+const MAX_OSC52_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+
 /// `TerminalTracker::with_model(ModelKind::Libghostty)` next to a
-/// `HeadlessTerminal` that exposes the cells.
+/// `HeadlessTerminal` that exposes the cells, plus a recorder of the OSC 52
+/// writes in the fed bytes.
 ///
 /// The tracker supplies feed, resize and the repaint; the terminal supplies
 /// the cell dump. `dump` fails when the two disagree on the visible text,
-/// which keeps the dump a description of what the seam really runs.
+/// which keeps the dump a description of what the seam really runs. The
+/// per-write clipboard record lives here, in the spike only: the product's
+/// sys crate keeps a bounded counter and the last size (issue #2538 M3).
 #[derive(Debug)]
 pub struct GhosttyModel {
     tracker: TerminalTracker,
     terminal: HeadlessTerminal,
+    osc52: Osc52Recorder,
 }
 
 /// Maps the spike's `config/model.toml` headless keys onto the sys crate's
@@ -63,6 +73,7 @@ impl GhosttyModel {
             tracker: TerminalTracker::with_model(ModelKind::Libghostty, rows, cols),
             terminal: HeadlessTerminal::new(&headless_config(config), rows, cols)
                 .map_err(model_error)?,
+            osc52: Osc52Recorder::default(),
         })
     }
 }
@@ -75,6 +86,7 @@ impl GridModel for GhosttyModel {
     fn feed(&mut self, bytes: &[u8]) {
         self.tracker.feed(bytes);
         self.terminal.feed(bytes);
+        self.osc52.feed(bytes);
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -85,8 +97,9 @@ impl GridModel for GhosttyModel {
     }
 
     fn repaint(&self) -> Result<Option<Vec<u8>>, ModelError> {
-        // The seam's repaint: the synchronized-output bracket around
-        // `format_vt(unwrap = true, trim = false)` with the configured prefix.
+        // The seam's repaint, pinned in crates/terminal/src/ghostty_screen.rs:
+        // the synchronized-output bracket around `format_vt(unwrap = true,
+        // trim = false)` with an empty prefix.
         Ok(Some(self.tracker.snapshot(0).ansi))
     }
 
@@ -139,7 +152,102 @@ impl GridModel for GhosttyModel {
             kitty_keyboard_flags: Some(u32::from(
                 terminal.kitty_keyboard_flags().map_err(model_error)?,
             )),
-            clipboard_writes: Some(terminal.clipboard_writes().to_vec()),
+            clipboard_writes: Some(self.osc52.writes.clone()),
         })
+    }
+}
+
+/// Streams over fed bytes and records the decoded length of every OSC 52
+/// clipboard write (`ESC ] 52 ; params ; base64 ST`); a `?` payload is a read
+/// request and records nothing.
+#[derive(Debug, Default)]
+struct Osc52Recorder {
+    state: RecState,
+    command: Vec<u8>,
+    payload: Vec<u8>,
+    writes: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RecState {
+    #[default]
+    Ground,
+    Escape,
+    Osc,
+    Payload,
+    PayloadEscape,
+    Discard,
+    DiscardEscape,
+}
+
+impl Osc52Recorder {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            match self.state {
+                RecState::Ground => {
+                    if byte == 0x1b {
+                        self.state = RecState::Escape;
+                    }
+                }
+                RecState::Escape => {
+                    self.state = if byte == b']' {
+                        self.command.clear();
+                        self.payload.clear();
+                        RecState::Osc
+                    } else {
+                        RecState::Ground
+                    };
+                }
+                RecState::Osc => match byte {
+                    b';' => self.state = RecState::Payload,
+                    0x07 => self.finish(),
+                    _ if self.command.len() < 16 => self.command.push(byte),
+                    _ => self.state = RecState::Discard,
+                },
+                RecState::Payload => match byte {
+                    0x07 => self.finish(),
+                    0x1b => self.state = RecState::PayloadEscape,
+                    _ if self.payload.len() < MAX_OSC52_PAYLOAD_BYTES => self.payload.push(byte),
+                    _ => self.state = RecState::Discard,
+                },
+                RecState::PayloadEscape => {
+                    if byte == b'\\' {
+                        self.finish();
+                    } else {
+                        self.state = RecState::Discard;
+                    }
+                }
+                RecState::Discard => {
+                    if byte == 0x07 {
+                        self.state = RecState::Ground;
+                    } else if byte == 0x1b {
+                        self.state = RecState::DiscardEscape;
+                    }
+                }
+                RecState::DiscardEscape => {
+                    self.state = if byte == b'\\' {
+                        RecState::Ground
+                    } else {
+                        RecState::Discard
+                    };
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        self.state = RecState::Ground;
+        if self.command == b"52" {
+            if let Some(separator) = self.payload.iter().position(|byte| *byte == b';') {
+                let data = &self.payload[separator + 1..];
+                if data != b"?" {
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        self.writes.push(decoded.len());
+                    }
+                }
+            }
+        }
+        self.command.clear();
+        self.payload.clear();
     }
 }

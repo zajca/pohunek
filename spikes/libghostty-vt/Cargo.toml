@@ -12,6 +12,7 @@ description = "Measurement spike: PTY trace format, recorder and screen-model co
 publish = false
 
 [dependencies]
+base64 = "0.22"
 pohunek-terminal = { path = "../../crates/terminal" }
 # The FFI crate that owns the unsafe libghostty-vt bindings (issue #2538 P2);
 # the spike drives it through pohunek-terminal's `with_model` seam.

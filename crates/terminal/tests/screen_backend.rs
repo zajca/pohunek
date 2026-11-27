@@ -198,12 +198,12 @@ fn with_model_selects_the_requested_backend() {
 
 /// Fixtures whose visible text the two models are known to report
 /// differently (issue #2538 known gaps): a resize reflows the vt100 grid
-/// differently than libghostty, libghostty retains scrollback rows that the
-/// vt100 backend (scrollback 0) has already dropped, and the two models mark
-/// a soft wrap differently when a wide char sits in the last column.
+/// differently than libghostty, and the two models mark a soft wrap
+/// differently when a wide char sits in the last column. The scrollback
+/// fixture is not here: `visible_text` is built from the active screen rows
+/// only, so a long history does not leak into it on either model.
 #[cfg(feature = "libghostty")]
-const KNOWN_VISIBLE_TEXT_DIFFERENCES: &[&str] =
-    &["resize-wrap.trace", "scrollback.trace", "wide-chars.trace"];
+const KNOWN_VISIBLE_TEXT_DIFFERENCES: &[&str] = &["resize-wrap.trace", "wide-chars.trace"];
 
 /// S2: every fixture reports the same screen geometry and cursor on both
 /// models.
@@ -254,25 +254,16 @@ fn visible_text_matches_on_both_models_except_the_pinned_known_differences() {
 }
 
 /// S2 (pinned known differences): the visible text of `resize-wrap` and
-/// `scrollback` is exactly what each model reports today, so a pin bump that
+/// `wide-chars` is exactly what each model reports today, so a pin bump that
 /// changes either fails here instead of silently changing snapshots.
 #[test]
 #[cfg(feature = "libghostty")]
 fn the_known_visible_text_differences_are_the_pinned_ones() {
-    let scrollback_history: String = (1..=15)
-        .map(|line| format!("line{line:02}"))
-        .collect::<Vec<_>>()
-        .join("\n");
     let cases: &[(&str, &str, String)] = &[
         (
             "resize-wrap.trace",
             "after-shri\nnk\nafter-grow",
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123\nafter-shrink\nafter-grow".to_owned(),
-        ),
-        (
-            "scrollback.trace",
-            "line13\nline14\nline15\ndone",
-            format!("{scrollback_history}\ndone"),
+            "UVWXYZ0123\nafter-shrink\nafter-grow".to_owned(),
         ),
         (
             "wide-chars.trace",
@@ -297,10 +288,23 @@ fn the_known_visible_text_differences_are_the_pinned_ones() {
 #[cfg(feature = "libghostty")]
 const EMOJI_WIDTH_TEXT: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x\n\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x\n\u{2764}\u{fe0f}x\n\u{2764}\u{fe0f}x\n\u{2764}\u{fe0e}x\n\u{1f1e8}\u{1f1ff}x\n\u{1f1e8}\u{1f1ff}x";
 
+/// Golden repaint bytes of the libghostty backend on the `emoji-width`
+/// fixture, committed as `tests/fixtures/emoji-width.ghostty.v1.ansi`
+/// (`.ghostty.v1.ansi`: the libghostty model's repaint at pin v1). After a
+/// deliberate pin bump, regenerate it with the ignored
+/// `regenerate_emoji_width_golden` test and review the diff.
+#[cfg(feature = "libghostty")]
+fn emoji_width_golden() -> Vec<u8> {
+    let dir = pohunek_test_support::manifest_dir().join("tests/fixtures");
+    std::fs::read(dir.join("emoji-width.ghostty.v1.ansi")).expect("the golden repaint reads")
+}
+
 /// S2 (pinned known gap): on the `emoji-width` fixture the screen state is
-/// identical on both models, and only the repaint bytes differ — the spike
-/// pinned the 17 cell diffs of the mode-2027 rows (0, 3, 5) that a text
-/// repaint cannot carry (issue #2538 known gaps).
+/// identical on both models, and the repaint bytes are pinned against the
+/// committed golden file — the spike pinned the 17 cell diffs of the
+/// mode-2027 rows (0, 3, 5) that a text repaint cannot carry, and the emoji
+/// width gap is the reason the spike exists, so it is pinned by golden
+/// Ghostty repaint bytes, not by a parity-only exemption (issue #2538 M4).
 #[test]
 #[cfg(feature = "libghostty")]
 fn the_emoji_width_known_gap_stays_pinned() {
@@ -312,9 +316,111 @@ fn the_emoji_width_known_gap_stays_pinned() {
         screen_state(&vt100),
         (8, 20, 7, 0, true, false, EMOJI_WIDTH_TEXT)
     );
+    assert_eq!(
+        ghostty.ansi,
+        emoji_width_golden(),
+        "the libghostty repaint bytes moved: the emoji-width gap must stay \
+         pinned by golden bytes, not by a parity-only check"
+    );
     assert_ne!(
         vt100.ansi, ghostty.ansi,
         "the repaint difference must stay visible"
+    );
+}
+
+/// S2/M2: a long scrollback does not grow `visible_text` past the active
+/// screen. 5000 lines of ~100 bytes (about 500 KiB of output) through a
+/// 24x80 libghostty tracker leave exactly the active screen, bounded by
+/// rows x (cols x per-cell bytes + the line break), and the same text the
+/// vt100 model reports for the same input.
+#[test]
+#[cfg(feature = "libghostty")]
+fn a_long_scrollback_does_not_exceed_the_output_limit() {
+    const ROWS: u16 = 24;
+    const COLS: u16 = 80;
+    /// Upper bound for one cell's text: a grapheme cluster is far below 32
+    /// bytes; 4 bytes per UTF-8 code point is the safety margin on top.
+    const MAX_CELL_TEXT_BYTES: usize = 32 * 4;
+    // 79-char lines with CRLF: no line ever wraps at the 80-column boundary,
+    // where the two models differ by one column on a pending wrap, so this
+    // scenario isolates the scrollback bound from the known wrap gap.
+    let lines: Vec<String> = (0..5000)
+        .map(|index| format!("line-{index:05}-{}", "x".repeat(68)))
+        .collect();
+    let mut input = lines.join("\r\n");
+    input.push_str("\r\n");
+    let bound = usize::from(ROWS) * (usize::from(COLS) * MAX_CELL_TEXT_BYTES + 1);
+    assert!(
+        input.len() > bound,
+        "the flood ({} bytes) must exceed the active-screen bound ({bound}) \
+         for this scenario to mean anything",
+        input.len()
+    );
+    let mut ghostty = TerminalTracker::with_model(ModelKind::Libghostty, ROWS, COLS);
+    ghostty.feed(input.as_bytes());
+    let mut vt100 = TerminalTracker::with_model(ModelKind::Vt100, ROWS, COLS);
+    vt100.feed(input.as_bytes());
+    let ghostty_snapshot = ghostty.snapshot(0);
+    let vt100_snapshot = vt100.snapshot(0);
+    assert_eq!(
+        ghostty_snapshot.visible_text, vt100_snapshot.visible_text,
+        "the two models report the same active screen after the flood"
+    );
+    assert!(
+        ghostty_snapshot.visible_text.len() <= bound,
+        "visible_text of {} bytes exceeds the active-screen bound of {bound}",
+        ghostty_snapshot.visible_text.len()
+    );
+    assert!(
+        ghostty_snapshot.visible_text.contains("line-04999"),
+        "the last line is on the active screen"
+    );
+    assert!(
+        !ghostty_snapshot.visible_text.contains("line-04000"),
+        "scrollback must not leak into visible_text"
+    );
+}
+
+/// S6: hostile PTY output cannot break the libghostty backend — malformed
+/// CSI/OSC fragments, an unterminated OSC, a kitty keyboard APC, deep resize
+/// cycles and an OSC 52 clipboard flood are all parsed without aborting, the
+/// snapshot stays bounded to the active screen, and no probe span is
+/// produced.
+#[test]
+#[cfg(feature = "libghostty")]
+fn hostile_output_does_not_break_the_libghostty_backend() {
+    use base64::Engine as _;
+    const ROWS: u16 = 24;
+    const COLS: u16 = 80;
+    const MAX_CELL_TEXT_BYTES: usize = 32 * 4;
+    let mut tracker = TerminalTracker::with_model(ModelKind::Libghostty, ROWS, COLS);
+    // Malformed and truncated sequences.
+    tracker.feed(b"\x1b[12;34\x1b]8;;https://example.com\x07link\x1b[?8m");
+    tracker.feed(b"\x1b]52;c;not base64!\x07\x1b[99999999999999999999H\x1b]0;unterminated");
+    // A kitty keyboard APC sequence.
+    tracker.feed(b"\x1b_Ga=1;i=1,u\x1b\\");
+    // Deep resize cycles.
+    for step in 0..200u16 {
+        tracker.resize(1 + step % 48, 1 + (step * 7) % 160);
+    }
+    tracker.resize(ROWS, COLS);
+    // An OSC 52 flood: 4096 writes of 1 KiB decoded each.
+    let payload = base64::engine::general_purpose::STANDARD.encode([b'x'; 1024]);
+    for _ in 0..4096 {
+        let sequence = format!("\x1b]52;c;{payload}\x07");
+        tracker.feed(sequence.as_bytes());
+    }
+    let snapshot = tracker.snapshot(0);
+    assert_eq!((snapshot.rows, snapshot.cols), (ROWS, COLS));
+    let bound = usize::from(ROWS) * (usize::from(COLS) * MAX_CELL_TEXT_BYTES + 1);
+    assert!(
+        snapshot.visible_text.len() <= bound,
+        "visible_text of {} bytes exceeds the active-screen bound of {bound}",
+        snapshot.visible_text.len()
+    );
+    assert!(
+        tracker.take_probes().is_empty(),
+        "hostile output must not produce probe spans"
     );
 }
 
