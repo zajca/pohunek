@@ -579,6 +579,7 @@ where
         method::SESSION_LIST,
         serde_json::to_value(SessionListParams {
             filters: Vec::new(),
+            ..SessionListParams::default()
         })
         .expect("serialize session list parameters"),
     )

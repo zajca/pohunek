@@ -107,6 +107,7 @@ fn spawn_daemon(env: &TestEnv, tree_filters_supported: bool) -> (std::path::Path
 fn tree_params() -> SessionListParams {
     SessionListParams {
         filters: vec![SessionListFilter::TopLevel],
+        ..SessionListParams::default()
     }
 }
 
@@ -202,6 +203,7 @@ async fn a_request_without_tree_filters_does_not_probe_the_capability() {
     client
         .session_list(SessionListParams {
             filters: Vec::new(),
+            ..SessionListParams::default()
         })
         .await
         .expect("a plain listing needs no capability");

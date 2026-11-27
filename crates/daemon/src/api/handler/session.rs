@@ -78,6 +78,11 @@ pub(super) async fn handle_session_adopt(
     }
 }
 
+/// `session.list`: the sessions matching the filters, ordered by id.
+///
+/// `limit` and `cursor` select one page of the filtered set. A result that
+/// does not fit one control line answers `session_list_too_large`, so the
+/// caller pages instead of receiving a frame its reader refuses.
 pub(super) async fn handle_session_list(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_optional_params::<SessionListParams>(request) {
         Ok(params) => params,
@@ -85,6 +90,12 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
     };
     if let Err(err) = validate_session_list_filters(&params.filters) {
         return error_value(request, err);
+    }
+    if params.limit == Some(0) {
+        return error_value(
+            request,
+            ProtocolError::bad_request("session.list limit must be at least 1"),
+        );
     }
     let mut list = sessions.list().await;
     // The tree is built over the unfiltered list: `TopLevel` keeps an
@@ -121,11 +132,18 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
         }
         list = kept;
     }
+    // The list is ordered by id, so a page is the run after the cursor id.
+    if let Some(cursor) = &params.cursor {
+        list.retain(|session| session.id.0.as_str() > cursor.as_str());
+    }
+    if let Some(limit) = params.limit {
+        list.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
     sessions.enrich_native_activity(&mut list).await;
     // Response-only presentation labels, after the activity snapshot: the
     // label reflects the current profile file, not the stored record.
     sessions.enrich_agent_labels(&mut list).await;
-    ok_value(request, &list)
+    ok_value_bounded(request, &list, ProtocolError::session_list_too_large())
 }
 
 pub(super) async fn handle_session_inspect(

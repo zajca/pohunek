@@ -1182,8 +1182,90 @@ impl Client {
                 ));
             }
         }
-        self.call_direct::<protocol::method::SessionList>(params)
-            .await
+        if params.limit.is_some() {
+            return self
+                .call_direct::<protocol::method::SessionList>(params)
+                .await;
+        }
+        self.session_list_every_page(params).await
+    }
+
+    /// Lists every matching session by following `cursor` page by page, so
+    /// the whole set never has to fit one control line.
+    ///
+    /// A page the daemon reports as `session_list_too_large` is asked again at
+    /// half the size, down to one session. A daemon that predates paging
+    /// ignores `limit` and answers the whole set at once, which is returned
+    /// as it is.
+    async fn session_list_every_page(
+        &mut self,
+        params: protocol::SessionListParams,
+    ) -> Result<Vec<protocol::SessionInfo>, ClientError> {
+        let mut page_params = params;
+        let mut page_size = protocol::SESSION_LIST_PAGE_SIZE;
+        let mut sessions: Vec<protocol::SessionInfo> = Vec::new();
+        let mut bytes = 0_usize;
+        loop {
+            page_params.limit = Some(page_size);
+            let page = match self
+                .call_direct::<protocol::method::SessionList>(page_params.clone())
+                .await
+            {
+                Ok(page) => page,
+                Err(ClientError::Protocol(source) | ClientError::RemoteProtocol { source, .. })
+                    if page_size > 1
+                        && source.code == protocol::ProtocolError::SESSION_LIST_TOO_LARGE =>
+                {
+                    page_size /= 2;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let page_len = page.len();
+            if sessions.is_empty() && page_len > usize::try_from(page_size).unwrap_or(usize::MAX) {
+                return Ok(page);
+            }
+            let (Some(first), Some(last)) = (
+                page.first().map(|session| session.id.0.clone()),
+                page.last().map(|session| session.id.0.clone()),
+            ) else {
+                break;
+            };
+            if let Some(cursor) = page_params.cursor.as_deref() {
+                // A daemon that pages never answers a session at or before the
+                // cursor. One does when it ignores `cursor` and answered the
+                // whole set again: this page is the current complete set.
+                if first.as_str() <= cursor {
+                    return Ok(page);
+                }
+                if last.as_str() <= cursor {
+                    return Err(ClientError::Protocol(protocol::ProtocolError::new(
+                        protocol::ErrorClass::Daemon,
+                        "session_list_cursor_repeated",
+                        "the daemon answered a session.list page that does not follow its cursor",
+                        Some("upgrade the daemon and client together".to_owned()),
+                    )));
+                }
+            }
+            bytes =
+                bytes.saturating_add(serde_json::to_vec(&page).map_or(0, |encoded| encoded.len()));
+            sessions.extend(page);
+            if sessions.len() > protocol::LIST_WALK_MAX_ITEMS
+                || bytes > protocol::LIST_WALK_MAX_BYTES
+            {
+                return Err(ClientError::Protocol(protocol::ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "session_list_walk_limit",
+                    "the session.list walk exceeded the sessions or bytes a client collects",
+                    Some("narrow the listing with filters".to_owned()),
+                )));
+            }
+            if page_len < usize::try_from(page_size).unwrap_or(usize::MAX) {
+                break;
+            }
+            page_params.cursor = Some(last);
+        }
+        Ok(sessions)
     }
 
     /// Run a retention sweep, refusing a selector the daemon cannot honor.

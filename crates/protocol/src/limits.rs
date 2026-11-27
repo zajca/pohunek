@@ -220,3 +220,22 @@ pub const MAX_SESSION_READ_RESPONSE_BYTES: usize =
 /// One thousand rows covers every supported terminal geometry while bounding
 /// JSON escaping and daemon-side allocation independently of terminal size.
 pub const MAX_SESSION_READ_LINES: u32 = 1_000;
+
+/// Sessions one `session.list` page asks for when a caller lists the whole set.
+///
+/// A page of typical session records fits one control line with room to spare;
+/// a caller halves the page when the daemon answers `session_list_too_large`.
+pub const SESSION_LIST_PAGE_SIZE: u32 = 200;
+
+/// Most records one client-side list walk collects before it stops.
+///
+/// A daemon that keeps answering full pages with increasing keys cannot make the
+/// client grow without bound; a real host holds far fewer records.
+pub const LIST_WALK_MAX_ITEMS: usize = 100_000;
+
+/// Most serialized bytes one client-side list walk collects before it stops.
+///
+/// Bounds the memory of a walk whose records are large, which the record count
+/// alone does not: a daemon that answers one record of nearly a control line
+/// per page stays under [`LIST_WALK_MAX_ITEMS`] while holding gigabytes.
+pub const LIST_WALK_MAX_BYTES: usize = 64 * 1024 * 1024;

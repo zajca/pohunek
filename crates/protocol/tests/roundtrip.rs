@@ -990,6 +990,7 @@ fn session_list_params_roundtrips_with_filters() {
             SessionListFilter::Activity(AgentActivity::Blocked),
             SessionListFilter::Id("s-42".to_owned()),
         ],
+        ..SessionListParams::default()
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");

@@ -707,6 +707,24 @@ impl ProtocolError {
         )
     }
 
+    /// Stable code of [`Self::session_list_too_large`].
+    pub const SESSION_LIST_TOO_LARGE: &'static str = "session_list_too_large";
+
+    /// The canonical error for a `session.list` result whose sessions do not
+    /// fit one control line.
+    #[must_use]
+    pub fn session_list_too_large() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            Self::SESSION_LIST_TOO_LARGE,
+            "the matching sessions exceed the public response budget",
+            Some(
+                "request fewer sessions with `limit` and continue with `cursor` set to the id of the last session"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/session_has_no_managed_terminal` error.
     #[must_use]
     pub fn session_has_no_managed_terminal() -> Self {

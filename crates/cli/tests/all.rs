@@ -140,6 +140,8 @@ mod session_blocked_kind;
 mod session_condition;
 #[path = "session_lifecycle_notice.rs"]
 mod session_lifecycle_notice;
+#[path = "session_list_paging.rs"]
+mod session_list_paging;
 #[path = "session_metadata_filters.rs"]
 mod session_metadata_filters;
 #[path = "session_new_agent_options.rs"]
