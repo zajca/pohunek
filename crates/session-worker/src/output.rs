@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(missing, 0..hub.next_offset());
         assert_eq!(terminal.watermark, hub.next_offset());
         assert!(terminal.visible_text.contains("counter:0042-after-outage"));
-        assert!(terminal.ansi.starts_with(b"\x1b[2J\x1b[H"));
+        assert!(terminal.ansi.starts_with(b"\x1b[?2026h\x1b[2J\x1b[H"));
 
         let expected_ansi = terminal.ansi;
         let mut subscriber = hub.subscribe(Some(0)).expect("gap subscribe");
