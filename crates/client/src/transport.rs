@@ -1189,10 +1189,10 @@ impl Client {
         }
     }
 
-    /// List projects. An explicit `limit` is one request; without one the
-    /// whole matching set is collected by following `cursor` page by page
-    /// (see [`crate::paging::every_page`]), so it never has to fit one control
-    /// line.
+    /// List projects. An explicit `limit` is one request, in id order; without
+    /// one the whole matching set is collected by following `cursor` page by
+    /// page (see [`crate::paging::every_page`]), so it never has to fit one
+    /// control line, and is returned ordered by label, then id.
     ///
     /// # Errors
     ///
@@ -1211,7 +1211,11 @@ impl Client {
             client: self,
             params,
         };
-        crate::paging::every_page(&crate::paging::PROJECT_LIST, &mut source).await
+        let mut projects =
+            crate::paging::every_page(&crate::paging::PROJECT_LIST, &mut source).await?;
+        // Pages follow the id; the listing reads by label.
+        projects.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+        Ok(projects)
     }
 
     /// List sessions, refusing before sending when a tree filter needs a

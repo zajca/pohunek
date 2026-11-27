@@ -13,13 +13,6 @@ pub(crate) trait Paged: Serialize {
     /// The cursor that continues the listing after this record. Cursors compare
     /// as strings in the order the daemon sorts the records.
     fn cursor(&self) -> String;
-
-    /// An identity that survives a change of the sort key between pages, when
-    /// the key is mutable: a record that moves past the cursor between two
-    /// pages is answered twice, and the walk keeps the first answer.
-    fn identity(&self) -> Option<String> {
-        None
-    }
 }
 
 impl Paged for protocol::SessionInfo {
@@ -30,11 +23,7 @@ impl Paged for protocol::SessionInfo {
 
 impl Paged for protocol::ProjectInfo {
     fn cursor(&self) -> String {
-        self.list_cursor()
-    }
-
-    fn identity(&self) -> Option<String> {
-        Some(self.id.clone())
+        self.id.clone()
     }
 }
 
@@ -95,8 +84,9 @@ fn client_error(code: &'static str, msg: String, hint: &'static str) -> ClientEr
 /// A page the daemon reports too large is asked again at half the size, down to
 /// one record. A daemon that predates paging ignores `limit` and `cursor`, and
 /// answers the whole current set to every request: an answer longer than the
-/// page size, or one that starts at or before the cursor (a paging daemon never
-/// answers a record at or before it), is that set and is returned as it is.
+/// page size, a first page that is not in ascending cursor order, or one that
+/// starts at or before the cursor (a paging daemon never answers a record at or
+/// before it) is that set and is returned as it is.
 ///
 /// # Errors
 ///
@@ -112,7 +102,6 @@ where
     let mut cursor: Option<String> = None;
     let mut records: Vec<T> = Vec::new();
     let mut bytes = 0_usize;
-    let mut seen = std::collections::HashSet::new();
     loop {
         let page = match source.fetch(page_size, cursor.clone()).await {
             Ok(page) => page,
@@ -135,6 +124,15 @@ where
         ) else {
             break;
         };
+        // A paging daemon answers ascending cursor order; the first page of a
+        // daemon that predates paging is in its own order.
+        if cursor.is_none()
+            && page
+                .windows(2)
+                .any(|pair| pair[0].cursor() >= pair[1].cursor())
+        {
+            return Ok(page);
+        }
         if let Some(cursor) = cursor.as_deref() {
             if first.as_str() <= cursor {
                 return Ok(page);
@@ -151,15 +149,7 @@ where
             }
         }
         bytes = bytes.saturating_add(serde_json::to_vec(&page).map_or(0, |encoded| encoded.len()));
-        for record in page {
-            if record
-                .identity()
-                .is_some_and(|identity| !seen.insert(identity))
-            {
-                continue;
-            }
-            records.push(record);
-        }
+        records.extend(page);
         if records.len() > protocol::LIST_WALK_MAX_ITEMS || bytes > protocol::LIST_WALK_MAX_BYTES {
             return Err(client_error(
                 spec.walk_limit_code,

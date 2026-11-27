@@ -1,7 +1,9 @@
 //! `project.*` methods plus the shared project-manager and blocking helpers.
 //!
 //! Project operations touch the git working copy and the metadata store, so all
-//! of them are pushed off the async runtime via [`run_project_blocking`]. The
+//! of them are pushed off the async runtime, through [`run_project_blocking`] or,
+//! for `project.list`, the bounded variant that answers an oversized result with
+//! a typed error. The
 //! registry owns the [`ProjectManager`]; [`require_projects`] surfaces the typed
 //! error when the daemon runs without a metadata store.
 
@@ -96,21 +98,20 @@ pub(super) async fn handle_project_list(request: &Request, sessions: &SessionReg
             ProtocolError::bad_request("project.list limit must be at least 1"),
         );
     }
-    let after = match cursor.as_deref().map(split_list_cursor).transpose() {
-        Ok(after) => after,
-        Err(err) => return error_value(request, err),
-    };
     super::util::run_blocking_bounded(
         request,
         move || {
             let mut projects = pm.list(&filters)?;
-            // The list is ordered by label, then id: a page is the run after
-            // the cursor key.
-            if let Some((label, id)) = &after {
-                projects.retain(|project| (&project.label, &project.id) > (label, id));
-            }
-            if let Some(limit) = limit {
-                projects.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            if limit.is_some() || cursor.is_some() {
+                // Pages follow the immutable id, so a rename between two
+                // requests cannot move a project across the cursor.
+                projects.sort_by(|a, b| a.id.cmp(&b.id));
+                if let Some(cursor) = &cursor {
+                    projects.retain(|project| project.id.as_str() > cursor.as_str());
+                }
+                if let Some(limit) = limit {
+                    projects.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                }
             }
             Ok(projects)
         },
@@ -119,14 +120,6 @@ pub(super) async fn handle_project_list(request: &Request, sessions: &SessionReg
         ProtocolError::project_list_too_large(),
     )
     .await
-}
-
-/// Split a `project.list` cursor into the label and id it was built from.
-fn split_list_cursor(cursor: &str) -> Result<(String, String), ProtocolError> {
-    cursor
-        .split_once('\0')
-        .map(|(label, id)| (label.to_owned(), id.to_owned()))
-        .ok_or_else(|| ProtocolError::bad_request("project.list cursor is not a project cursor"))
 }
 
 /// `project.candidates`: repositories proposed from pohunek sessions and, when

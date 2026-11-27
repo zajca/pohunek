@@ -737,7 +737,7 @@ impl ProtocolError {
             Self::PROJECT_LIST_TOO_LARGE,
             "the matching projects exceed the public response budget",
             Some(
-                "request fewer projects with `limit` and continue with `cursor` set to the cursor of the last project"
+                "request fewer projects with `limit` and continue with `cursor` set to the id of the last project"
                     .to_owned(),
             ),
         )

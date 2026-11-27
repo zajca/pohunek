@@ -126,14 +126,15 @@ async fn a_set_that_changes_between_requests_is_listed_once_from_its_current_sta
 }
 
 #[tokio::test]
-async fn a_project_renamed_past_the_cursor_between_pages_is_listed_once() {
+async fn a_label_ordered_answer_of_exactly_one_page_is_listed_once_in_label_order() {
     let env = TestEnv::new().expect("create the hermetic test environment");
-    // The second page answers a project the first page already listed, now
-    // under a label that sorts after the cursor, as a paging daemon does when
-    // a project is renamed between two requests.
-    let first = ids(0, CLIENT_PAGE_SIZE);
-    let renamed = vec!["p-00005@zz".to_owned()];
-    let socket = spawn_daemon(&env, vec![first.clone(), renamed]);
+    // A daemon that predates paging answers in label order, which here is the
+    // reverse of id order, so the answer is not in ascending id order.
+    let set: Vec<String> = (0..CLIENT_PAGE_SIZE)
+        .rev()
+        .map(|n| format!("p-{n:05}@l-{:05}", CLIENT_PAGE_SIZE - 1 - n))
+        .collect();
+    let socket = spawn_daemon(&env, vec![set]);
     let mut client = connect(&socket).await;
 
     let listed: Vec<String> = client
@@ -141,8 +142,9 @@ async fn a_project_renamed_past_the_cursor_between_pages_is_listed_once() {
         .await
         .expect("list the projects")
         .into_iter()
-        .map(|project| project.id)
+        .map(|project| project.label)
         .collect();
 
-    assert_eq!(listed, first);
+    let expected: Vec<String> = (0..CLIENT_PAGE_SIZE).map(|n| format!("l-{n:05}")).collect();
+    assert_eq!(listed, expected);
 }

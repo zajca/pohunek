@@ -242,5 +242,7 @@ pub const LIST_WALK_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Projects one `project.list` page asks for when a caller lists the whole set.
 ///
-/// A caller halves the page when the daemon answers `project_list_too_large`.
+/// The same size as [`SESSION_LIST_PAGE_SIZE`]: typical project records are a
+/// few hundred bytes, so a page stays far below one control line. A caller
+/// halves the page when the daemon answers `project_list_too_large`.
 pub const PROJECT_LIST_PAGE_SIZE: u32 = 200;

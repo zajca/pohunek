@@ -11,16 +11,16 @@ export type ProjectListParams = {
    */
   filters?: Array<ProjectListFilter>;
   /**
-   * Maximum number of projects to return (at least 1). Projects are ordered
-   * by label, then id; a page holds the first `limit` matching projects
-   * after `cursor`. Absent means the whole matching set in one response,
-   * which the daemon refuses with `project_list_too_large` when it does not
-   * fit one control line.
+   * Maximum number of projects to return (at least 1). With `limit` or
+   * `cursor` the projects are ordered by id, and a page holds the first
+   * `limit` matching projects after `cursor`. Absent means the whole
+   * matching set in one response, ordered by label then id, which the
+   * daemon refuses with `project_list_too_large` when it does not fit one
+   * control line.
    */
   limit?: number;
   /**
-   * The [`ProjectInfo::list_cursor`] of the last project of the previous
-   * page.
+   * The id of the last project of the previous page.
    */
   cursor?: string;
 };

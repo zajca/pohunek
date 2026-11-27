@@ -1,7 +1,8 @@
 ## Unreleased (2026-11-26, project.list paging, #1110)
 
-- `project.list` accepts `limit` and `cursor` and orders projects by label, then id.
-  A result that does not fit one control line answers `runtime/project_list_too_large`
+- `project.list` accepts `limit` and `cursor`; a page is ordered by id and `cursor` is
+  the id of its last project, so a rename between pages cannot move a project across
+  the cursor. The client sorts the walked set by label, then id. A result that does not fit one control line answers `runtime/project_list_too_large`
   instead of a frame the client refuses; the parameters and the code are additive and
   need no protocol bump.
 - The Rust SDK `Client::project_list` and `pohunek project list` page through the whole
