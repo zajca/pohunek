@@ -37,6 +37,7 @@ hermes-pty = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = '''
 (package(=pohunek-daemon) and binary(=forced_close_stop))
+or (package(=pohunek-daemon) and binary(=notifications_unavailable) and test(=a_store_this_build_cannot_use_leaves_the_daemon_running_and_the_files_untouched))
 or (package(=pohunek-platform) and test(/^process::sweep::tests::host::a_sweep_waits_for_the_holders_/))
 or (package(=pohunek-session-worker) and test(=server::tests::escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset))
 or (package(=pohunek-session-worker) and test(=server::tests::natural_exit_bounds_a_descendant_that_never_closes_the_pty))
