@@ -95,6 +95,7 @@ async fn scenario_child_serving_daemon() {
     if !arguments.iter().any(|argument| argument == SCENARIO_MARKER) {
         return;
     }
+    report("child-started");
     let env = TestEnv::new().expect("create the test environment");
     let root = env.root().to_path_buf();
     let runtime = env.root().join("r");
@@ -191,6 +192,11 @@ fn spawn_scenario_child() -> (Child, Report) {
     let exe = std::env::current_exe().expect("path of the running test binary");
     let [exact, test] =
         pohunek_test_support::exact_test_filter(module_path!(), "scenario_child_serving_daemon");
+    // The child's stderr goes to a file, so a child that never reports leaves
+    // its panic or hang reason in the parent's failure message.
+    let stderr_dir = pohunek_test_support::tempdir().expect("stderr dir for the scenario child");
+    let stderr_path = stderr_dir.path().join("stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create the child stderr file");
     let mut child = Command::new(exe)
         .arg(exact)
         .arg(test)
@@ -198,7 +204,7 @@ fn spawn_scenario_child() -> (Child, Report) {
         .arg(SCENARIO_MARKER)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("spawn the scenario child");
     let stdout = child.stdout.take().expect("piped stdout");
@@ -218,10 +224,30 @@ fn spawn_scenario_child() -> (Child, Report) {
     let mut root = None;
     let mut daemon = None;
     let mut processes = Vec::new();
+    // The child's report lines reach this pipe live, but its panic text is
+    // captured by the test harness and only flushed on exit, so keep the
+    // recent lines to show where a child that never reports got stuck.
+    let mut recent: Vec<String> = Vec::new();
     loop {
-        let line = rx
-            .recv_timeout(HANG_GUARD)
-            .expect("the scenario child reports before the hang guard");
+        let line = rx.recv_timeout(HANG_GUARD).unwrap_or_else(|error| {
+            let stderr_tail = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            let stdout_tail = recent
+                .iter()
+                .rev()
+                .take(30)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "the scenario child reports before the hang guard: {error}\nchild stdout tail:\n{stdout_tail}\nchild stderr tail: {}",
+                stderr_tail.chars().take(2000).collect::<String>()
+            )
+        });
+        if recent.len() >= 50 {
+            recent.remove(0);
+        }
+        recent.push(line.clone());
         if line == READY_LINE {
             break;
         }
