@@ -439,14 +439,21 @@ async fn finish_check(
         checked.report.warnings.extend(gated.warnings);
     }
     // The upgrade judges the adoption preflight before it rolls the refresh
-    // back, so a file of another schema is refused after that gate, as install
-    // and upgrade refuse it.
-    if checked
+    // back, so a file the rollback refuses is refused after that gate, as
+    // install and upgrade refuse it. The preview is the one a rollback makes:
+    // it reads the file with the current-schema reader and classifies it
+    // against the journal, so a check refuses what an upgrade would.
+    if let Some(record) = checked
         .pending
         .as_ref()
-        .is_some_and(|record| record.operation == record::Operation::RefreshPath)
+        .filter(|record| record.operation == record::Operation::RefreshPath)
     {
-        refresh::load_installed_config(context)?;
+        let record_path = context.paths().state_dir.join(record::FILE_NAME);
+        let preview =
+            engine::refresh_path::preview_refresh_rollback(context, record, &record_path)?;
+        if preview.state == engine::refresh_path::FileState::Edited {
+            return Err(Error::RefreshConfigChanged);
+        }
     }
     Ok(checked.report)
 }
