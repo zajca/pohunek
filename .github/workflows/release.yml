@@ -282,6 +282,39 @@ jobs:
     with:
       mode: release
 
+  # The libghostty-vt library for aarch64-apple-darwin, cross-built on Linux
+  # (the pinned Zig is an x86_64 Linux binary); stage-macos downloads it. It
+  # runs beside the gates, like `build`, and shares its cache entry with the
+  # producer job of release-build.yml.
+  libghostty-darwin:
+    name: libghostty-vt for aarch64-apple-darwin
+    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+          export-env: "false"
+
+      - name: Upload the library for stage-macos
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-darwin-release
+          path: ${{ steps.library.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   # Ad-hoc signed native Apple Silicon archives (issues #104, #481), in three
   # jobs so that no built program runs after the final bytes are produced:
   #
@@ -309,7 +342,7 @@ jobs:
   # job); macOS 14 is a supported build target without CI acceptance.
   stage-macos:
     name: Stage ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test]
+    needs: [tier-evidence, gate, docs-gate, sdk-gate, upgrade-test, libghostty-darwin]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -331,6 +364,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
+
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-release
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

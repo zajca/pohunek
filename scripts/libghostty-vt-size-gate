@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Fail when linking libghostty-vt grows a stripped release binary too much.
+
+usage: python3 -I scripts/libghostty-vt-size-gate --measurements FILE [--pin FILE]
+
+FILE is the output of `spikes/libghostty-vt/scripts/measure` for one target.
+The limit is `max_stripped_size_delta_bytes` in the `[limits]` table of the pin
+file. Prints one line with the measured growth and the limit; exits non-zero
+above the limit or when the measurement lacks the growth.
+"""
+
+import argparse
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+DEFAULT_PIN = Path(__file__).resolve().parent / "libghostty-vt.pin.toml"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--measurements", type=Path, required=True)
+    parser.add_argument("--pin", type=Path, default=DEFAULT_PIN)
+    args = parser.parse_args()
+
+    limit = tomllib.loads(args.pin.read_text())["limits"]["max_stripped_size_delta_bytes"]
+    document = json.loads(args.measurements.read_text())
+    delta = document["size_probe"]["delta_stripped_bytes"]
+    target = document["target"]
+    mib = delta / (1 << 20)
+    summary = f"{target}: stripped size grows by {delta} B ({mib:.2f} MiB), limit {limit} B ({limit / (1 << 20):.2f} MiB)"
+    print(summary)
+    if delta > limit:
+        print(f"libghostty-vt-size-gate: {summary}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -13,6 +13,9 @@ on:
   pull_request:
     paths:
       - spikes/libghostty-vt/**
+      - scripts/build-libghostty-vt
+      - scripts/libghostty-vt*
+      - .github/actions/libghostty-vt/**
       - .github/workflows/libghostty-spike.yml
 
 permissions: {}
@@ -25,10 +28,6 @@ env:
   # A Python script never imports from its own directory or the working
   # directory, so a file a pull request adds there cannot shadow a module.
   PYTHONSAFEPATH: "1"
-  # Zig 0.17.0 as pinned for ci.yml and pinned-cache-offline.yml; the first
-  # step of spike-libghostty-linux fails when libghostty-vt.pin.toml differs.
-  ZIG_VERSION: "0.17.0"
-  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
   CI_RETRY_ATTEMPTS: "3"
   CI_RETRY_BACKOFF_SECONDS: "10"
   CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS: "180"
@@ -86,18 +85,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Zig pin equals the workflow pin
-        run: |
-          set -eu
-          pin=$(python3 -c 'import tomllib,sys; print(tomllib.load(open(sys.argv[1],"rb"))["zig"]["version"])' "$SPIKE_DIR/libghostty-vt.pin.toml")
-          for file in .github/workflows/ci.yml .github/workflows/pinned-cache-offline.yml; do
-            grep -q "ZIG_VERSION: \"$pin\"" "$file" || { echo "::error::$file does not pin Zig $pin"; exit 1; }
-          done
-          test "$pin" = "$ZIG_VERSION"
-          for file in .github/workflows/ci.yml .github/workflows/pinned-cache-offline.yml; do
-            grep -q "ZIG_SHA256: $ZIG_SHA256" "$file" || { echo "::error::$file does not pin the Zig sha256 of this workflow"; exit 1; }
-          done
-
       # A pull request runs the measurements and the macOS job only when it
       # touches a build or measurement input; a dispatch always runs them. The
       # job-level `if` of the macOS job reads this output, so no macOS runner
@@ -111,17 +98,11 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT" = workflow_dispatch ] || git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
-            grep -Eq '^(spikes/libghostty-vt/(build.rs|libghostty-vt.pin.toml|Cargo.(toml|lock)|scripts/|config/|fixtures/|src/(lib|config|trace|expect|model|replay|report|ffi|ghostty|ghostty_model|vt100_model|registry).rs|src/bin/(size-probe|throughput).rs)|.github/workflows/libghostty-spike.yml)'; then
+            grep -Eq '^(spikes/libghostty-vt/(build.rs|Cargo.(toml|lock)|scripts/|config/|fixtures/|src/(lib|config|trace|expect|model|replay|report|ffi|ghostty|ghostty_model|vt100_model|registry).rs|src/bin/(size-probe|throughput).rs)|scripts/(libghostty-vt.pin.toml|build-libghostty-vt|libghostty-vt-abi-probe.c)|.github/actions/(libghostty-vt|libghostty-vt-macos)/|.github/workflows/libghostty-spike.yml)'; then
             echo run=true >> "$GITHUB_OUTPUT"
           else
             echo run=false >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Install zig
-        uses: ./.github/actions/setup-zig
-        with:
-          version: ${{ env.ZIG_VERSION }}
-          sha256: ${{ env.ZIG_SHA256 }}
 
       - name: Install musl toolchain
         timeout-minutes: 10
@@ -138,18 +119,32 @@ jobs:
           components: clippy
           targets: x86_64-unknown-linux-musl
 
-      - name: Build libghostty-vt (glibc, musl, macOS arm64)
+      # The shared action restores the cached build or builds it with the
+      # pinned Zig; each target lands in $RUNNER_TEMP/libghostty-vt-<target>.
+      - name: libghostty-vt (glibc)
+        uses: ./.github/actions/libghostty-vt
         timeout-minutes: 30
-        run: |
-          set -eu
-          for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin; do
-            python3 -I "$SPIKE_DIR/scripts/build-libghostty-vt" "$target" "$RUNNER_TEMP/ghostty-$target" --fetch
-            cat "$RUNNER_TEMP/ghostty-$target/BUILD_INFO"
-          done
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+
+      - name: libghostty-vt (musl)
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-musl
+          export-env: "false"
+
+      - name: libghostty-vt (macOS arm64)
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+          export-env: "false"
 
       - name: Clippy and test with the feature (glibc)
         env:
-          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty-x86_64-unknown-linux-gnu
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/libghostty-vt-x86_64-unknown-linux-gnu
         run: |
           set -eu
           cargo clippy --locked --all-targets --features libghostty --manifest-path "$SPIKE_DIR/Cargo.toml" -- -D warnings
@@ -157,12 +152,12 @@ jobs:
 
       - name: Report with both models (glibc)
         env:
-          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty-x86_64-unknown-linux-gnu
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/libghostty-vt-x86_64-unknown-linux-gnu
         run: cargo run --locked --release --features libghostty --manifest-path "$SPIKE_DIR/Cargo.toml" --bin spike-report -- --models vt100,libghostty --out "$RUNNER_TEMP/report"
 
       - name: Link the musl harness and check the binary
         env:
-          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty-x86_64-unknown-linux-musl
+          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/libghostty-vt-x86_64-unknown-linux-musl
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           set -eu
@@ -178,7 +173,7 @@ jobs:
           fi
           "$binary" --models vt100,libghostty --out "$RUNNER_TEMP/report-musl"
           cmp "$RUNNER_TEMP/report/report.json" "$RUNNER_TEMP/report-musl/report.json"
-          ls -l "$binary" "$RUNNER_TEMP"/ghostty-*/lib/libghostty-vt.a | tee "$RUNNER_TEMP/sizes.txt"
+          ls -l "$binary" "$RUNNER_TEMP"/libghostty-vt-*/lib/libghostty-vt.a | tee "$RUNNER_TEMP/sizes.txt"
 
       # Cold release builds of size-probe with and without the feature, binary
       # sizes, link checks and throughput, per target (scripts/measure). The
@@ -194,7 +189,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/measurements"
           for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
             python3 -I "$SPIKE_DIR/scripts/measure" --target "$target" \
-              --ghostty-dir "$RUNNER_TEMP/ghostty-$target" --runner ubuntu-24.04 \
+              --ghostty-dir "$RUNNER_TEMP/libghostty-vt-$target" --runner ubuntu-24.04 \
               --scratch "$RUNNER_TEMP/measure-$target" \
               --out "$RUNNER_TEMP/measurements/$target.json" |
               tee -a "$RUNNER_TEMP/measurements/table.txt"
@@ -218,7 +213,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: libghostty-vt-aarch64-apple-darwin
-          path: ${{ runner.temp }}/ghostty-aarch64-apple-darwin
+          path: ${{ runner.temp }}/libghostty-vt-aarch64-apple-darwin
           if-no-files-found: error
 
   # Links the cross-built macOS arm64 library on the release runner with the
@@ -248,17 +243,12 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
         with:
-          name: libghostty-vt-aarch64-apple-darwin
-          path: ${{ runner.temp }}/ghostty
-
-      - name: Record the layout of the mirrored types with the host compiler
-        run: python3 -I "$SPIKE_DIR/scripts/build-libghostty-vt" aarch64-apple-darwin "$RUNNER_TEMP/ghostty" --probe-native
+          artifact: libghostty-vt-aarch64-apple-darwin
 
       - name: Link the harness and check the minimum OS
-        env:
-          LIBGHOSTTY_VT_DIR: ${{ runner.temp }}/ghostty
         shell: bash
         run: |
           set -euo pipefail
@@ -280,7 +270,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/measurements"
           python3 -I "$SPIKE_DIR/scripts/measure" --target aarch64-apple-darwin \
-            --ghostty-dir "$RUNNER_TEMP/ghostty" --runner macos-15 \
+            --ghostty-dir "$LIBGHOSTTY_VT_DIR" --runner macos-15 \
             --scratch "$RUNNER_TEMP/measure-macos" \
             --out "$RUNNER_TEMP/measurements/aarch64-apple-darwin.json" |
             tee "$RUNNER_TEMP/measurements/table.txt"

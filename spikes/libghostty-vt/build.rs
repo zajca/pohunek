@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const BUILD_SCRIPT: &str = "spikes/libghostty-vt/scripts/build-libghostty-vt";
+const BUILD_SCRIPT: &str = "scripts/build-libghostty-vt";
 
 fn fail(message: &str) -> ! {
     eprintln!("error: {message}");
@@ -29,7 +29,7 @@ fn key_values(path: &Path) -> BTreeMap<String, String> {
 
 /// The pinned library version, the `version` key of the `[library]` table of the pin file.
 fn pinned_version(manifest_dir: &Path) -> String {
-    let path = manifest_dir.join("libghostty-vt.pin.toml");
+    let path = manifest_dir.join("../../scripts/libghostty-vt.pin.toml");
     println!("cargo:rerun-if-changed={}", path.display());
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|error| fail(&format!("cannot read {}: {error}", path.display())));
@@ -46,7 +46,7 @@ fn pinned_version(manifest_dir: &Path) -> String {
             }
         }
     }
-    fail("libghostty-vt.pin.toml has no [library] version")
+    fail("scripts/libghostty-vt.pin.toml has no [library] version")
 }
 
 fn main() {

@@ -70,16 +70,10 @@ uses it) and through libghostty-vt?
   a method and the mode 2027 state are a separate group, and `pohunek-contract`
   assertions cite Pohunek's own code instead of a public specification.
 - **Build with libghostty.** The `libghostty` cargo feature links a prebuilt
-  static library and is off by default (no Zig, no C library). Zig 0.17.0
-  (the `ZIG_VERSION` of `ci.yml`) and
-  `python3 -I spikes/libghostty-vt/scripts/build-libghostty-vt <rust-target> <out-dir> --tarball-dir <dir>`
-  (or `--fetch`) build the pinned libghostty-vt 1.0.2 from its two sha256-checked
-  tarballs with an offline `zig build` and a fresh `ZIG_GLOBAL_CACHE_DIR`.
-  `LIBGHOSTTY_VT_DIR=<out-dir> cargo build --features libghostty` links it;
-  `build.rs` never downloads anything and never runs Zig. `--zig` and `--pin`
-  select another Zig binary or pin file; `--probe-native` rewrites only
-  `abi-layout.txt` with the host C compiler, for a library cross-built on a host
-  that cannot run the target (the macOS job). Kitty graphics are
+  static library and is off by default (no Zig, no C library). The library is
+  built as described in [libghostty-vt library](#libghostty-vt-library) below;
+  `LIBGHOSTTY_VT_DIR=<out-dir> cargo build --features libghostty` links it, and
+  `build.rs` never downloads anything and never runs Zig. Kitty graphics are
   compiled out, and the headless terminal installs no reply callback.
 - **Measure.** `vt100-scrollback` (`--models vt100,vt100-scrollback,libghostty`)
   is the same parser with the scrollback rows of `config/model.toml`.
@@ -101,9 +95,70 @@ uses it) and through libghostty-vt?
   generated `report.json`, `measurements.json` and `sessiond.json` it cites are
   in `spikes/libghostty-vt/report/`.
 - **CI.** `.github/workflows/libghostty-spike.yml` runs on dispatch and on pull
-  requests that touch the spike. The measurements and the macOS job run on
-  dispatch, or on a pull request that touches a build or measurement input.
-  It is not part of `ci.yml`.
+  requests that touch the spike or the library build. The measurements and the
+  macOS job run on dispatch, or on a pull request that touches a build or
+  measurement input. It builds the library through the shared action below and
+  is not part of `ci.yml`.
+
+### libghostty-vt library
+
+The pinned static library (libghostty-vt 1.0.2, issue #2538) is built outside
+cargo, by one script from one pin file, so a cargo build never downloads a
+tarball or runs a compiler:
+
+- `scripts/libghostty-vt.pin.toml` pins the library version and commit, the
+  two tarballs with their sha256 (the source and the dependency bundle), the
+  Zig version and its sha256, the signing key, the build flags, the Zig target
+  of each Rust target and the size limit of the macOS job. `ZIG_VERSION` and
+  `ZIG_SHA256` in `ci.yml` and `pinned-cache-offline.yml` must equal its
+  `[zig]` table; `scripts/tests/test_libghostty_vt.py` fails otherwise.
+- `scripts/build-libghostty-vt` is the only code that fetches or compiles the
+  library. `python3 -I scripts/build-libghostty-vt <rust-target> <out-dir> --tarball-dir <dir>`
+  (or `--fetch`) checks `zig version` against the pin, verifies both tarballs,
+  and runs an offline `zig build` with a fresh `ZIG_GLOBAL_CACHE_DIR`;
+  `--download-tarballs <dir>` only fetches them, `--verify` checks a built
+  directory against the pin (version, target, archive size and sha256),
+  `--probe-native` rewrites `abi-layout.txt` with the host C compiler for a
+  library cross-built on a host that cannot run the target, `--print-pin
+  SECTION.KEY` prints one pin value and `--evidence <file>` writes the pin as
+  JSON. Locally, install the pinned Zig (the `[zig]` table names its version and
+  sha256) and build the target you need into a directory outside the worktree;
+  a cold build takes about four minutes.
+- `.github/actions/libghostty-vt` (Linux x86_64 runners) is the CI entry point:
+  it restores the built library from its cache entry, keyed by the pin file,
+  the script, the ABI probe and the target, and on a miss installs Zig through
+  `setup-zig`, restores or downloads the two tarballs (their own entry),
+  builds, verifies and saves. It exports `LIBGHOSTTY_VT_DIR`. The
+  `aarch64-apple-darwin` library is cross-built there (the Zig release is an
+  x86_64 Linux binary) and reaches the macOS jobs as a run artifact through
+  `.github/actions/libghostty-vt-macos`, which records the layout of the
+  mirrored types natively and verifies the directory.
+- `.github/workflows/libghostty-vt.yml` (dispatch, pull requests that touch the
+  build inputs, and pushes to main, which save the cache entries) runs
+  `library (<target>)` for the glibc, musl and macOS targets,
+  `offline rebuild (glibc)` (after `library`, in the same run: the built
+  library restores, and a forced rebuild runs from the cached Zig and
+  tarballs with every download host refused), and
+  `macos arm64 (link, minos, size)`, which links the spike's size probe on
+  `macos-15` with the release deployment target, checks `minos 14.0` and fails
+  when the stripped binary grows by more than `max_stripped_size_delta_bytes`
+  of the pin (3 MiB). The size probe stands in for `pohunek-sessiond` until a
+  crate links the library: on Linux its growth (+1.90 MiB) is slightly above
+  the one measured for `pohunek-sessiond` (+1.82 MiB, `report/sessiond.json`).
+- Release: `release-build.yml` runs the action in `binaries`, `kit-linux` and
+  `packages` and builds the macOS library in `libghostty-darwin` for
+  `kit-macos` and `rehearsal-macos`; `release.yml` does the same for
+  `stage-macos`. `libghostty-darwin` also uploads `libghostty-vt-evidence`, the
+  pin as JSON, which `release-evidence.yml` attests with the archives: the
+  supply-chain record of the C library, which `cargo audit` does not see.
+- `pinned-cache-offline.yml` has a `libghostty-vt` job with the same two steps,
+  for `workflow_dispatch` after a main run (it is skipped on a pull request,
+  where the entries of main do not exist yet). `release.files.ghostty.org` is
+  one of its refused hosts.
+- `scripts/tests/test_libghostty_vt.py` runs the action's miss, hit and forced
+  rebuild, and keeps a list of the workflow jobs that run cargo: each one either
+  uses the action or is listed as not yet linking the library, so a new lane
+  cannot be added without a decision.
 
 Read **[AGENTS.md](../AGENTS.md)** first, then follow its task-specific
 instruction routes.
@@ -227,6 +282,15 @@ that path too.
   `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
+
+The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
+`ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
+`library (x86_64-unknown-linux-musl)`, `library (aarch64-apple-darwin)`,
+`offline rebuild (glibc)` and `macos arm64 (link, minos, size)` run on a pull
+request that touches the library build inputs (see
+[libghostty-vt library](#libghostty-vt-library)) and decide that pull request by
+their own result. The release jobs `libghostty-vt for aarch64-apple-darwin`
+(`release-build.yml`, `release.yml`) belong to the release run.
 
 The nightly `CI budgets` workflow checks per-step and per-job medians over the
 newest 30 green `ci.yml` runs per event against `scripts/ci-budgets.json`:
@@ -381,7 +445,9 @@ in `/etc/hosts` and fails unless each one then refuses a connection. It then
 installs every pinned item exactly like its `ci.yml` site, on the image and
 Node its key names, and its last step requires the `hit` output of every item
 (setup-mold, setup-zig and setup-uv forward the one of their pinned restore);
-offline, a miss fails its install anyway. The cache service and `api.github.com`/`codeload.github.com`,
+offline, a miss fails its install anyway. The `libghostty-vt` job runs the
+[libghostty-vt action](#libghostty-vt-library) twice instead: a restore of the
+built library, and a forced rebuild from the cached Zig and tarballs. The cache service and `api.github.com`/`codeload.github.com`,
 through which the runner fetches the actions nested in the composites, stay
 reachable. Run it with `gh workflow run pinned-cache-offline.yml` after a
 main run has saved the entries; on a pull request it runs only when the

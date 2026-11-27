@@ -1545,6 +1545,12 @@ jobs:
               - '.github/actions/setup-mold/**'
               - '.github/actions/setup-uv/**'
               - '.github/actions/pinned-cache/**'
+              - '.github/actions/setup-zig/**'
+              - '.github/actions/libghostty-vt/**'
+              - '.github/actions/libghostty-vt-macos/**'
+              - 'scripts/build-libghostty-vt'
+              - 'scripts/libghostty-vt-abi-probe.c'
+              - 'scripts/libghostty-vt.pin.toml'
             # The release gate's test steps (gate-tests.yml) run on a pull
             # request that changes what they run or how: the two workflows,
             # the nextest profiles and shard filters, and the partition and

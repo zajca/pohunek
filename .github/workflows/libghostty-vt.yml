@@ -1,0 +1,266 @@
+# Builds the pinned libghostty-vt static library for every shipped target
+# through .github/actions/libghostty-vt, and proves what the rest of CI relies
+# on (issue #2538):
+#
+#   library  one job per target: the action restores the cached library or
+#            builds it with the pinned Zig (cold) and saves it, then the job
+#            checks the result (BUILD_INFO against the pin, no C++ runtime
+#            symbol in the Linux archives). The aarch64-apple-darwin library
+#            is cross-built here and uploaded for the macOS job.
+#   offline  after `library`, in the same run: restores the built library and
+#            rebuilds it from the cached Zig and tarballs with every download
+#            host refused (the proof of pinned-cache-offline.yml, run where
+#            the entries are guaranteed to exist).
+#   macos    links the cross-built library on macos-15 with the deployment
+#            target of the release, records the layout of the mirrored types
+#            with the host compiler, checks the minimum OS and fails when the
+#            stripped binary grows by more than the pin's size limit.
+#
+# A push to main saves the cache entries that pull requests and the offline
+# proof (pinned-cache-offline.yml) restore: a run on a pull request reads the
+# entries of its base branch and of its own ref.
+#
+# Linux jobs are pinned to ubuntu-24.04, never ubuntu-latest.
+# Run it with `gh workflow run libghostty-vt.yml`.
+name: libghostty-vt
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/build-libghostty-vt
+      - scripts/libghostty-vt-abi-probe.c
+      - scripts/libghostty-vt-size-gate
+      - scripts/libghostty-vt.pin.toml
+      - .github/actions/libghostty-vt/**
+      - .github/actions/libghostty-vt-macos/**
+      - .github/actions/setup-zig/**
+      - spikes/libghostty-vt/scripts/measure
+      - .github/workflows/libghostty-vt.yml
+  pull_request:
+    paths:
+      - scripts/build-libghostty-vt
+      - scripts/libghostty-vt-abi-probe.c
+      - scripts/libghostty-vt-size-gate
+      - scripts/libghostty-vt.pin.toml
+      - .github/actions/libghostty-vt/**
+      - .github/actions/libghostty-vt-macos/**
+      - .github/actions/setup-zig/**
+      - spikes/libghostty-vt/scripts/measure
+      - .github/workflows/libghostty-vt.yml
+
+permissions: {}
+
+concurrency:
+  group: libghostty-vt-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A Python script never imports from its own directory or the working
+  # directory, so a file a pull request adds there cannot shadow a module.
+  PYTHONSAFEPATH: "1"
+  CARGO_TERM_COLOR: always
+  SPIKE_DIR: spikes/libghostty-vt
+  # The hosts of the miss paths and the bound of the offline check, as in
+  # pinned-cache-offline.yml (scripts/tests/test_libghostty_vt.py keeps the
+  # host list equal).
+  OFFLINE_HOSTS: >-
+    github.com objects.githubusercontent.com release-assets.githubusercontent.com
+    raw.githubusercontent.com ziglang.org get.nexte.st crates.io index.crates.io
+    static.crates.io static.rust-lang.org release.files.ghostty.org
+  OFFLINE_CONNECT_TIMEOUT_SECONDS: "5"
+
+jobs:
+  library:
+    name: library (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Check the archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          LIBRARY_DIR: ${{ steps.library.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cat "$LIBRARY_DIR/BUILD_INFO"
+          ls -l "$LIBRARY_DIR/lib/libghostty-vt.a"
+          case "$TARGET" in
+            *-linux-*)
+              # The archive must pull in no C++ runtime: the musl binary is
+              # fully static and the glibc one has no libstdc++ to find.
+              if nm -u "$LIBRARY_DIR/lib/libghostty-vt.a" 2>/dev/null | grep -E '_ZSt|__cxa_|__gxx_'; then
+                echo "::error::the $TARGET archive references the C++ runtime" >&2
+                exit 1
+              fi
+              # The ABI probe ran on this host and recorded real layouts.
+              grep -q '=' "$LIBRARY_DIR/abi-layout.txt"
+              ;;
+            *)
+              # A cross-built probe cannot run here; the macOS job records the layout.
+              grep -q 'probe not runnable' "$LIBRARY_DIR/abi-layout.txt"
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ matrix.target == 'aarch64-apple-darwin' }}
+        with:
+          name: libghostty-vt-aarch64-apple-darwin
+          path: ${{ steps.library.outputs.dir }}
+          if-no-files-found: error
+          overwrite: true
+
+  # The offline proof of the action, independent of whether `library` hit or
+  # missed. An online forced build first restores the Zig and tarball entries
+  # or downloads and saves them in this job, so the offline steps find them
+  # under every cache state. Then, with every download host of the miss paths
+  # refused, the built library restores from its entry and a second forced
+  # build runs from the cached Zig and tarballs. The same proof runs from
+  # pinned-cache-offline.yml after a main run.
+  offline:
+    name: offline rebuild (glibc)
+    needs: library
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Populate the Zig and tarball entries online
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+          force-build: "true"
+
+      - name: Take the miss-path download hosts offline
+        timeout-minutes: 5
+        run: |
+          sudo python3 -I .github/scripts/pinned-cache-offline apply \
+            --hosts-file /etc/hosts --connect-timeout "$OFFLINE_CONNECT_TIMEOUT_SECONDS" \
+            --apt-dir /etc/apt \
+            --npm-lock compat/pi/npm/package-lock.json \
+            --npm-lock compat/codex/npm/package-lock.json \
+            --npm-lock compat/claude/npm/package-lock.json \
+            $OFFLINE_HOSTS
+
+      - name: Restore the built libghostty-vt library
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 10
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+
+      - name: Rebuild libghostty-vt from the cached Zig and tarballs
+        id: rebuild
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 20
+        with:
+          target: x86_64-unknown-linux-gnu
+          export-env: "false"
+          force-build: "true"
+
+      - name: Require a hit for every restore
+        env:
+          HITS: library=${{ steps.library.outputs.hit }} zig=${{ steps.rebuild.outputs.zig-hit }} tarballs=${{ steps.rebuild.outputs.tarballs-hit }}
+        run: |
+          set -euo pipefail
+          for hit in $HITS; do
+            [ "${hit#*=}" = true ] || { echo "::error::libghostty-vt offline proof: ${hit%%=*} did not hit" >&2; exit 1; }
+          done
+          echo "every restore hit: $HITS"
+
+  macos:
+    name: macos arm64 (link, minos, size)
+    needs: library
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      # The deployment target of the release (packaging/macos/DEPLOYMENT_TARGET).
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: The deployment target is the release's
+        shell: bash
+        run: test "$(tr -d ' \n' < packaging/macos/DEPLOYMENT_TARGET)" = "$MACOSX_DEPLOYMENT_TARGET"
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-aarch64-apple-darwin
+
+      # Cold release builds of the size probe with and without the library:
+      # the link must carry the minimum OS of the release and the stripped
+      # binary may grow by at most the pin's limit.
+      - name: Measure (macOS arm64)
+        timeout-minutes: 40
+        shell: bash
+        env:
+          LIBRARY_DIR: ${{ steps.library.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/measurements"
+          python3 -I "$SPIKE_DIR/scripts/measure" --target aarch64-apple-darwin \
+            --ghostty-dir "$LIBRARY_DIR" --runner macos-15 \
+            --scratch "$RUNNER_TEMP/measure-macos" \
+            --out "$RUNNER_TEMP/measurements/aarch64-apple-darwin.json" |
+            tee "$RUNNER_TEMP/measurements/table.txt"
+          cat "$RUNNER_TEMP/measurements/table.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the size limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I scripts/libghostty-vt-size-gate \
+            --measurements "$RUNNER_TEMP/measurements/aarch64-apple-darwin.json" |
+            tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ always() }}
+        with:
+          name: libghostty-vt-measurements-macos
+          path: ${{ runner.temp }}/measurements
+          if-no-files-found: ignore
+          overwrite: true

@@ -1,0 +1,66 @@
+name: libghostty-vt (macOS arm64)
+description: >-
+  Provide the pinned libghostty-vt static library on an Apple Silicon runner
+  (issue #2538). The library is cross-built on Linux by
+  `.github/actions/libghostty-vt` (the Zig release is an x86_64 Linux binary)
+  and handed over as a run artifact. This action downloads it, records the
+  layout of the mirrored C types with the host compiler (the cross-built
+  probe could not run), verifies the directory against the pin and, unless
+  told otherwise, writes `LIBGHOSTTY_VT_DIR` to `GITHUB_ENV`. The checkout
+  must be present.
+
+inputs:
+  artifact:
+    description: Name of the artifact the Linux producer job uploaded.
+    required: true
+  export-env:
+    description: >-
+      `true` writes `LIBGHOSTTY_VT_DIR` to `GITHUB_ENV` for the later steps of
+      the job.
+    required: false
+    default: "true"
+
+outputs:
+  dir:
+    description: The directory holding `lib/`, `include/`, `abi-layout.txt` and `BUILD_INFO`.
+    value: ${{ steps.dir.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the inputs
+      id: dir
+      shell: bash
+      env:
+        ARTIFACT: ${{ inputs.artifact }}
+        EXPORT_ENV: ${{ inputs.export-env }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::libghostty-vt-macos: $*" >&2; exit 1; }
+        [ -n "$ARTIFACT" ] || fail "input 'artifact' is required"
+        case "$EXPORT_ENV" in true|false) ;; *) fail "input 'export-env' must be true or false, not '$EXPORT_ENV'" ;; esac
+        [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ] || fail "runs on an Apple Silicon runner only"
+        echo "dir=${RUNNER_TEMP:?}/libghostty-vt-aarch64-apple-darwin" >> "$GITHUB_OUTPUT"
+
+    - name: Download the cross-built library
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: ${{ inputs.artifact }}
+        path: ${{ steps.dir.outputs.dir }}
+
+    - name: Record the layout of the mirrored types and verify the library
+      shell: bash
+      env:
+        OUT_DIR: ${{ steps.dir.outputs.dir }}
+      run: |
+        set -euo pipefail
+        script="${GITHUB_WORKSPACE:?}/scripts/build-libghostty-vt"
+        python3 -I "$script" aarch64-apple-darwin "$OUT_DIR" --probe-native
+        python3 -I "$script" aarch64-apple-darwin "$OUT_DIR" --verify
+
+    - name: Export LIBGHOSTTY_VT_DIR
+      if: inputs.export-env == 'true'
+      shell: bash
+      env:
+        OUT_DIR: ${{ steps.dir.outputs.dir }}
+      run: echo "LIBGHOSTTY_VT_DIR=$OUT_DIR" >> "${GITHUB_ENV:?}"

@@ -1,5 +1,6 @@
-# Pins of the libghostty-vt build. `scripts/build-libghostty-vt` and `build.rs`
-# read this file; nothing else downloads or compiles libghostty.
+# Pins of the libghostty-vt build. `scripts/build-libghostty-vt`, the
+# `.github/actions/libghostty-vt` action and `build.rs` read this file; nothing
+# else downloads or compiles libghostty.
 
 [library]
 version = "1.0.2"
@@ -15,10 +16,20 @@ url = "https://release.files.ghostty.org/libghostty-vt/1.0.2/libghostty-vt-1.0.2
 sha256 = "c56156dbea82fdf71f13bf0d704cdf4393b6a04208d7f9691e0d7f60c7f9ca4d"
 
 [zig]
-# Must equal ZIG_VERSION in .github/workflows/ci.yml; a step of .github/workflows/libghostty-spike.yml checks it.
+# `version` and `linux_x86_64_sha256` must equal ZIG_VERSION and ZIG_SHA256 in
+# .github/workflows/ci.yml and pinned-cache-offline.yml;
+# scripts/tests/test_libghostty_vt.py checks it.
 version = "0.17.0"
+# sha256 of zig-x86_64-linux-<version>.tar.xz as published by ziglang.org.
+linux_x86_64_sha256 = "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
 # Public key that signs the tarballs (PACKAGING-LIBGHOSTTY.md of the release).
 minisign_public_key = "RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV"
+
+[limits]
+# Largest growth of a stripped aarch64-apple-darwin release binary that linking
+# the library may cause (3 MiB); the macOS job of
+# .github/workflows/libghostty-vt.yml fails above it.
+max_stripped_size_delta_bytes = 3145728
 
 [build]
 optimize = "ReleaseFast"
@@ -28,7 +39,7 @@ download_timeout_seconds = 300
 # The download host answers HTTP 403 to the default `Python-urllib` agent, so
 # the request names itself. A failed attempt (network error, 5xx, 429) is
 # retried with a doubling wait; any other HTTP status fails at once.
-user_agent = "pohunek-libghostty-spike-build/1 (+https://github.com/zajca/pohunek)"
+user_agent = "pohunek-libghostty-build/1 (+https://github.com/zajca/pohunek)"
 download_attempts = 3
 download_backoff_seconds = 10
 # The two tarballs are about 10 MB together.

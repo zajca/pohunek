@@ -35,9 +35,9 @@ const MIB: f64 = 1_048_576.0;
 /// What one run feeds: only the parsing path, with no cell dump or diff.
 enum Subject {
     /// `TerminalTracker`, as the session worker runs it.
-    Tracker(pohunek_terminal::TerminalTracker),
+    Tracker(Box<pohunek_terminal::TerminalTracker>),
     /// A bare `vt100` parser, with or without scrollback.
-    Parser(vt100::Parser),
+    Parser(Box<vt100::Parser>),
     /// libghostty-vt with the production settings of the spike.
     #[cfg(feature = "libghostty")]
     Ghostty(Box<pohunek_libghostty_spike::ghostty::HeadlessTerminal>),
@@ -46,15 +46,15 @@ enum Subject {
 impl Subject {
     fn new(name: &str, config: &ModelConfig, rows: u16, cols: u16) -> Result<Self, String> {
         match name {
-            "vt100" => Ok(Self::Tracker(pohunek_terminal::TerminalTracker::new(
-                rows, cols,
+            "vt100" => Ok(Self::Tracker(Box::new(
+                pohunek_terminal::TerminalTracker::new(rows, cols),
             ))),
-            "vt100-parser" => Ok(Self::Parser(vt100::Parser::new(rows, cols, 0))),
-            "vt100-scrollback" => Ok(Self::Parser(vt100::Parser::new(
+            "vt100-parser" => Ok(Self::Parser(Box::new(vt100::Parser::new(rows, cols, 0)))),
+            "vt100-scrollback" => Ok(Self::Parser(Box::new(vt100::Parser::new(
                 rows,
                 cols,
                 config.vt100_scrollback_rows,
-            ))),
+            )))),
             #[cfg(feature = "libghostty")]
             "libghostty" => {
                 pohunek_libghostty_spike::ghostty::HeadlessTerminal::new(config, rows, cols)

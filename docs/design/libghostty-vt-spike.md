@@ -346,7 +346,7 @@ of this change; both need the owner's explicit decision.
 ## Reproduce
 
 ```bash
-python3 -I spikes/libghostty-vt/scripts/build-libghostty-vt x86_64-unknown-linux-gnu OUT --fetch
+python3 -I scripts/build-libghostty-vt x86_64-unknown-linux-gnu OUT --fetch
 LIBGHOSTTY_VT_DIR=OUT cargo run --release --features libghostty \
   --manifest-path spikes/libghostty-vt/Cargo.toml --bin spike-report -- \
   --models vt100,vt100-scrollback,libghostty --out report-out
