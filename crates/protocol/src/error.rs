@@ -743,6 +743,42 @@ impl ProtocolError {
         )
     }
 
+    /// Stable code of [`Self::project_actions_too_large`].
+    pub const PROJECT_ACTIONS_TOO_LARGE: &'static str = "project_actions_too_large";
+
+    /// The canonical error for a `project.actions` result whose resolved
+    /// actions exceed the public response budget.
+    #[must_use]
+    pub fn project_actions_too_large() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            Self::PROJECT_ACTIONS_TOO_LARGE,
+            "the resolved project actions exceed the public response budget",
+            Some(
+                "remove actions from the project's .pohunek/actions.toml or the host actions.toml so at most 1024 resolve"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// Stable code of [`Self::host_discover_too_large`].
+    pub const HOST_DISCOVER_TOO_LARGE: &'static str = "host_discover_too_large";
+
+    /// The canonical error for a `host.discover` result whose peer records do
+    /// not fit one control line.
+    #[must_use]
+    pub fn host_discover_too_large() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            Self::HOST_DISCOVER_TOO_LARGE,
+            "the discovered hosts exceed the public response budget",
+            Some(
+                "the configured overlay reported more peers than one reply may carry; shrink the overlay or configure fewer peers"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/session_has_no_managed_terminal` error.
     #[must_use]
     pub fn session_has_no_managed_terminal() -> Self {

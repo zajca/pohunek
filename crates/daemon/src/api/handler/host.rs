@@ -6,10 +6,26 @@ use protocol::{
 
 use super::util::error_value;
 
-use super::util::{ok_value, parse_optional_params, parse_params, run_blocking, selected_version};
+use super::util::{
+    ok_value, ok_value_bounded, parse_optional_params, parse_params, run_blocking, selected_version,
+};
 use super::{ControlTransport, HealthInfo};
 use crate::discovery::DiscoveryCache;
 use crate::session::SessionRegistry;
+
+/// Hard count bound on the `host.discover` reply: 1024 peer records.
+///
+/// The success reply is one control line of at most `MAX_CONTROL_LINE_BYTES`
+/// (1 MiB), envelope included. One [`protocol::HostRecord`] serializes with at
+/// most a 63-byte first DNS label as `name`, a 253-byte DNS `fqdn`, a 45-byte
+/// IP `address`, a 5-digit `port`, a 9-byte known overlay id, a 64-byte provider
+/// `peer_id`, an 18-byte `reason`, a class tag of at most 48 bytes plus a
+/// 16-byte daemon version, and 85 bytes of keys, quotes and punctuation —
+/// 606 bytes, sized here at 640 with margin. The worst case is
+/// 1024 × 640 B = 640 KiB, below one control line. A reply that is still too
+/// large is refused by the reply's byte-level check with the same
+/// `host_discover_too_large` code.
+const MAX_HOST_DISCOVER_RECORDS: usize = 1024;
 
 /// `host.inspect`: report this host's live capability snapshot.
 ///
@@ -94,6 +110,10 @@ fn heartbeat_capability(sessions: &SessionRegistry) -> protocol::SubscribeHeartb
 /// advertised (a client keeps its whole window on this method, see
 /// [`protocol::compat::RANGE_FORWARDING_METHODS`]), and cached per range. Discovery errors retain their typed protocol mapping rather than
 /// being represented as an empty peer list.
+///
+/// The reply is count-bounded by [`MAX_HOST_DISCOVER_RECORDS`] and itself goes
+/// through the control-line check, so an oversized result answers
+/// `host_discover_too_large` instead of a frame the client refuses.
 pub(super) async fn handle_host_discover(
     request: &Request,
     discovery: &DiscoveryCache,
@@ -106,7 +126,12 @@ pub(super) async fn handle_host_discover(
         .records(params.force, request.version_range())
         .await
     {
-        Ok(records) => ok_value(request, &records),
+        Ok(records) if records.len() > MAX_HOST_DISCOVER_RECORDS => {
+            error_value(request, ProtocolError::host_discover_too_large())
+        }
+        Ok(records) => {
+            ok_value_bounded(request, &records, ProtocolError::host_discover_too_large())
+        }
         Err(err) => error_value(request, err.to_protocol_error()),
     }
 }

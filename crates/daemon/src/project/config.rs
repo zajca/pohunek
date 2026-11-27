@@ -90,6 +90,22 @@ struct LayeredActions {
     repo: HashMap<String, RawAction>,
 }
 
+/// Hard count bound on the resolved `project.actions` list: 1024 actions.
+///
+/// The success reply is one control line of at most `MAX_CONTROL_LINE_BYTES`
+/// (1 MiB), envelope included. One [`ActionSummary`] serializes as
+/// `{"name":"…","provider":"…","template":"…","layer":"…"}`: `provider` is one
+/// of three fixed wire strings of at most 12 bytes, `layer` one of two of at
+/// most 7 bytes, and the keys, quotes and punctuation total 69 bytes, so a
+/// record costs its two name strings plus at most 69 bytes. Both name strings
+/// pass the single-segment charset guard ([`validate_name`]), so they are
+/// ASCII and JSON escaping never grows them. Sizing the largest record the
+/// count bound admits at 512 bytes, the worst case is 1024 × 512 B = 512 KiB,
+/// half of one control line. A reply that is still too large because fewer
+/// records carry longer names is refused by the reply's byte-level check with
+/// the same `project_actions_too_large` code.
+pub(crate) const MAX_PROJECT_ACTIONS: usize = 1024;
+
 /// Resolves per-project config from the in-repo and host-default layers, applying
 /// the name + containment guards on every read.
 ///
@@ -200,11 +216,19 @@ impl ProjectConfigResolver {
     }
 
     /// List action summaries after applying in-repo-over-host shadowing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `project_actions_too_large` when more than [`MAX_PROJECT_ACTIONS`]
+    /// actions resolve, so the reply stays within one control line.
     pub(crate) fn list_actions(&self) -> Result<Vec<ActionSummary>, ProtocolError> {
         let layers = self.load_actions("actions")?;
         let mut names = BTreeSet::new();
         names.extend(layers.host.keys().cloned());
         names.extend(layers.repo.keys().cloned());
+        if names.len() > MAX_PROJECT_ACTIONS {
+            return Err(ProtocolError::project_actions_too_large());
+        }
 
         let mut actions = Vec::with_capacity(names.len());
         for name in names {

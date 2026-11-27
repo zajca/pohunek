@@ -318,6 +318,11 @@ pub(super) async fn handle_project_action(
 
 /// `project.actions`: list the actions resolvable for a project (the union across
 /// the in-repo and host layers), with the template each uses.
+///
+/// The resolved list is count-bounded by `MAX_PROJECT_ACTIONS`
+/// (`crate::project::config`) and the reply itself goes through the
+/// control-line check, so an oversized result answers `project_actions_too_large`
+/// instead of a frame the client refuses.
 pub(super) async fn handle_project_actions(
     request: &Request,
     sessions: &SessionRegistry,
@@ -332,13 +337,19 @@ pub(super) async fn handle_project_actions(
     };
     let config_dir = sessions.config_dir().map(Path::to_path_buf);
     let ProjectActionsParams { reference } = params;
-    run_project_blocking(request, move || {
-        let record = pm.resolve(&reference)?;
-        let resolver = ProjectConfigResolver::new(record.repo_root, config_dir);
-        resolver
-            .list_actions()
-            .map(|actions| ProjectActionsResult { actions })
-    })
+    super::util::run_blocking_bounded(
+        request,
+        move || {
+            let record = pm.resolve(&reference)?;
+            let resolver = ProjectConfigResolver::new(record.repo_root, config_dir);
+            resolver
+                .list_actions()
+                .map(|actions| ProjectActionsResult { actions })
+        },
+        "project_task_panicked",
+        "project operation task panicked",
+        ProtocolError::project_actions_too_large(),
+    )
     .await
 }
 
