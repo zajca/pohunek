@@ -93,6 +93,10 @@ impl ProfileHead {
 pub(crate) enum BindError {
     /// The host has no such profile.
     NotFound,
+    /// A profile file exists under `name`, but `name` itself fails
+    /// [`validate_name`] (for example it is over the byte cap): a file that is
+    /// on disk must not read as absent.
+    NameInvalid,
     /// The profile fails the acceptance rule, is a link, or is not rewritable
     /// TOML.
     Unusable(String),
@@ -412,11 +416,19 @@ impl BindDir {
     ///
     /// # Errors
     ///
-    /// Returns [`BindError::NotFound`] for a missing profile and
-    /// [`BindError::Unusable`] for one that fails the rule or is a link.
+    /// Returns [`BindError::NotFound`] for a missing profile,
+    /// [`BindError::NameInvalid`] for a file that is on disk under a name the
+    /// acceptance rule refuses, and [`BindError::Unusable`] for one that fails
+    /// the rule or is a link.
     pub(crate) fn read(&self, name: &str) -> Result<ProfileFile, BindError> {
         if validate_name("agent", name).is_err() {
-            return Err(BindError::NotFound);
+            // A file that is on disk under a refused name must not read as
+            // absent.
+            return Err(if self.file_exists_unvalidated(name) {
+                BindError::NameInvalid
+            } else {
+                BindError::NotFound
+            });
         }
         let file = profile_file_name(name);
         let path = self.root.join(&file);

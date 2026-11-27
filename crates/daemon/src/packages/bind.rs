@@ -63,6 +63,11 @@ pub(super) struct Target {
 pub(super) fn bind_kind(profile: &str, error: BindError) -> PackageError {
     match error {
         BindError::NotFound => PackageError::from(PackageErrorKind::ProfileNotFound),
+        BindError::NameInvalid => {
+            // The refused name is not logged: it can be over the byte cap.
+            warn!("a profile file is on disk under a name the daemon refuses to load");
+            PackageError::from(PackageErrorKind::ProfileNameInvalid)
+        }
         BindError::Unusable(detail) => {
             warn!(%profile, %detail, "an agent profile cannot be rewritten");
             PackageError::from(PackageErrorKind::ProfileUnusable)
