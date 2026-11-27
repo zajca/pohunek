@@ -23,9 +23,7 @@ use std::sync::mpsc::channel;
 
 use futures::{SinkExt as _, StreamExt as _};
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::owner::{
-    self, HostInspector, ProcessIdentity, ProcessInspector, StartIdentity,
-};
+use pohunek_test_support::owner::{self, HostInspector, ProcessInspector};
 use pohunek_test_support::wait::{poll_until, wait_until, HANG_GUARD};
 use pohunek_test_support::workers;
 use pohunek_test_support::{bin_exe, worker_binary};
@@ -307,18 +305,14 @@ fn a_sigkilled_scenario_leaves_no_daemon_worker_or_session_of_its_root() {
         },
     );
     for (kind, pid, start) in &report.processes {
-        let expected = ProcessIdentity {
-            pid: *pid,
-            start_identity: StartIdentity::new(start.parse().expect("numeric start identity")),
-        };
         poll_until(
             &format!("the {kind} {pid} of the killed scenario to end"),
             || {
-                let gone = match inspector.identity(*pid) {
-                    Ok(None) => true,
-                    Ok(Some(current)) => current != expected,
-                    // Not evidence of an exit; the reaper has not finished yet.
-                    Err(_) => false,
+                // The child reported the start identity in the process
+                // table's own spelling, so compare it in that spelling.
+                let gone = match workers::try_start_of(*pid) {
+                    None => true,
+                    Some(current) => current != *start,
                 };
                 gone.then_some(())
             },

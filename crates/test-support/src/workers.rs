@@ -499,6 +499,17 @@ pub fn try_child_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
         .collect())
 }
 
+/// Returns the start identity of `pid` as the process table spells it, or
+/// `None` when the process is gone.
+///
+/// The spelling is platform-dependent (clock ticks on Linux, the `lstart`
+/// text of `ps` elsewhere), so it is only comparable with a start identity
+/// reported by this module.
+#[must_use]
+pub fn try_start_of(pid: u32) -> Option<String> {
+    start_of(pid)
+}
+
 /// [`try_workers_under`] that also follows the sessions in `retained`.
 fn workers_retaining(root: &Path, retained: &[ProcessId]) -> io::Result<Vec<WorkerProcess>> {
     let own_pid = std::process::id();

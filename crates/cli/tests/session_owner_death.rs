@@ -31,9 +31,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pohunek_client::Client;
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::owner::{
-    self, HostInspector, ProcessIdentity, ProcessInspector, StartIdentity,
-};
+use pohunek_test_support::owner;
 use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
 use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 use pohunek_test_support::workers;
@@ -260,20 +258,15 @@ fn assert_root_reaped(root: &Path, processes: &[(String, u32, String)]) {
                 .map(|_| ())
         },
     );
-    let inspector = HostInspector::new();
     for (kind, pid, start) in processes {
-        let expected = ProcessIdentity {
-            pid: *pid,
-            start_identity: StartIdentity::new(start.parse().expect("numeric start identity")),
-        };
         poll_until(
             &format!("the {kind} {pid} of the killed scenario to end"),
             || {
-                let gone = match inspector.identity(*pid) {
-                    Ok(None) => true,
-                    Ok(Some(current)) => current != expected,
-                    // Not evidence of an exit; the reaper has not finished yet.
-                    Err(_) => false,
+                // The child reported the start identity in the process
+                // table's own spelling, so compare it in that spelling.
+                let gone = match workers::try_start_of(*pid) {
+                    None => true,
+                    Some(current) => &current != start,
                 };
                 gone.then_some(())
             },
