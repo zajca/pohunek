@@ -1,7 +1,9 @@
 //! `project.*` methods plus the shared project-manager and blocking helpers.
 //!
 //! Project operations touch the git working copy and the metadata store, so all
-//! of them are pushed off the async runtime via [`run_project_blocking`]. The
+//! of them are pushed off the async runtime, through [`run_project_blocking`] or,
+//! for `project.list`, the bounded variant that answers an oversized result with
+//! a typed error. The
 //! registry owns the [`ProjectManager`]; [`require_projects`] surfaces the typed
 //! error when the daemon runs without a metadata store.
 
@@ -85,8 +87,39 @@ pub(super) async fn handle_project_list(request: &Request, sessions: &SessionReg
         Ok(pm) => pm,
         Err(resp) => return resp,
     };
-    let filters = params.filters;
-    run_project_blocking(request, move || pm.list(&filters)).await
+    let ProjectListParams {
+        filters,
+        limit,
+        cursor,
+    } = params;
+    if limit == Some(0) {
+        return error_value(
+            request,
+            ProtocolError::bad_request("project.list limit must be at least 1"),
+        );
+    }
+    super::util::run_blocking_bounded(
+        request,
+        move || {
+            let mut projects = pm.list(&filters)?;
+            if limit.is_some() || cursor.is_some() {
+                // Pages follow the immutable id, so a rename between two
+                // requests cannot move a project across the cursor.
+                projects.sort_by(|a, b| a.id.cmp(&b.id));
+                if let Some(cursor) = &cursor {
+                    projects.retain(|project| project.id.as_str() > cursor.as_str());
+                }
+                if let Some(limit) = limit {
+                    projects.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+                }
+            }
+            Ok(projects)
+        },
+        "project_task_panicked",
+        "project operation task panicked",
+        ProtocolError::project_list_too_large(),
+    )
+    .await
 }
 
 /// `project.candidates`: repositories proposed from pohunek sessions and, when

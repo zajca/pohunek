@@ -14,6 +14,15 @@ list, add, show, rename, forget, and resolve project-specific prompts and
 actions. The current CLI exposes `pohunek project list`, `add`, `show`,
 `rename`, `rm`, `prompt`, `action`, `actions`, and `candidates`.
 
+`project.list` orders projects by label, then id, and takes `limit` and `cursor`;
+a page is ordered by id and `cursor` is the id of its last project. A set that
+does not fit one control line is refused with `project_list_too_large`;
+`pohunek project list` and the Rust SDK `Client::project_list` page through the set
+themselves, 200 projects at a time and fewer when the daemon says the page is too
+large, and sort the result by label, then id. Pages follow the immutable id, so a
+rename during a walk neither hides nor repeats a project; a listing that takes
+several pages is still not a snapshot of projects registered or removed meanwhile.
+
 Projects give sessions stable targeting. A remote host can resolve a project id
 or label on that host without the local CLI sending a local filesystem path.
 Project records also carry the default base branch used when sessions create

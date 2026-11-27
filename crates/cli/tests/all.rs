@@ -110,6 +110,8 @@ mod plugin_profile_list_audience;
 mod plugin_profile_rm;
 #[path = "plugin_run.rs"]
 mod plugin_run;
+#[path = "project_list_paging.rs"]
+mod project_list_paging;
 #[path = "prompt_link.rs"]
 mod prompt_link;
 #[path = "prompt_render.rs"]

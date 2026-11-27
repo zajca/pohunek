@@ -432,6 +432,48 @@ struct Conn<S> {
     poisoned: Option<String>,
 }
 
+/// One `session.list` page at a time over a client's connection.
+struct SessionPages<'a> {
+    client: &'a mut Client,
+    params: protocol::SessionListParams,
+}
+
+impl crate::paging::PageSource<protocol::SessionInfo> for SessionPages<'_> {
+    async fn fetch(
+        &mut self,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Vec<protocol::SessionInfo>, ClientError> {
+        let mut page = self.params.clone();
+        page.limit = Some(limit);
+        page.cursor = cursor;
+        self.client
+            .call_direct::<protocol::method::SessionList>(page)
+            .await
+    }
+}
+
+/// One `project.list` page at a time over a client's connection.
+struct ProjectPages<'a> {
+    client: &'a mut Client,
+    params: protocol::ProjectListParams,
+}
+
+impl crate::paging::PageSource<protocol::ProjectInfo> for ProjectPages<'_> {
+    async fn fetch(
+        &mut self,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Vec<protocol::ProjectInfo>, ClientError> {
+        let mut page = self.params.clone();
+        page.limit = Some(limit);
+        page.cursor = cursor;
+        self.client
+            .call_direct::<protocol::method::ProjectList>(page)
+            .await
+    }
+}
+
 /// The outcome of routing one generic `call` through the gated typed helpers:
 /// either the helper already answered, or the params come back unclaimed.
 enum CallGate<Params> {
@@ -831,7 +873,8 @@ impl Client {
     /// `session.input`, `session.new`, `session.resume`,
     /// `session.stop`, `session.remove`, `session.remove_accepting_unconfirmed`,
     /// `session.wait`, `session.wait_turn`, `session.output`, `session.list`,
-    /// `session.retention.sweep`, and `session.remove_tree` take the same
+    /// `project.list`, `session.retention.sweep`, and `session.remove_tree`
+    /// take the same
     /// dedicated-connection budgets and capability gates as their typed
     /// helpers. The lower-level
     /// [`Self::request`] remains available for callers that need raw JSON
@@ -913,6 +956,13 @@ impl Client {
             let params =
                 serde_json::from_value::<SessionOutputParams>(serde_json::to_value(params)?)?;
             let result = self.session_output(params).await?;
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
+        }
+        if name == protocol::method::PROJECT_LIST {
+            let params = serde_json::from_value::<protocol::ProjectListParams>(
+                serde_json::to_value(params)?,
+            )?;
+            let result = self.project_list(params).await?;
             return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
         if name == protocol::method::SESSION_LIST {
@@ -1139,6 +1189,35 @@ impl Client {
         }
     }
 
+    /// List projects. An explicit `limit` is one request, in id order; without
+    /// one the whole matching set is collected by following `cursor` page by
+    /// page (see [`crate::paging::every_page`]), so it never has to fit one
+    /// control line, and is returned ordered by label, then id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails, the daemon reports an
+    /// error, or a page does not follow its cursor.
+    pub async fn project_list(
+        &mut self,
+        params: protocol::ProjectListParams,
+    ) -> Result<Vec<protocol::ProjectInfo>, ClientError> {
+        if params.limit.is_some() {
+            return self
+                .call_direct::<protocol::method::ProjectList>(params)
+                .await;
+        }
+        let mut source = ProjectPages {
+            client: self,
+            params,
+        };
+        let mut projects =
+            crate::paging::every_page(&crate::paging::PROJECT_LIST, &mut source).await?;
+        // Pages follow the id; the listing reads by label.
+        projects.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+        Ok(projects)
+    }
+
     /// List sessions, refusing before sending when a tree filter needs a
     /// daemon that does not advertise it.
     ///
@@ -1187,85 +1266,11 @@ impl Client {
                 .call_direct::<protocol::method::SessionList>(params)
                 .await;
         }
-        self.session_list_every_page(params).await
-    }
-
-    /// Lists every matching session by following `cursor` page by page, so
-    /// the whole set never has to fit one control line.
-    ///
-    /// A page the daemon reports as `session_list_too_large` is asked again at
-    /// half the size, down to one session. A daemon that predates paging
-    /// ignores `limit` and answers the whole set at once, which is returned
-    /// as it is.
-    async fn session_list_every_page(
-        &mut self,
-        params: protocol::SessionListParams,
-    ) -> Result<Vec<protocol::SessionInfo>, ClientError> {
-        let mut page_params = params;
-        let mut page_size = protocol::SESSION_LIST_PAGE_SIZE;
-        let mut sessions: Vec<protocol::SessionInfo> = Vec::new();
-        let mut bytes = 0_usize;
-        loop {
-            page_params.limit = Some(page_size);
-            let page = match self
-                .call_direct::<protocol::method::SessionList>(page_params.clone())
-                .await
-            {
-                Ok(page) => page,
-                Err(ClientError::Protocol(source) | ClientError::RemoteProtocol { source, .. })
-                    if page_size > 1
-                        && source.code == protocol::ProtocolError::SESSION_LIST_TOO_LARGE =>
-                {
-                    page_size /= 2;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            let page_len = page.len();
-            if sessions.is_empty() && page_len > usize::try_from(page_size).unwrap_or(usize::MAX) {
-                return Ok(page);
-            }
-            let (Some(first), Some(last)) = (
-                page.first().map(|session| session.id.0.clone()),
-                page.last().map(|session| session.id.0.clone()),
-            ) else {
-                break;
-            };
-            if let Some(cursor) = page_params.cursor.as_deref() {
-                // A daemon that pages never answers a session at or before the
-                // cursor. One does when it ignores `cursor` and answered the
-                // whole set again: this page is the current complete set.
-                if first.as_str() <= cursor {
-                    return Ok(page);
-                }
-                if last.as_str() <= cursor {
-                    return Err(ClientError::Protocol(protocol::ProtocolError::new(
-                        protocol::ErrorClass::Daemon,
-                        "session_list_cursor_repeated",
-                        "the daemon answered a session.list page that does not follow its cursor",
-                        Some("upgrade the daemon and client together".to_owned()),
-                    )));
-                }
-            }
-            bytes =
-                bytes.saturating_add(serde_json::to_vec(&page).map_or(0, |encoded| encoded.len()));
-            sessions.extend(page);
-            if sessions.len() > protocol::LIST_WALK_MAX_ITEMS
-                || bytes > protocol::LIST_WALK_MAX_BYTES
-            {
-                return Err(ClientError::Protocol(protocol::ProtocolError::new(
-                    protocol::ErrorClass::Daemon,
-                    "session_list_walk_limit",
-                    "the session.list walk exceeded the sessions or bytes a client collects",
-                    Some("narrow the listing with filters".to_owned()),
-                )));
-            }
-            if page_len < usize::try_from(page_size).unwrap_or(usize::MAX) {
-                break;
-            }
-            page_params.cursor = Some(last);
-        }
-        Ok(sessions)
+        let mut source = SessionPages {
+            client: self,
+            params,
+        };
+        crate::paging::every_page(&crate::paging::SESSION_LIST, &mut source).await
     }
 
     /// Run a retention sweep, refusing a selector the daemon cannot honor.
