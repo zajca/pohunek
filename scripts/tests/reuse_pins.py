@@ -34,7 +34,7 @@ PINNED_BODY_HASHES = {
   "build-tests": "0c4b15a4ab9a7e5ad82bf21c6489e68f8e5cba2b51b8f15fa218b1e412c318fd",
   "darwin-check": "4a82af03b6684e8d7c970cd338a799007bbca51e5dfd7681c1e4ccdbfb62612b",
   "docs": "8bcc9f4b97574b58f126265bb747f9b13c0dca8a9fc9d9212f016dd94e16a188",
-  "doctests": "7978d844ac8b29ecbbf12db1808456dbb830fb70431c85d7afa3eb8a1ba24326",
+  "doctests": "ac487f2a7d06d4aeb8165dc19a9997d851400018763b332ec6f725ef29e245e3",
   "fast-tests": "bb8a335dd5ec94c10c91f9889eaaa5196254987b611ecea329858ac6e6289a8a",
   "feature-matrix": "7f1ff717444cbe6383a275855562cbdd49a1bd8836355baf6259063527b618aa",
   "hermes-compatibility-macos": "129f6fcbafd49fa6aafcbc9b36dbc45bfb69a7653604f9c13658123c9c42ca2f",

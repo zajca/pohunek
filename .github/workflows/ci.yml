@@ -2256,6 +2256,12 @@ jobs:
           shared-key: test-debug
           save-if: false
 
+      # `cargo test --doc` builds no binaries; the `TestEnv` doc example arms
+      # the test-owner reaper, so build it here (the archive jobs get it via
+      # `archive.include` in .config/nextest.toml).
+      - name: Build the test-owner reaper
+        run: cargo build -p pohunek-test-support --bin pohunek-test-reaper
+
       # Nextest does not execute rustdoc tests; preserve the cargo test gate.
       - name: Documentation tests
         run: cargo test --doc --workspace --all-features
