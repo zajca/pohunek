@@ -1554,8 +1554,6 @@ struct IdentityFence {
 enum NotDurableCause {
     /// The report names no process or no monotonic sequence.
     Unbound,
-    /// The worker negotiated a protocol that cannot journal a forwarded claim.
-    WorkerProtocolV7,
     /// Forwarding to the worker failed.
     ForwardFailed,
 }
@@ -1564,7 +1562,6 @@ impl NotDurableCause {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Unbound => "unbound",
-            Self::WorkerProtocolV7 => "worker_protocol_v7",
             Self::ForwardFailed => "forward_failed",
         }
     }

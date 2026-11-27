@@ -8,7 +8,7 @@
 
 use pohunek_worker_protocol::{
     InputFragment, InputPlan, InspectSnapshot, LeaseId, ResponseKind, RuntimeScope, SecretBytes,
-    SessionId, Version, WorkerId, WorkerInstanceId, WriteId, CURRENT_VERSION, PREVIOUS_VERSION,
+    SessionId, WorkerId, WorkerInstanceId, WriteId,
 };
 
 use super::{
@@ -29,9 +29,9 @@ fn prompt(provider: &str, sequence: u64) -> serde_json::Value {
     })
 }
 
-async fn snapshot(server: &Server, version: Version) -> InspectSnapshot {
+async fn snapshot(server: &Server) -> InspectSnapshot {
     let state = server.shared.state.lock().await;
-    inspect_snapshot(&server.shared, &state, version)
+    inspect_snapshot(&server.shared, &state)
         .await
         .expect("inspect the worker")
 }
@@ -63,7 +63,7 @@ async fn stop(server: &Server, pty: &PtyOwner) {
 }
 
 #[tokio::test]
-async fn a_launch_process_report_is_kept_in_memory_and_shown_from_protocol_8() {
+async fn a_launch_process_report_is_kept_in_memory_and_shown() {
     let (server, pty, _directory) = launch_claim_fixture().await;
     establish_launch(&server, &pty).await;
     let before = serde_json::to_value(server.shared.journal.load().expect("journal"))
@@ -72,17 +72,8 @@ async fn a_launch_process_report_is_kept_in_memory_and_shown_from_protocol_8() {
     assert!(send_hook(&server, &pty, prompt("claude", FIRST_SEQUENCE)).await);
 
     assert_eq!(
-        snapshot(&server, CURRENT_VERSION)
-            .await
-            .prompt_accepted_sequence,
+        snapshot(&server).await.prompt_accepted_sequence,
         Some(FIRST_SEQUENCE)
-    );
-    assert_eq!(
-        snapshot(&server, PREVIOUS_VERSION)
-            .await
-            .prompt_accepted_sequence,
-        None,
-        "a version-seven connection never sees the field"
     );
     let after = serde_json::to_value(server.shared.journal.load().expect("journal"))
         .expect("serialize the journal");
@@ -115,17 +106,13 @@ async fn a_duplicate_older_or_expired_report_changes_nothing() {
         "a lease beyond the shared ceiling"
     );
     assert_eq!(
-        snapshot(&server, CURRENT_VERSION)
-            .await
-            .prompt_accepted_sequence,
+        snapshot(&server).await.prompt_accepted_sequence,
         Some(FIRST_SEQUENCE)
     );
 
     assert!(send_hook(&server, &pty, prompt("claude", FIRST_SEQUENCE + 1)).await);
     assert_eq!(
-        snapshot(&server, CURRENT_VERSION)
-            .await
-            .prompt_accepted_sequence,
+        snapshot(&server).await.prompt_accepted_sequence,
         Some(FIRST_SEQUENCE + 1)
     );
     stop(&server, &pty).await;
@@ -137,7 +124,7 @@ async fn a_far_future_sequence_cannot_outrank_the_reports_that_follow() {
     establish_launch(&server, &pty).await;
 
     assert!(send_hook(&server, &pty, prompt("claude", u64::MAX)).await);
-    let stored = snapshot(&server, CURRENT_VERSION)
+    let stored = snapshot(&server)
         .await
         .prompt_accepted_sequence
         .expect("the forged report was applied");
@@ -160,12 +147,7 @@ async fn a_report_before_the_launch_identity_or_from_another_process_is_refused(
         !send_hook(&server, &pty, prompt("claude", FIRST_SEQUENCE)).await,
         "no launch identity has been accepted yet"
     );
-    assert_eq!(
-        snapshot(&server, CURRENT_VERSION)
-            .await
-            .prompt_accepted_sequence,
-        None
-    );
+    assert_eq!(snapshot(&server).await.prompt_accepted_sequence, None);
 
     establish_launch(&server, &pty).await;
     // A nested `claude -p` inherits the session's environment and sits in the
@@ -182,12 +164,7 @@ async fn a_report_before_the_launch_identity_or_from_another_process_is_refused(
         .process
         .start_identity = "1".to_owned();
     assert!(!send_hook(&server, &pty, prompt("claude", FIRST_SEQUENCE)).await);
-    assert_eq!(
-        snapshot(&server, CURRENT_VERSION)
-            .await
-            .prompt_accepted_sequence,
-        None
-    );
+    assert_eq!(snapshot(&server).await.prompt_accepted_sequence, None);
     stop(&server, &pty).await;
 }
 
@@ -218,12 +195,7 @@ async fn a_provider_the_schema_or_the_launch_runtime_does_not_admit_is_refused()
         !send_hook(&server, &pty, prompt("claude", FIRST_SEQUENCE)).await,
         "the identity-only schema has no prompt action"
     );
-    assert_eq!(
-        snapshot(&server, CURRENT_VERSION)
-            .await
-            .prompt_accepted_sequence,
-        None
-    );
+    assert_eq!(snapshot(&server).await.prompt_accepted_sequence, None);
     stop(&server, &pty).await;
 }
 
@@ -274,14 +246,16 @@ async fn write(
 }
 
 #[tokio::test]
-async fn the_acknowledgement_carries_the_submit_mark_only_from_protocol_8() {
+async fn the_acknowledgement_carries_the_submit_mark() {
     let (server, pty, _directory) = launch_claim_fixture_running(WRITE_TARGET_SCRIPT).await;
-    let (mut connection, lease_id) = controller_connection(&server);
+    let (connection, lease_id) = controller_connection(&server);
 
     let started = monotonic_nanos();
     let ack = write(&server, &connection, &lease_id, "input-lease-initialize-1").await;
     let finished = monotonic_nanos();
-    let mark = ack.submit_mark_ns.expect("a protocol-8 acknowledgement");
+    let mark = ack
+        .submit_mark_ns
+        .expect("an acknowledgement carries the mark");
     assert!(
         (started..=finished).contains(&mark),
         "the mark {mark} lies inside the call [{started}, {finished}]"
@@ -294,10 +268,6 @@ async fn the_acknowledgement_carries_the_submit_mark_only_from_protocol_8() {
         "a deduplicated retry reports the mark of the first execution"
     );
 
-    connection.selected_version = Some(PREVIOUS_VERSION);
-    let older = write(&server, &connection, &lease_id, "input-lease-initialize-2").await;
-    assert_eq!(older.submit_mark_ns, None, "a version-seven connection");
-    assert_eq!(older.bytes_written, 6);
     stop(&server, &pty).await;
 }
 

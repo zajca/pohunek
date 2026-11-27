@@ -1387,11 +1387,13 @@ async fn inspect_request(
     lease_id: &LeaseId,
 ) -> Result<ResponseKind, ControlError> {
     validate_lease(shared, connection, lease_id)?;
-    let version = connection.selected_version.ok_or_else(identity_mismatch)?;
+    if connection.selected_version.is_none() {
+        return Err(identity_mismatch());
+    }
     let mut state = shared.state.lock().await;
     clear_exited_owner(shared, &mut state).await?;
     Ok(ResponseKind::Inspected {
-        snapshot: Box::new(inspect_snapshot(shared, &state, version).await?),
+        snapshot: Box::new(inspect_snapshot(shared, &state).await?),
     })
 }
 
@@ -2023,10 +2025,7 @@ async fn write_request(
         ControlInputId::Legacy => pty.input().execute_legacy(&producer_id, local).await,
     }
     .map_err(input_control_error)?;
-    let reports_prompt_evidence = connection
-        .selected_version
-        .is_some_and(|version| version >= protocol::PROMPT_EVIDENCE_VERSION)
-        && launch_reports_prompt_acceptance(shared).await;
+    let reports_prompt_evidence = launch_reports_prompt_acceptance(shared).await;
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
@@ -2382,12 +2381,7 @@ async fn run_placement_check(shared: &Shared) {
     state.placement.report = Some(report);
 }
 
-async fn inspect_snapshot(
-    shared: &Shared,
-    state: &State,
-    version: Version,
-) -> Result<InspectSnapshot, ControlError> {
-    let forwarding = version >= protocol::ACTIVE_IDENTITY_FORWARD_VERSION;
+async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnapshot, ControlError> {
     let (child_process, dimensions, history_start_offset, next_offset) =
         if let Some(pty) = state.pty.as_ref() {
             let (cols, rows) = pty.dimensions().await;
@@ -2440,9 +2434,9 @@ async fn inspect_snapshot(
                     expires_at: identity.expires_at.clone(),
                     reference_kind: identity.reference_kind.clone(),
                     native_reference: identity.native_reference.clone(),
-                    agent: identity.agent.clone().filter(|_| forwarding),
-                    origin: identity.origin.filter(|_| forwarding),
-                    reported_session: identity.reported_session.clone().filter(|_| forwarding),
+                    agent: identity.agent.clone(),
+                    origin: identity.origin,
+                    reported_session: identity.reported_session.clone(),
                 })
             })
             .transpose()?,
@@ -2477,10 +2471,8 @@ async fn inspect_snapshot(
             .collect(),
         hook_schema: state.journal.hook_schema.clone(),
         background: state.journal.background.clone(),
-        active_identity_revision: forwarding.then_some(state.journal.active_identity_revision),
-        prompt_accepted_sequence: state
-            .prompt_accepted_sequence
-            .filter(|_| version >= protocol::PROMPT_EVIDENCE_VERSION),
+        active_identity_revision: Some(state.journal.active_identity_revision),
+        prompt_accepted_sequence: state.prompt_accepted_sequence,
         drains_streams_on_terminal_ack: true,
         placement: state.placement.report.clone(),
     })
@@ -9051,7 +9043,7 @@ mod tests {
         let mut state = server.shared.state.lock().await;
         assert!(state.journal.active_identity.is_none());
         state.journal.active_identity = None;
-        let snapshot = super::inspect_snapshot(&server.shared, &state, CURRENT_VERSION)
+        let snapshot = super::inspect_snapshot(&server.shared, &state)
             .await
             .unwrap();
         assert!(snapshot.active_identity.is_none());
@@ -9544,7 +9536,7 @@ mod tests {
             persisted.hook_schema.as_deref(),
             Some("identity-subagent-v1")
         );
-        let snapshot = super::inspect_snapshot(&server.shared, &state, CURRENT_VERSION)
+        let snapshot = super::inspect_snapshot(&server.shared, &state)
             .await
             .expect("inspect");
         assert_eq!(

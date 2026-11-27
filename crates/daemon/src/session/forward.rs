@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use pohunek_worker_protocol::{
     ActiveIdentityOutcome, ForwardedActiveRelease, ForwardedActiveReport, InspectSnapshot,
-    ProcessIdentity, ReportedSession, ReportedSessionKind, ACTIVE_IDENTITY_FORWARD_VERSION,
+    ProcessIdentity, ReportedSession, ReportedSessionKind,
 };
 use protocol::{
     event, AgentActivity, SessionId, SessionReleaseAgentParams, SessionReleaseAgentResult,
@@ -660,15 +660,14 @@ impl SessionRegistry {
                 }
             }
         };
-        let Some(version) = self.within_worker_bound(worker.selected_version()).await else {
+        if self
+            .within_worker_bound(worker.selected_version())
+            .await
+            .is_none()
+        {
             self.note_forward_timed_out(id, self.forward_bound(), operation)
                 .await;
             return Err(ForwardRefusal::LOGGED);
-        };
-        if version < ACTIVE_IDENTITY_FORWARD_VERSION {
-            self.note_not_durable(id, NotDurableCause::WorkerProtocolV7)
-                .await;
-            return Err(ForwardRefusal::QUIET);
         }
         let Some(instance) = self
             .within_worker_bound(worker.worker_instance_id())

@@ -16,16 +16,15 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pohunek_daemon::runtime::{Worker, WorkerError};
+use pohunek_daemon::runtime::Worker;
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
-    ActiveIdentityOutcome, BaseEnv, ClaimOrigin, ControlCode, DaemonId, Dimensions,
-    ForwardedActiveRelease, ForwardedActiveReport, IdentityRejectReason, Initialize,
-    InitializeLimits, InputPolicy, LaunchIdentity, ProcessIdentity, ReportedSession,
-    ReportedSessionKind, SecretEnv, SessionId, StopPolicy, TransactionId, Version, CURRENT_VERSION,
-    PREVIOUS_VERSION,
+    ActiveIdentityOutcome, BaseEnv, ClaimOrigin, DaemonId, Dimensions, ForwardedActiveRelease,
+    ForwardedActiveReport, IdentityRejectReason, Initialize, InitializeLimits, InputPolicy,
+    LaunchIdentity, ProcessIdentity, ReportedSession, ReportedSessionKind, SecretEnv, SessionId,
+    StopPolicy, TransactionId, Version, CURRENT_VERSION, PREVIOUS_VERSION,
 };
 
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -274,7 +273,7 @@ async fn a_forwarded_report_is_durable_across_a_controller_reconnect() {
 }
 
 #[tokio::test]
-async fn a_previous_version_connection_reads_a_forwarded_claim_as_provider_only() {
+async fn a_previous_version_connection_reads_and_forwards_the_full_claim() {
     let (mut fixture, worker, child) = running_fixture().await;
     worker
         .record_active_identity(report(child, 110))
@@ -291,27 +290,15 @@ async fn a_previous_version_connection_reads_a_forwarded_claim_as_provider_only(
         .expect("inspect at the previous version");
     let claim = snapshot.active_identity.expect("the claim is still there");
     assert_eq!(claim.provider, "claude");
-    assert_eq!(
-        (claim.origin, claim.agent, claim.reported_session),
-        (None, None, None)
-    );
-    assert_eq!((claim.reference_kind, claim.native_reference), (None, None));
-    assert_eq!(snapshot.active_identity_revision, None);
+    assert!(claim.origin.is_some());
+    assert!(claim.agent.is_some());
+    assert!(claim.reported_session.is_some());
+    assert!(snapshot.active_identity_revision.is_some());
 
-    let refused = previous
+    previous
         .record_active_identity(report(child, 111))
         .await
-        .expect_err("a previous-version connection cannot forward");
-    assert!(
-        matches!(
-            refused,
-            WorkerError::Rejected {
-                code: ControlCode::WorkerFeatureUnavailable,
-                ..
-            }
-        ),
-        "{refused:?}"
-    );
+        .expect("a previous-version connection forwards");
     stop(&previous).await;
 }
 

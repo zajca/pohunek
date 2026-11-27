@@ -12,7 +12,7 @@ use pohunek_worker_protocol::{
     FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId, OutputGap,
     RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeScope, SessionId, StopRequest,
     StreamId, StreamMode, TransactionId, Version, WorkerId, WorkerInstanceId, WriteId,
-    ACTIVE_IDENTITY_FORWARD_VERSION, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
@@ -1357,12 +1357,9 @@ impl Worker {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::Rejected`] with
-    /// [`ControlCode::WorkerFeatureUnavailable`](pohunek_worker_protocol::ControlCode::WorkerFeatureUnavailable)
-    /// without sending a frame when the connection negotiated below
-    /// [`ACTIVE_IDENTITY_FORWARD_VERSION`], and [`WorkerError`] for an
-    /// unavailable runtime, a journal fault or a transport failure. A worker
-    /// refusal is an [`ActiveIdentityOutcome::Rejected`], not an error.
+    /// Returns [`WorkerError`] for an unavailable runtime, a journal fault or
+    /// a transport failure. A worker refusal is an
+    /// [`ActiveIdentityOutcome::Rejected`], not an error.
     pub async fn record_active_identity(
         &self,
         report: ForwardedActiveReport,
@@ -1384,7 +1381,6 @@ impl Worker {
         sent: &SentAt,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
         let mut inner = self.inner.lock().await;
-        require_active_identity_forwarding(inner.selected_version)?;
         let scope = scope(&inner)?;
         let response = request_forwarded(
             &mut inner,
@@ -1425,7 +1421,6 @@ impl Worker {
         sent: &SentAt,
     ) -> Result<ActiveIdentityOutcome, WorkerError> {
         let mut inner = self.inner.lock().await;
-        require_active_identity_forwarding(inner.selected_version)?;
         let scope = scope(&inner)?;
         let response = request_forwarded(
             &mut inner,
@@ -2216,18 +2211,6 @@ async fn read_handshake_response(
             }
         }
     }
-}
-
-/// Refuses a forwarded identity operation on a connection that cannot carry it.
-fn require_active_identity_forwarding(selected_version: Version) -> Result<(), WorkerError> {
-    if selected_version >= ACTIVE_IDENTITY_FORWARD_VERSION {
-        return Ok(());
-    }
-    Err(WorkerError::Rejected {
-        code: ControlCode::WorkerFeatureUnavailable,
-        message: format!("worker protocol {selected_version} cannot forward an active identity"),
-        retryable: false,
-    })
 }
 
 /// [`response_error`] for a request the worker may have executed: an answer of

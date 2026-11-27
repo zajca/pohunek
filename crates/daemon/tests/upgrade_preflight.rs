@@ -665,8 +665,8 @@ fn journal_evidence_failures_each_name_their_reason() {
         (
             "a worker pinned to the protocol just below the window",
             |journal| {
-                journal["protocol_minimum"] = json!(6);
-                journal["protocol_maximum"] = json!(6);
+                journal["protocol_minimum"] = json!(7);
+                journal["protocol_maximum"] = json!(7);
             },
             CODE_PROTOCOL_INCOMPATIBLE,
         ),

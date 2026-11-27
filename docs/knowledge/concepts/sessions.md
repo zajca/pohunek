@@ -929,9 +929,9 @@ the worker validates the subject like a hook claim, journals it, and only then
 answers, and the daemon commits the claim the worker holds. A bound report
 therefore survives a restart whenever it is accepted, and `recorded: false`
 also covers a report the worker refused. A report that is unbound (an SDK or
-remote client, an older hook), that meets a protocol 7 worker, or whose forward
+remote client, an older hook) or whose forward
 failed is held in memory and logged once per session and cause as
-`session.active_identity.not_durable` (`unbound`, `worker_protocol_v7`,
+`session.active_identity.not_durable` (`unbound`,
 `forward_failed`; a failed forward also logs `forward_failed` at WARN, once for
 a release (it ends a memory claim and never a claim the worker journaled); an
 accepted forward whose snapshot was not read or applied in time logs
@@ -943,7 +943,7 @@ An agent observed by procwatch is held in memory in the same way. A per-session
 commit guard and the newest committed worker identity revision order a worker
 snapshot against a forwarded commit: a snapshot read before the commit carries
 an older revision and cannot replace the forwarded identity or its release
-(#1101). A worker that predates the revision (protocol 7) gives no such order.
+(#1101).
 A record written before
 schema 10 carries no origin, and its agent counts as observed when its name
 equals the agent's own runtime: a reported agent under a profile named like

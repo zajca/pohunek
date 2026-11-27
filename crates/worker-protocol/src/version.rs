@@ -13,12 +13,12 @@ use thiserror::Error;
 
 /// Current worker protocol version.
 ///
-/// Version eight opens the window for the forwarded active identity; it adds
-/// no wire change of its own.
-pub const CURRENT_VERSION: Version = Version(8);
+/// Version nine opens the window for the framed, offset-based reattach; it
+/// adds no wire change of its own.
+pub const CURRENT_VERSION: Version = Version(9);
 
 /// Immediately preceding worker protocol version.
-pub const PREVIOUS_VERSION: Version = Version(7);
+pub const PREVIOUS_VERSION: Version = Version(8);
 
 /// First version with atomic attach snapshots.
 ///
@@ -32,25 +32,6 @@ pub const CONTROL_PLANE_OBSERVATION_VERSION: Version = Version(4);
 
 /// First version with durable provider-managed subagent observation.
 pub const SUBAGENT_OBSERVATION_VERSION: Version = Version(5);
-
-/// First version whose controller may forward an active identity.
-///
-/// From version eight the daemon sends
-/// [`RecordActiveIdentity`](crate::RequestKind::RecordActiveIdentity) and
-/// [`ReleaseActiveIdentity`](crate::RequestKind::ReleaseActiveIdentity), and the
-/// snapshot carries the active identity's revision, label, origin and reported
-/// session. A version-seven peer receives none of them. The gate is the
-/// version alone: an unknown capability in a version-seven decoder would fail
-/// its request.
-pub const ACTIVE_IDENTITY_FORWARD_VERSION: Version = Version(8);
-
-/// First version whose worker reports prompt-delivery evidence.
-///
-/// From version eight the write acknowledgement carries the monotonic time
-/// taken just before the plan's last fragment was written, and the snapshot
-/// carries the sequence of the last accepted prompt report. A version-seven
-/// peer receives neither field.
-pub const PROMPT_EVIDENCE_VERSION: Version = Version(8);
 
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {

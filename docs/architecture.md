@@ -704,13 +704,13 @@ timeout keeps the report memory-only or leaves the commit to the next sync. A fe
 revision (per worker instance, in memory) makes a snapshot read before a commit
 leave the active identity alone while its native reference, subagents and
 background still apply. A report that cannot be forwarded takes the memory-only
-path: it is unbound, the worker negotiated v7, or the forward failed in transit
-or in the worker's journal. The last two keep today's `recorded: true` when the
-daemon's own rules accept it, with a WARN for a failed forward, and an INFO
+path: it is unbound, or the forward failed in transit
+or in the worker's journal. A failed forward keeps today's `recorded: true` when
+the daemon's own rules accept it, with a WARN, and an INFO
 `session.active_identity.not_durable` per session and cause names each of them.
 A forward the worker accepted whose snapshot the daemon could not read or apply
 in time logs `session.active_identity.commit_deferred` at WARN: the worker
-journaled the claim and the next sync commits it. A v7 worker reports no revision, so no fence applies to it.
+journaled the claim and the next sync commits it.
 
 Public observation is bounded by the 1 MiB control-line ceiling. Output accounts
 for base64 expansion and response metadata; screen snapshots are measured after
@@ -877,7 +877,7 @@ states the contract and then the current state.
 
 - **Live workers.** The private worker protocol negotiates the range
   `PREVIOUS_VERSION..=CURRENT_VERSION` (`crates/worker-protocol/src/version.rs`,
-  currently 7 and 8), so a worker started by N-1 keeps serving through a daemon
+  currently 8 and 9), so a worker started by N-1 keeps serving through a daemon
   update. A worker below the window is not adopted, and the upgrade preflight
   reports its session as `would_not_be_adopted`.
 - **Worker journal.** The daemon reads the previous journal schema. The

@@ -224,8 +224,7 @@ pub struct ActiveIdentityClaim {
     pub native_reference: Option<String>,
     /// Opaque profile label of a forwarded claim, absent for a hook claim.
     ///
-    /// The worker stores it verbatim and never interprets it. Withheld from a
-    /// connection that negotiated below [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
+    /// The worker stores it verbatim and never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     /// How the worker came to hold the claim. Absent means [`ClaimOrigin::Hook`].
@@ -979,8 +978,8 @@ pub struct WriteAck {
     /// Total bytes written and flushed.
     pub bytes_written: u64,
     /// `CLOCK_MONOTONIC` nanoseconds read immediately before the write of the
-    /// plan's last fragment, on the hooks' clock. Absent on a connection that
-    /// negotiated below [`crate::PROMPT_EVIDENCE_VERSION`].
+    /// plan's last fragment, on the hooks' clock. Absent when the launch does
+    /// not report prompt acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit_mark_ns: Option<u64>,
 }
@@ -1281,14 +1280,12 @@ pub struct InspectSnapshot {
     #[serde(default)]
     pub background: Option<BackgroundSnapshot>,
     /// Number of journaled changes to the active identity or its release,
-    /// counting hook and forwarded operations alike. Absent on a connection
-    /// that negotiated below [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
+    /// counting hook and forwarded operations alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_identity_revision: Option<u64>,
     /// Sequence of the last prompt-acceptance report the worker applied for
     /// the current runtime, in the hooks' monotonic clock. Absent before the
-    /// first report and on a connection that negotiated below
-    /// [`crate::PROMPT_EVIDENCE_VERSION`].
+    /// first report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_accepted_sequence: Option<u64>,
     /// Whether `AcknowledgeTerminal` first lets every attached data stream
@@ -1415,9 +1412,6 @@ pub enum RequestKind {
         lease_id: LeaseId,
     },
     /// Records a public agent report as the session's active identity.
-    ///
-    /// Sent only on connections that negotiated at least
-    /// [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
     RecordActiveIdentity {
         /// Exact leased runtime scope.
         scope: RuntimeScope,
@@ -1425,9 +1419,6 @@ pub enum RequestKind {
         report: ForwardedActiveReport,
     },
     /// Releases the session's active identity on a public release.
-    ///
-    /// Sent only on connections that negotiated at least
-    /// [`crate::ACTIVE_IDENTITY_FORWARD_VERSION`].
     ReleaseActiveIdentity {
         /// Exact leased runtime scope.
         scope: RuntimeScope,

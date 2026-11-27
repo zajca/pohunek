@@ -6,10 +6,10 @@
 //! not from the handlers' own output.
 
 use pohunek_worker_protocol::{
-    ActiveIdentityOutcome, ClaimOrigin, ControlCode, ForwardedActiveRelease, ForwardedActiveReport,
+    ActiveIdentityOutcome, ClaimOrigin, ForwardedActiveRelease, ForwardedActiveReport,
     IdentityRejectReason, LeaseId, ProcessIdentity, ReportedSession, ReportedSessionKind,
     RequestKind, ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, WorkerId,
-    WorkerInstanceId, CURRENT_VERSION, PREVIOUS_VERSION,
+    WorkerInstanceId,
 };
 
 use super::{
@@ -433,7 +433,7 @@ async fn a_report_of_a_provider_or_with_an_expiry_the_schema_refuses_is_rejected
 }
 
 #[tokio::test]
-async fn the_snapshot_withholds_the_forwarding_fields_from_a_previous_version_connection() {
+async fn the_snapshot_carries_the_forwarding_fields_of_a_forwarded_claim() {
     let (server, pty, _directory) = launch_claim_fixture().await;
     let (mut connection, lease_id) = controller_connection(&server);
     record(
@@ -445,58 +445,16 @@ async fn the_snapshot_withholds_the_forwarding_fields_from_a_previous_version_co
     .await;
 
     let state = server.shared.state.lock().await;
-    let current = super::super::inspect_snapshot(&server.shared, &state, CURRENT_VERSION)
+    let snapshot = super::super::inspect_snapshot(&server.shared, &state)
         .await
-        .expect("current snapshot");
-    let previous = super::super::inspect_snapshot(&server.shared, &state, PREVIOUS_VERSION)
-        .await
-        .expect("previous snapshot");
+        .expect("snapshot");
     drop(state);
 
-    let claim = current.active_identity.expect("current claim");
+    let claim = snapshot.active_identity.expect("forwarded claim");
     assert_eq!(claim.origin, Some(ClaimOrigin::Forwarded));
     assert_eq!(claim.agent.as_deref(), Some("tuned"));
     assert!(claim.reported_session.is_some());
-    assert_eq!(current.active_identity_revision, Some(1));
-    let claim = previous.active_identity.expect("previous claim");
-    assert_eq!(
-        (claim.origin, claim.agent, claim.reported_session),
-        (None, None, None),
-        "a previous-version peer reads a provider-only claim"
-    );
-    assert_eq!(claim.reference_kind, None);
-    assert_eq!(claim.native_reference, None);
-    assert_eq!(previous.active_identity_revision, None);
-    stop(&server, &pty).await;
-}
-
-#[tokio::test]
-async fn a_connection_below_the_forwarding_version_cannot_forward() {
-    let (server, pty, _directory) = launch_claim_fixture().await;
-    let (mut connection, lease_id) = controller_connection(&server);
-    connection.selected_version = Some(PREVIOUS_VERSION);
-
-    let error = forward(
-        &server,
-        &mut connection,
-        RequestKind::RecordActiveIdentity {
-            scope: scope(&lease_id),
-            report: report(root_process(&pty), 60),
-        },
-    )
-    .await
-    .expect_err("a previous-version connection cannot forward");
-
-    assert_eq!(error.code, ControlCode::WorkerFeatureUnavailable);
-    assert_eq!(
-        server
-            .shared
-            .journal
-            .load()
-            .expect("load the journal")
-            .active_identity_revision,
-        0
-    );
+    assert_eq!(snapshot.active_identity_revision, Some(1));
     stop(&server, &pty).await;
 }
 

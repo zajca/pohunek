@@ -18,7 +18,7 @@ use pohunek_test_support::hold;
 use pohunek_test_support::wait::{poll_until, wait_until, HANG_GUARD};
 use pohunek_worker_protocol::{
     PlacementOutcome, PlacementReport, ResponseKind, RuntimeScope, SessionId, StopPolicy,
-    TransactionId, WorkerId, CURRENT_VERSION,
+    TransactionId, WorkerId,
 };
 
 use crate::placement::Armed;
@@ -72,7 +72,7 @@ async fn arm(server: &Server, pty: &crate::PtyOwner, scenario: &str) {
 /// The result `inspect` shows for the latest check, without running one.
 async fn latest(server: &Server) -> Option<PlacementReport> {
     let state = server.shared.state.lock().await;
-    inspect_snapshot(&server.shared, &state, CURRENT_VERSION)
+    inspect_snapshot(&server.shared, &state)
         .await
         .expect("inspect the worker")
         .placement

@@ -23,7 +23,7 @@ rule. The current state of each place is stated separately.
 
 - **Live workers.** Contract and state: the private worker protocol accepts
   `PREVIOUS_VERSION` as well as `CURRENT_VERSION`
-  (`crates/worker-protocol/src/version.rs`, today 7 and 8), so a daemon update
+  (`crates/worker-protocol/src/version.rs`, today 8 and 9), so a daemon update
   leaves running sessions alone. A worker below the window is not adopted and
   the upgrade preflight reports it as `would_not_be_adopted`.
 - **Worker journal.** Contract: the daemon reads the previous journal schema.
