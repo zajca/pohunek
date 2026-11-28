@@ -656,10 +656,12 @@ mod tests {
     #[test]
     fn can_and_sub_in_csi_entry_abort_the_sequence() {
         // CAN and SUB end any escape sequence, so the `? 2026 h` after them is
-        // printed text and mode 2026 stays unset.
+        // printed text and mode 2026 stays unset. The abort byte must arrive
+        // while the tracker is in the `Csi` state (after `ESC [`), not in
+        // `Escape`.
         for abort in [0x18_u8, 0x1a] {
             let mut tracker = TerminalTracker::with_model(ModelKind::Vt100, 2, 10);
-            tracker.feed(&[b"\x1b["[0], abort]);
+            tracker.feed(&[0x1b, b'[', abort]);
             tracker.feed(b"?2026h");
             assert!(
                 !mode_2026_is_set(&tracker),

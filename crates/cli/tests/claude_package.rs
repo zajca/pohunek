@@ -4529,13 +4529,11 @@ fn helper_stops(events: &[Value]) -> Vec<String> {
 /// the same [`HANG_GUARD`], but on expiry the panic carries what the scenario
 /// captured, so a recurrence names the missing side (#2471): a helper request
 /// that reached the stub without a stop is the reporting path dropping it, no
-/// request at all is Claude never starting the helper.
-///
-/// timing-allowed: #2471 the bound stays [`HANG_GUARD`]. Measured with the
-/// locked Claude on an unloaded host (3 runs of the scenario above), each
-/// helper stop was logged 41 to 46 ms after its request reached the stub, so
-/// 120 s is about 2600x the observed request-to-stop latency; the wait is a
-/// readiness wait, not a duration check.
+/// request at all is Claude never starting the helper. The bound stays
+/// [`HANG_GUARD`]: measured with the locked Claude on an unloaded host (3 runs
+/// of the scenario above), each helper stop was logged 41 to 46 ms after its
+/// request reached the stub, so 120 s is about 2600x the observed
+/// request-to-stop latency.
 async fn wait_for_helper_stop(
     fixture: &Fixture,
     id: &str,
@@ -4562,6 +4560,7 @@ async fn wait_for_helper_stop(
             ignored.len(),
             fixture.worker_events(id),
         );
+        // timing-allowed: #2471 readiness poll, bounded by HANG_GUARD (measured latency 41-46 ms)
         tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
 }
