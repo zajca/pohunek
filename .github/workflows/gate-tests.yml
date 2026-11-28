@@ -113,6 +113,17 @@ jobs:
           version: ${{ env.MOLD_VERSION }}
           sha256: ${{ env.MOLD_SHA256 }}
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the `--all-features` clippy, nextest archive and doctests
+      # below compile pohunek-terminal-ghostty-sys with its `libghostty`
+      # feature, whose build script needs LIBGHOSTTY_VT_DIR (issue #2602).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
         with:

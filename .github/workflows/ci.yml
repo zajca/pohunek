@@ -1649,6 +1649,8 @@ jobs:
               - '.github/actions/setup-mold/**'
               - '.github/actions/setup-sccache/**'
               - '.github/actions/pinned-cache/**'
+              - '.github/actions/setup-zig/**'
+              - '.github/actions/libghostty-vt/**'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
