@@ -4732,7 +4732,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
             "this run's own reports arrive through the pinned download action",
         )
 
-    def test_the_reuse_job_runs_on_a_delta_dispatch_a_push_and_a_pull_request(self):
+    def test_the_reuse_job_runs_on_a_delta_dispatch_and_on_a_push(self):
         job = workflow_jobs()[REUSE_JOB]
         self.assertNotRegex(job, r"(?m)^    needs:")
         # The `gh` calls must not hang the 21 jobs that wait on them:
@@ -4742,8 +4742,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
             job_condition(REUSE_JOB),
             "(github.event_name == 'workflow_dispatch' "
             "&& inputs.tier == 'main' && inputs.delta) "
-            "|| github.event_name == 'push' "
-            "|| github.event_name == 'pull_request'",
+            "|| github.event_name == 'push'",
         )
         self.assertNotIn("env.", job_condition(REUSE_JOB))
         for output in ("skip", "source_run", "source_runs", "tree"):
@@ -4757,7 +4756,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertEqual(int(retention.group(1)), 30)
         self.assertIn("overwrite: true", upload)
 
-    def test_the_reuse_job_condition_admits_a_push_a_delta_main_dispatch_and_a_pull_request(self):
+    def test_the_reuse_job_condition_admits_only_a_push_and_a_delta_main_dispatch(self):
         condition = job_condition(REUSE_JOB)
         on = bool(evaluate_needs_expression(
             condition, event="push",
@@ -4800,8 +4799,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
             outputs={REUSE_JOB: {"skip": "[]"}},
             changes=dict(changes_of("pull_request")),
         ))
-        self.assertTrue(pr, "a pull request runs reuse, so a re-run of the same "
-                            "head (re-push or reopen) reuses its green legs (#2599)")
+        self.assertFalse(pr, "a pull request never runs reuse: a PR run is "
+                             "always a full run (#2599)")
 
     def test_the_kill_switch_is_documented_and_defaults_on(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text()

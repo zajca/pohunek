@@ -315,9 +315,10 @@ the `labeled`/`unlabeled` activity types, because a label event would cancel
 and restart every pull request's full CI on every label edit — that cost is
 why the label event is not used. Escape hatch for a PR that already ran
 unlabelled: push again (an empty commit or a rebase), or dispatch the `main`
-tier for the PR's head; the re-run reuses the same-tree green legs of the
-earlier runs (the `reuse` job runs on pull requests too) and costs only the
-jobs those runs skipped — the unlabelled run's macOS lane.
+tier for the PR's head. A re-pushed PR run is a full run — pull requests are
+not reuse consumers (reuse is push and delta-dispatch only) — so it costs the
+whole sweep minus the paths-filtered jobs, and the macOS lane runs in it
+because the label is now present.
 
 The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
 `ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
@@ -383,19 +384,16 @@ carry it, because a failed selection runs everything instead of ending the
 run. A fork or Dependabot pull request has a read-only token, so the cancel
 call is refused and the run keeps its real failure.
 
-**Delta dispatch, push and pull-request reuse.** A `workflow_dispatch` run of
-`ci.yml` with `tier=main` accepts `delta: true`, a `main` push reuses green
+**Delta dispatch and push reuse.** A `workflow_dispatch` run of
+`ci.yml` with `tier=main` accepts `delta: true`, and a `main` push reuses green
 jobs while the workflow-level
 `CI_REUSE_PUSH` kill switch is `"true"` (issue #2204; set it to `"false"` to turn
-push reuse off — a tier=main delta dispatch is unaffected), and a pull request
-run — including a re-run of the same head by a re-push or reopen (#2599) —
-reuses by the same rule: a pull request consumer matches source runs by their
-recorded tested tree, like a push, while a delta dispatch matches only the
-same commit. The `reuse` job
+push reuse off — a tier=main delta dispatch is unaffected). Pull requests are
+not reuse consumers: a PR run is always a full run (#2599). The `reuse` job
 finds the newest green legs of the previous runs of the same tree from this
 repository — pull request runs, prior main pushes, and tier=main delta dispatches,
 each within 24 hours, fork runs never — and reuses those green legs (per job, the
-newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push and a pull request run may
+newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push may
 match by recorded tested tree. A failed `reuse` run fails
 the verdict, so no job is wrongly skipped. The record names only legs that were green in their source run, and a fail-open run writes an empty record. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
