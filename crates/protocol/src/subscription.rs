@@ -63,9 +63,9 @@ crate::tolerant_enum!(SubscriptionChannel);
 
 /// Payload of a `subscription_lagged` event.
 ///
-/// The event precedes every later event on the connection: the subscriber
-/// missed `skipped` events of `channel` and re-seeds from the list method of
-/// that channel.
+/// A lag is per channel, never per connection: the event precedes every later
+/// event of `channel` only. The subscriber missed `skipped` events of `channel`
+/// and re-seeds from the list method of that channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SubscriptionLaggedEvent.ts"))]
@@ -73,6 +73,7 @@ pub struct SubscriptionLaggedEvent {
     /// Channel whose events were dropped.
     pub channel: SubscriptionChannel,
     /// Number of events dropped.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub skipped: u64,
 }
 

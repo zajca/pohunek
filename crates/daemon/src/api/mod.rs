@@ -1448,8 +1448,9 @@ where
 /// Each received [`Event`] is written as one JSON line. Further input from the
 /// client is ignored (a subscription is one-way in this milestone); a closed or
 /// broken connection ends the stream. A lagging subscriber (slow reader) drops
-/// the oldest events and is told with a `subscription_lagged` event before any
-/// later event, rather than having the connection torn down.
+/// the oldest events and is told with a `subscription_lagged` event naming that
+/// channel, before any later event of that channel (a lag is per channel, not
+/// per connection), rather than having the connection torn down.
 ///
 /// With a `heartbeat` interval the stream sends a `heartbeat` event whenever
 /// that long passes without a line written to the client.

@@ -1,8 +1,9 @@
 ## Unreleased (2026-11-26, external-client contract: subscription lag, heartbeat, local socket resolver, #1314)
 
 - `subscribe` streams now send `subscription_lagged {channel, skipped}` before any
-  later event when a slow subscriber lost events; the client re-seeds with
-  `session.list` (session channel) or `notification.list` (notification channel).
+  later event of that channel when a slow subscriber lost events; the client
+  re-seeds with `session.list` (session channel) or `notification.list`
+  (notification channel). A lag is per channel, never per connection.
 - `subscribe` accepts optional `{heartbeat_ms}`; the daemon then sends `heartbeat`
   events while the stream is quiet. `host.inspect` carries `subscribe_heartbeat
   {min_ms, max_ms}` on a daemon that serves it; an out-of-range value is
