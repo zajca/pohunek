@@ -1334,6 +1334,8 @@ mod tests {
             cursor_col: 0,
             cursor_visible: true,
             alternate_screen: false,
+            model: pohunek_terminal::ScreenModelId::Vt100,
+            format_version: pohunek_terminal::CURRENT_FORMAT_VERSION,
             title: None,
             progress: None,
             visible_text: "bounded repaint".to_owned(),

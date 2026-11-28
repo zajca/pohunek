@@ -574,6 +574,8 @@ fn screen_fixtures(runtime: &SessionRuntimeIdentity) -> Result<Vec<NamedFixture>
                         visible: true,
                     },
                     alternate_screen: false,
+                    screen_model: None,
+                    format_version: None,
                     title: Some("fixture terminal".to_owned()),
                     progress: None,
                     visible_lines: vec!["pohunek fixture".to_owned()],

@@ -8,7 +8,64 @@
 
 // Rust guideline compliant 2026-06-26
 
-use pohunek_session_worker::{OutputEvent, OutputHub};
+use pohunek_session_worker::{wire_terminal, OutputEvent, OutputHub};
+use pohunek_terminal::{ScreenModelId, TerminalSnapshot, CURRENT_FORMAT_VERSION};
+use pohunek_worker_protocol::{
+    Cursor, Dimensions, ScreenModelId as WireScreenModelId, TerminalLink,
+    TerminalSnapshot as WireTerminalSnapshot,
+};
+
+/// The screen model the hub's tracker runs in this build: the default model
+/// of the build (issue #2538 P3a keeps the flip off, so vt100 unless the
+/// `libghostty` feature is on).
+fn default_model() -> ScreenModelId {
+    if cfg!(feature = "libghostty") {
+        ScreenModelId::Libghostty
+    } else {
+        ScreenModelId::Vt100
+    }
+}
+
+/// Asserts the versioning fields of a hub snapshot (issue #2538 P3a): the
+/// screen model that produced it and the current wire format version.
+fn assert_versioning(snapshot: &TerminalSnapshot) {
+    assert_eq!(
+        snapshot.model,
+        default_model(),
+        "the snapshot must name the model that produced it"
+    );
+    assert_eq!(
+        snapshot.format_version, CURRENT_FORMAT_VERSION,
+        "the snapshot must carry the current wire format version"
+    );
+}
+
+/// Maps a tracker screen model onto the worker wire type in a test.
+fn wire_model(model: ScreenModelId) -> WireScreenModelId {
+    match model {
+        ScreenModelId::Vt100 => WireScreenModelId::Vt100,
+        ScreenModelId::Libghostty => WireScreenModelId::Libghostty,
+    }
+}
+
+/// A small tracker snapshot of the given model, for the wire rows.
+fn tracked_snapshot(model: ScreenModelId) -> TerminalSnapshot {
+    TerminalSnapshot {
+        watermark: 7,
+        rows: 24,
+        cols: 80,
+        cursor_row: 1,
+        cursor_col: 2,
+        cursor_visible: true,
+        alternate_screen: false,
+        model,
+        format_version: CURRENT_FORMAT_VERSION,
+        title: None,
+        progress: None,
+        visible_text: "screen".to_owned(),
+        ansi: b"repaint".to_vec(),
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unobserved_reads_leave_the_repaint_at_their_watermark() {
@@ -17,6 +74,7 @@ async fn unobserved_reads_leave_the_repaint_at_their_watermark() {
     hub.push(b"\r\ntwo").expect("push second line");
 
     let first = hub.terminal_snapshot();
+    assert_versioning(&first);
     assert_eq!(first.watermark, hub.next_offset());
     assert_eq!((first.rows, first.cols), (24, 80));
     assert!(first.visible_text.contains("one"), "{first:?}");
@@ -24,6 +82,7 @@ async fn unobserved_reads_leave_the_repaint_at_their_watermark() {
 
     hub.resize(12, 60);
     let resized = hub.terminal_snapshot();
+    assert_versioning(&resized);
     assert_eq!(
         (resized.rows, resized.cols),
         (12, 60),
@@ -34,6 +93,7 @@ async fn unobserved_reads_leave_the_repaint_at_their_watermark() {
 
     hub.push(b"\r\nthree").expect("push after resize");
     let second = hub.terminal_snapshot();
+    assert_versioning(&second);
     assert_eq!(
         second.watermark,
         hub.next_offset(),
@@ -98,6 +158,7 @@ async fn gap_repaint_split_into_bounded_events_is_one_synchronized_bracket() {
 
     let repaint = collect_repaint(&mut subscriber).await;
 
+    assert_versioning(&hub.terminal_snapshot());
     assert!(repaint.len() > 64 * 4, "repaint must span several events");
     assert!(repaint.starts_with(SYNC_BEGIN), "{repaint:?}");
     assert!(repaint.ends_with(SYNC_END), "{repaint:?}");
@@ -113,6 +174,9 @@ async fn attach_repaint_is_one_bracket_on_the_alternate_screen() {
 
     let repaint = collect_repaint(&mut subscriber).await;
 
+    let snapshot = hub.terminal_snapshot();
+    assert_versioning(&snapshot);
+    assert!(snapshot.alternate_screen, "{snapshot:?}");
     assert!(repaint.starts_with(SYNC_BEGIN), "{repaint:?}");
     assert!(repaint.ends_with(SYNC_END), "{repaint:?}");
     assert_eq!(count(&repaint, SYNC_BEGIN), 1);
@@ -172,4 +236,164 @@ async fn terminal_reset_clears_a_program_set_synchronized_output() {
         let repaint = collect_repaint(&mut subscriber).await;
         assert!(repaint.ends_with(SYNC_END), "{reset:?} {repaint:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wire-compatibility rows 13-17 of the issue #2538 P3a case table: the
+// snapshot's `model`/`format_version` fields are additive on the worker
+// wire (worker protocol stays 9, window 8..=9), so no protocol bump.
+
+/// Row 13 (new worker + new daemon): the wire snapshot carries both
+/// versioning fields — `model = "libghostty"`, `format_version = 1` — and
+/// round-trips through `serde_json` byte-identically.
+#[test]
+fn wire_snapshot_carries_model_and_format_version() {
+    let wire = wire_terminal(&tracked_snapshot(ScreenModelId::Libghostty)).expect("conversion");
+    assert_eq!(wire.model, Some(WireScreenModelId::Libghostty));
+    assert_eq!(wire.format_version, Some(1));
+    let json = serde_json::to_value(&wire).expect("serialize");
+    assert_eq!(json["model"], "libghostty");
+    assert_eq!(json["format_version"], 1);
+    let decoded: WireTerminalSnapshot =
+        serde_json::from_value(json.clone()).expect("decode the new wire shape");
+    assert_eq!(decoded, wire, "the wire snapshot round-trips");
+    assert_eq!(serde_json::to_value(&decoded).expect("serialize"), json);
+}
+
+/// Row 14 (new worker + N-1 daemon): a receiver pinned to the pre-P3 derive
+/// — no `model`/`format_version` members and no `deny_unknown_fields`, like
+/// every `TerminalSnapshot` in the 8..=9 window — decodes the new wire JSON,
+/// ignoring the new fields.
+#[test]
+fn a_pre_p3_receiver_ignores_the_new_wire_fields() {
+    /// Test-only copy of the pre-P3 `worker_protocol::TerminalSnapshot`
+    /// derive (issue #2538 §3.2 direction A).
+    #[derive(serde::Deserialize)]
+    #[allow(
+        dead_code,
+        reason = "the fields exist so the decode pins the pre-P3 member list; serde reads them"
+    )]
+    struct PreP3TerminalSnapshot {
+        watermark: u64,
+        dimensions: Dimensions,
+        cursor: Cursor,
+        alternate_screen: bool,
+        title: Option<String>,
+        progress: Option<String>,
+        visible_lines: Vec<String>,
+        // `links` is skipped when empty on the wire (pre-existing attr).
+        #[serde(default)]
+        links: Vec<TerminalLink>,
+    }
+
+    let wire = wire_terminal(&tracked_snapshot(ScreenModelId::Libghostty)).expect("conversion");
+    let json = serde_json::to_value(&wire).expect("serialize");
+    assert!(json.get("model").is_some() && json.get("format_version").is_some());
+    serde_json::from_value::<PreP3TerminalSnapshot>(json)
+        .expect("the N-1 daemon's types decode the new snapshot tolerantly");
+}
+
+/// Row 15 (old worker + new daemon): a pre-P3 wire JSON — no `model`, no
+/// `format_version` — decodes with both fields `None` and serializes back to
+/// exactly the pre-P3 shape, so the daemon omits both from `session.screen`.
+#[test]
+fn a_pre_p3_wire_snapshot_decodes_with_none_and_keeps_its_shape() {
+    let wire = wire_terminal(&tracked_snapshot(ScreenModelId::Vt100)).expect("conversion");
+    let mut legacy = serde_json::to_value(&wire).expect("serialize");
+    // Emulate an old worker: the fields are absent from its bytes.
+    assert_eq!(
+        legacy.as_object_mut().expect("object").remove("model"),
+        Some(serde_json::json!("vt100"))
+    );
+    assert_eq!(
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("format_version"),
+        Some(serde_json::json!(1))
+    );
+    let decoded: WireTerminalSnapshot =
+        serde_json::from_value(legacy.clone()).expect("decode the pre-P3 shape");
+    assert_eq!(decoded.model, None);
+    assert_eq!(decoded.format_version, None);
+    assert_eq!(
+        serde_json::to_value(&decoded).expect("serialize"),
+        legacy,
+        "absent fields stay absent: an N-1 worker produces exactly today's reply shape"
+    );
+}
+
+/// Row 16 (worker restarted across an upgrade, live PTY): the snapshot is
+/// rebuilt from the live tracker and never persisted — a fresh hub (the
+/// restarted worker) reports the versioning fields again from its own
+/// tracker, on the wire as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_worker_rebuilds_the_snapshot_with_its_versioning_fields() {
+    let hub = OutputHub::new(1024, 4096, 24, 80).expect("hub");
+    hub.push(b"\x1b[2J\x1b[Hbefore")
+        .expect("push before restart");
+    assert_versioning(&hub.terminal_snapshot());
+    drop(hub);
+
+    // The restarted worker on the same live PTY output.
+    let hub = OutputHub::new(1024, 4096, 24, 80).expect("hub");
+    hub.push(b"\x1b[2J\x1b[Hafter").expect("push after restart");
+    let after = hub.terminal_snapshot();
+    assert_versioning(&after);
+    let wire = wire_terminal(&after).expect("conversion");
+    assert_eq!(wire.model, Some(wire_model(default_model())));
+    assert_eq!(wire.format_version, Some(CURRENT_FORMAT_VERSION));
+}
+
+/// Row 17 (reattach to a vt100-model worker from a libghostty-era CLI): the
+/// worker runs vt100 **explicitly** (`TerminalTracker::with_model(Vt100)`, not
+/// the build default, so this row asserts `vt100` on every lane, libghostty
+/// ones included), its wire snapshot reports `model = "vt100"` /
+/// `format_version = 1`, and the repaint payload is opaque bytes that
+/// recreate the screen on a fresh vt100 client.
+#[test]
+fn a_vt100_model_worker_reports_vt100_and_an_opaque_repaint() {
+    let mut tracker =
+        pohunek_terminal::TerminalTracker::with_model(pohunek_terminal::ModelKind::Vt100, 4, 20);
+    tracker.feed(b"\x1b[2J\x1b[Hscreen");
+    let snapshot = tracker.snapshot(0);
+    assert_eq!(snapshot.model, ScreenModelId::Vt100);
+    assert_eq!(snapshot.format_version, CURRENT_FORMAT_VERSION);
+
+    let wire = wire_terminal(&snapshot).expect("conversion");
+    assert_eq!(
+        wire.model,
+        Some(WireScreenModelId::Vt100),
+        "row 17 asserts vt100 unconditionally, whatever the build default is"
+    );
+    assert_eq!(wire.format_version, Some(CURRENT_FORMAT_VERSION));
+    let json = serde_json::to_value(&wire).expect("serialize");
+    assert_eq!(json["model"], "vt100");
+    assert_eq!(json["format_version"], 1);
+
+    // The attach repaint reaches the client as opaque bytes: feeding them to
+    // a fresh vt100 terminal recreates the screen exactly.
+    assert!(snapshot.ansi.starts_with(SYNC_BEGIN), "{snapshot:?}");
+    let mut fresh = pohunek_terminal::TerminalTracker::with_model(
+        pohunek_terminal::ModelKind::Vt100,
+        snapshot.rows,
+        snapshot.cols,
+    );
+    fresh.feed(&snapshot.ansi);
+    let replayed = fresh.snapshot(0);
+    assert_eq!(
+        (
+            replayed.visible_text,
+            replayed.cursor_row,
+            replayed.cursor_col,
+            replayed.alternate_screen,
+        ),
+        (
+            snapshot.visible_text,
+            snapshot.cursor_row,
+            snapshot.cursor_col,
+            snapshot.alternate_screen,
+        ),
+        "the repaint payload is opaque bytes"
+    );
 }

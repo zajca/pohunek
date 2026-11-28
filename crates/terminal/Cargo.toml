@@ -26,6 +26,8 @@ vte = { workspace = true }
 
 [dev-dependencies]
 pohunek-test-support = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

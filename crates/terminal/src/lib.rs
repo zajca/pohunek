@@ -38,5 +38,7 @@ pub use program_status::{
 };
 #[doc(inline)]
 pub use screen::{ScreenObservation, ScreenRegion, ScreenTracker};
-pub use snapshot::{ModelKind, TerminalSnapshot, TerminalTracker};
+pub use snapshot::{
+    ModelKind, ScreenModelId, TerminalSnapshot, TerminalTracker, CURRENT_FORMAT_VERSION,
+};
 pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};

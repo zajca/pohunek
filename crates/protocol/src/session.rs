@@ -1694,6 +1694,21 @@ impl SessionRuntimeIdentity {
     }
 }
 
+/// Identifier of the screen model that produced a `session.screen` snapshot.
+///
+/// Optional on the wire: a daemon that predates the field omits it, which a
+/// reader treats as `vt100`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ScreenModelId.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenModelId {
+    /// The pure-Rust `vt100` parser.
+    Vt100,
+    /// libghostty-vt through `pohunek-terminal-ghostty-sys`.
+    Libghostty,
+}
+
 /// Rendered terminal snapshot returned by `session.screen`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -1714,6 +1729,20 @@ pub struct SessionScreenResult {
     pub cursor: TerminalCursor,
     /// Whether the terminal is in its alternate screen buffer.
     pub alternate_screen: bool,
+    /// Screen model that rendered this snapshot, when the worker reports one.
+    ///
+    /// Omitted by a worker that predates the field; a reader treats that
+    /// absence as `vt100`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub screen_model: Option<ScreenModelId>,
+    /// Wire format version of the snapshot payload, when the worker reports
+    /// one.
+    ///
+    /// Omitted by a worker that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub format_version: Option<u32>,
     /// Sanitized terminal title when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]

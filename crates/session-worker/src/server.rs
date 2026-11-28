@@ -34,11 +34,12 @@ use protocol::{
     InspectSnapshot, LaunchProcess, LeaseChallenge, LeaseId, OutputGap,
     ProcessIdentity as WireProcessIdentity, PtyRelation, ReleasedIdentityClaim,
     ReportedLaunchIdentity, ReportedNativeReference, RequestId, RequestKind, ResponseKind,
-    RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
-    SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
-    TerminalLink as WireTerminalLink, TerminalLinkSource as WireTerminalLinkSource,
-    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
-    WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, BACKGROUND_MAX_ITEMS, SUPPORTED_RANGE,
+    RuntimePhase as WireRuntimePhase, RuntimeScope, ScreenModelId as WireScreenModelId, SessionId,
+    StreamId, StreamMode, SubagentField, SubagentPhase as WireSubagentPhase, SubagentSequence,
+    SubagentSnapshot, TerminalLink as WireTerminalLink,
+    TerminalLinkSource as WireTerminalLinkSource, TerminalSnapshot as WireTerminalSnapshot,
+    TransactionId, Version, WorkerId, WorkerInstanceId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION,
+    BACKGROUND_MAX_ITEMS, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7771,7 +7772,11 @@ fn journal_identity(identity: &ProcessIdentity) -> ChildIdentity {
     }
 }
 
-fn wire_terminal(snapshot: &crate::TerminalSnapshot) -> Result<WireTerminalSnapshot, WorkerError> {
+/// Converts a tracker snapshot into the worker wire type, carrying the
+/// screen model and the wire format version (issue #2538 P3).
+pub fn wire_terminal(
+    snapshot: &crate::TerminalSnapshot,
+) -> Result<WireTerminalSnapshot, WorkerError> {
     let dimensions = Dimensions::new(snapshot.cols, snapshot.rows)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
     Ok(WireTerminalSnapshot {
@@ -7783,11 +7788,21 @@ fn wire_terminal(snapshot: &crate::TerminalSnapshot) -> Result<WireTerminalSnaps
             visible: snapshot.cursor_visible,
         },
         alternate_screen: snapshot.alternate_screen,
+        model: Some(wire_screen_model(snapshot.model)),
+        format_version: Some(snapshot.format_version),
         title: snapshot.title.clone(),
         progress: snapshot.progress.clone(),
         visible_lines: snapshot.visible_text.lines().map(str::to_owned).collect(),
         links: Vec::new(),
     })
+}
+
+/// Maps the tracker's screen model onto the worker wire type (issue #2538 P3).
+fn wire_screen_model(model: pohunek_terminal::ScreenModelId) -> WireScreenModelId {
+    match model {
+        pohunek_terminal::ScreenModelId::Vt100 => WireScreenModelId::Vt100,
+        pohunek_terminal::ScreenModelId::Libghostty => WireScreenModelId::Libghostty,
+    }
 }
 
 fn wire_link(link: pohunek_terminal::ScreenLink) -> WireTerminalLink {
@@ -8649,8 +8664,9 @@ mod tests {
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
         ControlResponse, Cursor, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
-        FrameKind, HookAction, LeaseId, RequestId, ResponseKind, StreamId, StreamMode, Version,
-        WorkerInstanceId, WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+        FrameKind, HookAction, LeaseId, RequestId, ResponseKind,
+        ScreenModelId as WireScreenModelId, StreamId, StreamMode, Version, WorkerInstanceId,
+        WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -11363,6 +11379,8 @@ mod tests {
                 visible: true,
             },
             alternate_screen: true,
+            model: Some(WireScreenModelId::Vt100),
+            format_version: Some(1),
             title: Some("Unicode 界".to_owned()),
             progress: Some("50%".to_owned()),
             visible_lines: vec!["wide 界".to_owned(), "lossy �".to_owned()],
@@ -11801,6 +11819,8 @@ mod tests {
                 visible: true,
             },
             alternate_screen: false,
+            model: None,
+            format_version: None,
             title: None,
             progress: None,
             visible_lines: vec!["bounded repaint".to_owned()],

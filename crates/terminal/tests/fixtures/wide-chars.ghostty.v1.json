@@ -1,0 +1,13 @@
+{
+  "rows": 4,
+  "cols": 10,
+  "cursor_row": 3,
+  "cursor_col": 0,
+  "cursor_visible": true,
+  "alternate_screen": false,
+  "model": "libghostty",
+  "format_version": 1,
+  "title": null,
+  "progress": null,
+  "visible_text": "ab中文cd\nabcdefghi中x"
+}

@@ -1,0 +1,13 @@
+{
+  "rows": 4,
+  "cols": 40,
+  "cursor_row": 2,
+  "cursor_col": 0,
+  "cursor_visible": true,
+  "alternate_screen": false,
+  "model": "libghostty",
+  "format_version": 1,
+  "title": null,
+  "progress": null,
+  "visible_text": "after-write\nafter-read"
+}

@@ -477,3 +477,82 @@ async fn a_reported_link_is_counted_in_the_log_and_its_query_string_is_not_logge
         "the query string is not logged: {log}"
     );
 }
+
+/// Issue #2538 P3a, the daemon boundary of `session.screen`: a worker wire
+/// snapshot carrying `model` + `format_version` reaches the public reply
+/// unchanged, and an N-1 worker snapshot (both fields absent from its bytes)
+/// gives a reply with neither key present.
+#[tokio::test]
+async fn screen_model_and_format_version_reach_the_session_screen_reply() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    // New worker, through the real session boundary: the serialized reply a
+    // client decodes carries both fields (the worker's model of this build
+    // and format version 1).
+    let screen = screen_of(b"model me\r\n", Setup::default()).await;
+    let model = screen["screen_model"]
+        .as_str()
+        .expect("screen_model is a string");
+    assert!(
+        model == "vt100" || model == "libghostty",
+        "the worker's model reaches the reply unchanged: {screen}"
+    );
+    assert_eq!(screen["format_version"], json!(1), "{screen}");
+
+    // The same mapping driven from the wire side through the test-util seam:
+    // a snapshot with both fields set passes them through unchanged.
+    let runtime =
+        protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+            .expect("runtime identity");
+    let session_id = protocol::SessionId("s-42".to_owned());
+    let wire = |model, format_version| pohunek_worker_protocol::TerminalSnapshot {
+        watermark: 9,
+        dimensions: pohunek_worker_protocol::Dimensions::new(80, 24).expect("dimensions"),
+        cursor: pohunek_worker_protocol::Cursor {
+            column: 0,
+            row: 0,
+            visible: true,
+        },
+        alternate_screen: false,
+        model,
+        format_version,
+        title: None,
+        progress: None,
+        visible_lines: vec!["model me".to_owned()],
+        links: Vec::new(),
+    };
+    let result = pohunek_daemon::session::screen_result(
+        &session_id,
+        "worker-1".to_owned(),
+        runtime.clone(),
+        &wire(
+            Some(pohunek_worker_protocol::ScreenModelId::Libghostty),
+            Some(1),
+        ),
+    )
+    .expect("the mapping applies");
+    let reply = serde_json::to_value(&result).expect("serialize the reply");
+    assert_eq!(reply["screen_model"], json!("libghostty"), "{reply}");
+    assert_eq!(reply["format_version"], json!(1), "{reply}");
+
+    // N-1 worker: its bytes carry neither field, they decode as `None`, and
+    // the daemon's reply omits both keys — exactly the pre-P3 reply shape.
+    let legacy = serde_json::to_value(wire(None, None)).expect("serialize the N-1 shape");
+    assert!(legacy.get("model").is_none(), "{legacy}");
+    assert!(legacy.get("format_version").is_none(), "{legacy}");
+    let decoded: pohunek_worker_protocol::TerminalSnapshot =
+        serde_json::from_value(legacy).expect("the N-1 worker's snapshot decodes");
+    assert_eq!(decoded.model, None);
+    assert_eq!(decoded.format_version, None);
+    let result = pohunek_daemon::session::screen_result(
+        &session_id,
+        "worker-1".to_owned(),
+        runtime,
+        &decoded,
+    )
+    .expect("the mapping applies");
+    let reply = serde_json::to_value(&result).expect("serialize the reply");
+    assert!(reply.get("screen_model").is_none(), "{reply}");
+    assert!(reply.get("format_version").is_none(), "{reply}");
+}

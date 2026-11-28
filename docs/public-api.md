@@ -2442,8 +2442,8 @@ redundant leading zeroes.
 {"session_id":"s-42"}
 ```
 
-A successful result has this exact shape (optional `title` and `progress` may be
-omitted):
+A successful result has this exact shape (the optional `title`, `progress`,
+`screen_model` and `format_version` members may be omitted):
 
 ```json
 {
@@ -2459,6 +2459,14 @@ omitted):
   "visible_lines": ["pohunek"]
 }
 ```
+
+Two further optional members name the snapshot's provenance: `screen_model`
+(`"vt100"` or `"libghostty"`) is the screen model that rendered the snapshot,
+and `format_version` (a number, currently `1`) is the wire format version of
+the snapshot payload. A daemon or worker that predates them omits both, and
+their absence reads as `"vt100"` / `1`, so an older client simply ignores the
+extra keys. In this release the default screen model is still `vt100`; the
+`libghostty` model is selected per build and reports itself here.
 
 Visible lines are plain UTF-8 terminal cells with control sequences removed.
 They cover the active screen only: scrolled-off history is never included, so a

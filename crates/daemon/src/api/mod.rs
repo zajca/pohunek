@@ -1929,6 +1929,8 @@ mod tests {
                             visible: true,
                         },
                         alternate_screen: false,
+                        model: None,
+                        format_version: None,
                         title: None,
                         progress: None,
                         visible_lines: Vec::new(),

@@ -24,19 +24,19 @@ use protocol::{
     ProcessStartIdentity, ProfileAudience, ProjectSource, ProposalExpiry, ProposalId,
     ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
     QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult,
-    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
-    SessionDetectionParams, SessionDetectionResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
-    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeRef, RuntimeState, ScreenModelId,
+    SessionAttachResult, SessionBackground, SessionCapabilities, SessionDetachParams,
+    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -2667,6 +2667,10 @@ fn session_screen_contract_has_exact_wire_shape() {
             visible: true,
         },
         alternate_screen: false,
+        // Absent = an N-1 worker or the fallback build: the reply keeps the
+        // pre-P3 shape (issue #2538 P3a).
+        screen_model: None,
+        format_version: None,
         title: Some("Build".to_owned()),
         progress: None,
         visible_lines: vec!["one".to_owned(), "two".to_owned()],
@@ -2697,6 +2701,56 @@ fn session_screen_contract_has_exact_wire_shape() {
         "unknown": true
     }))
     .expect_err("unknown screen field must fail");
+}
+
+/// Issue #2538 P3a: `screen_model` and `format_version` are optional on
+/// `session.screen`'s result. Present, they serialize as a `snake_case` model
+/// id and a plain number; absent, a pre-P3 reply decodes with both `None`
+/// and a new reply decodes tolerantly for an N-1 client (no deny on this
+/// type).
+#[test]
+fn session_screen_model_and_format_version_are_optional_additive_fields() {
+    let mut wire = json!({
+        "session_id": "s-42",
+        "worker_id": "worker-1",
+        "worker_instance_id": "runtime-1",
+        "runtime_generation": "2",
+        "watermark": "9",
+        "dimensions": {"cols": 120, "rows": 40},
+        "cursor": {"row": 3, "col": 7, "visible": true},
+        "alternate_screen": false,
+        "screen_model": "libghostty",
+        "format_version": 1,
+        "visible_lines": ["one"],
+    });
+    let decoded = serde_json::from_value::<SessionScreenResult>(wire.clone()).expect("parse");
+    assert_eq!(decoded.screen_model, Some(ScreenModelId::Libghostty));
+    assert_eq!(decoded.format_version, Some(1));
+    assert_eq!(
+        serde_json::to_value(&decoded).expect("serialize"),
+        wire,
+        "present fields round-trip byte-identically"
+    );
+    // An N-1 daemon's reply (no model fields) decodes with both None and
+    // serializes back to the same pre-P3 shape.
+    let legacy = wire.as_object_mut().expect("object").remove("screen_model");
+    assert_eq!(legacy, Some(json!("libghostty")));
+    let legacy = wire
+        .as_object_mut()
+        .expect("object")
+        .remove("format_version");
+    assert_eq!(legacy, Some(json!(1)));
+    let decoded = serde_json::from_value::<SessionScreenResult>(wire.clone()).expect("parse");
+    assert_eq!(decoded.screen_model, None);
+    assert_eq!(decoded.format_version, None);
+    assert_eq!(serde_json::to_value(&decoded).expect("serialize"), wire);
+    // An N-1 client ignores the new keys: the type has no deny_unknown_fields.
+    let mut with_probe = wire.clone();
+    with_probe
+        .as_object_mut()
+        .expect("object")
+        .insert("__unknown_key_probe__".to_owned(), json!(true));
+    serde_json::from_value::<SessionScreenResult>(with_probe).expect("unknown key is ignored");
 }
 
 #[test]

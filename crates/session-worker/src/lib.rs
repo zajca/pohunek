@@ -70,7 +70,7 @@ pub use pty::{Command, Exit, ProcessIdentity, PtyError, PtyOwner};
 #[cfg(feature = "test-util")]
 pub use server::TerminalCommitHold;
 #[doc(inline)]
-pub use server::{run, Server, ServerArgs, ServerHandle};
+pub use server::{run, wire_terminal, Server, ServerArgs, ServerHandle};
 // Measurement seam for tests/output_path_cost.rs; not a client API.
 #[doc(hidden)]
 pub use server::write_output_event;

@@ -46,6 +46,20 @@ pub struct Cursor {
     pub visible: bool,
 }
 
+/// Identifier of the screen model that produced a [`TerminalSnapshot`].
+///
+/// Serialized as a `snake_case` string. Mirrors
+/// `pohunek_terminal::ScreenModelId`, which cannot be reused here because the
+/// worker protocol does not depend on the terminal crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenModelId {
+    /// The pure-Rust `vt100` parser.
+    Vt100,
+    /// libghostty-vt through `pohunek-terminal-ghostty-sys`.
+    Libghostty,
+}
+
 /// Captures complete provider-independent terminal state.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
@@ -57,6 +71,17 @@ pub struct TerminalSnapshot {
     pub cursor: Cursor,
     /// Whether the alternate screen is active.
     pub alternate_screen: bool,
+    /// Screen model that produced this snapshot, when the peer reports one.
+    ///
+    /// Absent from a worker that predates issue #2538's P3, and read as
+    /// `vt100` by that absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ScreenModelId>,
+    /// Wire format version of the snapshot payload, when the peer reports one.
+    ///
+    /// Absent from a worker that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u32>,
     /// Current terminal title.
     pub title: Option<String>,
     /// Current sanitized progress signal.
@@ -109,6 +134,8 @@ impl Debug for TerminalSnapshot {
             .field("dimensions", &self.dimensions)
             .field("cursor", &self.cursor)
             .field("alternate_screen", &self.alternate_screen)
+            .field("model", &self.model)
+            .field("format_version", &self.format_version)
             .field("title", &self.title.as_ref().map(|_| "<redacted>"))
             .field("progress", &self.progress.as_ref().map(|_| "<redacted>"))
             .field("visible_line_count", &self.visible_lines.len())
@@ -740,6 +767,8 @@ mod tests {
                         visible: true,
                     },
                     alternate_screen: true,
+                    model: Some(ScreenModelId::Vt100),
+                    format_version: Some(1),
                     title: Some(secret.to_owned()),
                     progress: Some(secret.to_owned()),
                     visible_lines: vec![secret.to_owned()],

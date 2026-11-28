@@ -2042,6 +2042,7 @@ dependencies = [
  "pohunek-terminal-ghostty-sys",
  "pohunek-test-support",
  "serde",
+ "serde_json",
  "unicode-width",
  "vt100",
  "vte",

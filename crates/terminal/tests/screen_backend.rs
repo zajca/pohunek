@@ -10,7 +10,25 @@
 
 // Rust guideline compliant 2026-11-27
 
-use pohunek_terminal::{ModelKind, TerminalSnapshot, TerminalTracker};
+use pohunek_terminal::{
+    ModelKind, ScreenModelId, TerminalSnapshot, TerminalTracker, CURRENT_FORMAT_VERSION,
+};
+use serde::{Deserialize, Serialize};
+
+/// Asserts the versioning fields of a snapshot (issue #2538 P3a): the screen
+/// model that produced it and the current wire format version. Every
+/// case-table scenario calls this, so each row visibly pins the new fields.
+fn assert_versioning(snapshot: &TerminalSnapshot, model: ModelKind) {
+    assert_eq!(
+        snapshot.model,
+        ScreenModelId::from(model),
+        "the snapshot must name the model that produced it"
+    );
+    assert_eq!(
+        snapshot.format_version, CURRENT_FORMAT_VERSION,
+        "the snapshot must carry the current wire format version"
+    );
+}
 
 /// First seven bytes of every trace file.
 const MAGIC: &[u8; 7] = b"PHTRACE";
@@ -181,19 +199,38 @@ fn screen_state(snapshot: &TerminalSnapshot) -> (u16, u16, u16, u16, bool, bool,
 
 /// S3: `with_model` runs the requested model, and `new` runs the default of
 /// the build (vt100 without the `libghostty` feature, libghostty with it).
+/// The snapshot of each tracker carries the model and the format version.
 #[test]
 fn with_model_selects_the_requested_backend() {
     let tracker = TerminalTracker::with_model(ModelKind::Vt100, 4, 20);
     assert_eq!(tracker.model(), ModelKind::Vt100);
+    assert_versioning(&tracker.snapshot(0), ModelKind::Vt100);
 
     #[cfg(feature = "libghostty")]
     {
         let tracker = TerminalTracker::with_model(ModelKind::Libghostty, 4, 20);
         assert_eq!(tracker.model(), ModelKind::Libghostty);
+        assert_versioning(&tracker.snapshot(0), ModelKind::Libghostty);
         assert_eq!(TerminalTracker::new(4, 20).model(), ModelKind::Libghostty);
     }
     #[cfg(not(feature = "libghostty"))]
-    assert_eq!(TerminalTracker::new(4, 20).model(), ModelKind::Vt100);
+    {
+        assert_eq!(TerminalTracker::new(4, 20).model(), ModelKind::Vt100);
+        assert_versioning(&TerminalTracker::new(4, 20).snapshot(0), ModelKind::Vt100);
+    }
+}
+
+/// S3 (P3b row, red by design in P3a): after the P3b flip
+/// (`default = ["libghostty"]` in `crates/terminal/Cargo.toml`),
+/// `TerminalTracker::new` reports the libghostty model in its snapshot. The
+/// flip is off in this slice, so the default build reports vt100 and this
+/// row stays ignored until P3b lands it.
+#[test]
+#[ignore = "flipped in P3b (issue #2538): default = [\"libghostty\"] lands there"]
+fn new_reports_libghostty_in_its_snapshot_after_the_p3b_flip() {
+    let snapshot = TerminalTracker::new(4, 20).snapshot(0);
+    assert_eq!(snapshot.model, ScreenModelId::Libghostty);
+    assert_eq!(snapshot.format_version, CURRENT_FORMAT_VERSION);
 }
 
 /// Fixtures whose visible text the two models are known to report
@@ -213,6 +250,8 @@ fn every_fixture_reports_the_same_geometry_and_cursor_on_both_models() {
     for (name, trace) in fixture_traces() {
         let vt100 = replay(ModelKind::Vt100, &trace).snapshot(0);
         let ghostty = replay(ModelKind::Libghostty, &trace).snapshot(0);
+        assert_versioning(&vt100, ModelKind::Vt100);
+        assert_versioning(&ghostty, ModelKind::Libghostty);
         assert_eq!(
             (
                 vt100.rows,
@@ -246,6 +285,8 @@ fn visible_text_matches_on_both_models_except_the_pinned_known_differences() {
         }
         let vt100 = replay(ModelKind::Vt100, &trace).snapshot(0);
         let ghostty = replay(ModelKind::Libghostty, &trace).snapshot(0);
+        assert_versioning(&vt100, ModelKind::Vt100);
+        assert_versioning(&ghostty, ModelKind::Libghostty);
         assert_eq!(
             vt100.visible_text, ghostty.visible_text,
             "{name}: the two models disagree on the visible text"
@@ -275,6 +316,8 @@ fn the_known_visible_text_differences_are_the_pinned_ones() {
         let trace = fixture(name);
         let vt100 = replay(ModelKind::Vt100, &trace).snapshot(0);
         let ghostty = replay(ModelKind::Libghostty, &trace).snapshot(0);
+        assert_versioning(&vt100, ModelKind::Vt100);
+        assert_versioning(&ghostty, ModelKind::Libghostty);
         assert_eq!(vt100.visible_text, *vt100_text, "{name}: vt100 text moved");
         assert_eq!(
             ghostty.visible_text, *ghostty_text,
@@ -292,7 +335,7 @@ const EMOJI_WIDTH_TEXT: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}x\n\u
 /// fixture, committed as `tests/fixtures/emoji-width.ghostty.v1.ansi`
 /// (`.ghostty.v1.ansi`: the libghostty model's repaint at pin v1). After a
 /// deliberate pin bump, regenerate it with the ignored
-/// `regenerate_emoji_width_golden` test and review the diff.
+/// `regenerate_golden_libghostty` test and review the diff.
 #[cfg(feature = "libghostty")]
 fn emoji_width_golden() -> Vec<u8> {
     let dir = pohunek_test_support::manifest_dir().join("tests/fixtures");
@@ -311,6 +354,8 @@ fn the_emoji_width_known_gap_stays_pinned() {
     let trace = fixture("emoji-width.trace");
     let vt100 = replay(ModelKind::Vt100, &trace).snapshot(0);
     let ghostty = replay(ModelKind::Libghostty, &trace).snapshot(0);
+    assert_versioning(&vt100, ModelKind::Vt100);
+    assert_versioning(&ghostty, ModelKind::Libghostty);
     assert_eq!(screen_state(&vt100), screen_state(&ghostty));
     assert_eq!(
         screen_state(&vt100),
@@ -362,6 +407,8 @@ fn a_long_scrollback_does_not_exceed_the_output_limit() {
     vt100.feed(input.as_bytes());
     let ghostty_snapshot = ghostty.snapshot(0);
     let vt100_snapshot = vt100.snapshot(0);
+    assert_versioning(&ghostty_snapshot, ModelKind::Libghostty);
+    assert_versioning(&vt100_snapshot, ModelKind::Vt100);
     assert_eq!(
         ghostty_snapshot.visible_text, vt100_snapshot.visible_text,
         "the two models report the same active screen after the flood"
@@ -411,6 +458,7 @@ fn hostile_output_does_not_break_the_libghostty_backend() {
         tracker.feed(sequence.as_bytes());
     }
     let snapshot = tracker.snapshot(0);
+    assert_versioning(&snapshot, ModelKind::Libghostty);
     assert_eq!((snapshot.rows, snapshot.cols), (ROWS, COLS));
     let bound = usize::from(ROWS) * (usize::from(COLS) * MAX_CELL_TEXT_BYTES + 1);
     assert!(
@@ -431,6 +479,7 @@ fn the_ansi_repaint_round_trips_through_a_fresh_tracker_of_the_same_model() {
     for (name, trace) in fixture_traces() {
         let model = ModelKind::Vt100;
         let snapshot = replay(model, &trace).snapshot(0);
+        assert_versioning(&snapshot, model);
         assert!(
             snapshot.ansi.starts_with(b"\x1b[?2026h"),
             "{name}: the repaint opens the synchronized-output bracket"
@@ -454,6 +503,7 @@ fn the_ansi_repaint_round_trips_through_a_fresh_tracker_of_the_same_model() {
 fn the_ghostty_ansi_repaint_round_trips_through_a_fresh_ghostty_tracker() {
     for (name, trace) in fixture_traces() {
         let snapshot = replay(ModelKind::Libghostty, &trace).snapshot(0);
+        assert_versioning(&snapshot, ModelKind::Libghostty);
         assert!(
             snapshot.ansi.starts_with(b"\x1b[?2026h"),
             "{name}: the repaint opens the synchronized-output bracket"
@@ -487,6 +537,7 @@ fn the_ansi_repaint_clears_a_prefilled_tracker() {
         for name in ["claude.trace", "resize-alt-screen.trace"] {
             let trace = fixture(name);
             let snapshot = replay(model, &trace).snapshot(0);
+            assert_versioning(&snapshot, model);
             let mut prefilled = TerminalTracker::with_model(model, snapshot.rows, snapshot.cols);
             for _ in 0..snapshot.rows {
                 prefilled.feed(b"stale content that the repaint must wipe\r\n");
@@ -518,6 +569,10 @@ fn the_emoji_width_cell_layout_is_pinned_per_row() {
     /// grapheme-cluster mode puts it at 2.
     const X_COLUMNS: [u16; 7] = [6, 2, 2, 1, 1, 4, 2];
     let trace = fixture("emoji-width.trace");
+    assert_versioning(
+        &replay(ModelKind::Libghostty, &trace).snapshot(0),
+        ModelKind::Libghostty,
+    );
     let mut terminal = HeadlessTerminal::new(&HeadlessConfig::default(), trace.rows, trace.cols)
         .expect("the headless terminal inits");
     for record in &trace.records {
@@ -568,6 +623,8 @@ fn osc_metadata_and_probes_are_identical_across_backends() {
         let mut vt100 = replay(ModelKind::Vt100, &trace);
         let mut ghostty = replay(ModelKind::Libghostty, &trace);
         let (a, b) = (vt100.snapshot(7), ghostty.snapshot(7));
+        assert_versioning(&a, ModelKind::Vt100);
+        assert_versioning(&b, ModelKind::Libghostty);
         assert_eq!(a.title, b.title, "{name}: title differs");
         assert_eq!(a.progress, b.progress, "{name}: progress differs");
         assert_eq!(
@@ -590,15 +647,170 @@ fn osc_metadata_and_probes_are_identical_across_backends() {
 fn osc_metadata_and_probes_are_delivered_on_the_default_model() {
     let mut tracker = replay(ModelKind::Vt100, &fixture("title-progress.trace"));
     let snapshot = tracker.snapshot(0);
+    assert_versioning(&snapshot, ModelKind::Vt100);
     assert_eq!(snapshot.title.as_deref(), Some("title two"));
     assert_eq!(snapshot.progress.as_deref(), Some("4;1;50"));
     assert!(tracker.take_probes().is_empty());
 
     let mut tracker = replay(ModelKind::Vt100, &fixture("program-status.trace"));
     let snapshot = tracker.snapshot(0);
+    assert_versioning(&snapshot, ModelKind::Vt100);
     assert!(
         !tracker.take_probes().is_empty(),
         "the probes of the fixture are delivered"
     );
     assert_eq!(snapshot.visible_text, "visible");
+}
+
+// ---------------------------------------------------------------------------
+// Golden fixtures (plan §5, issue #2538 P3a): one committed golden per
+// (trace, model), keyed by model and `format_version`:
+// `<trace>.<model>.v<N>.json` for the state and `<trace>.<model>.v<N>.ansi`
+// for the repaint bytes, where `<N>` is `CURRENT_FORMAT_VERSION`. A scenario
+// mismatch fails with the bump instruction below; the ignored
+// `regenerate_golden_*` tests rewrite the files (run them with
+// `cargo test --test screen_backend -- --ignored regenerate_golden`, review
+// the diff, commit).
+
+/// The screen state a golden file pins, serialized as JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GoldenState {
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    cursor_visible: bool,
+    alternate_screen: bool,
+    model: ScreenModelId,
+    format_version: u32,
+    title: Option<String>,
+    progress: Option<String>,
+    visible_text: String,
+}
+
+impl From<&TerminalSnapshot> for GoldenState {
+    fn from(snapshot: &TerminalSnapshot) -> Self {
+        Self {
+            rows: snapshot.rows,
+            cols: snapshot.cols,
+            cursor_row: snapshot.cursor_row,
+            cursor_col: snapshot.cursor_col,
+            cursor_visible: snapshot.cursor_visible,
+            alternate_screen: snapshot.alternate_screen,
+            model: snapshot.model,
+            format_version: snapshot.format_version,
+            title: snapshot.title.clone(),
+            progress: snapshot.progress.clone(),
+            visible_text: snapshot.visible_text.clone(),
+        }
+    }
+}
+
+/// The model slug of a golden file name: `vt100` or `ghostty`.
+fn model_slug(model: ModelKind) -> &'static str {
+    if model == ModelKind::Vt100 {
+        "vt100"
+    } else {
+        "ghostty"
+    }
+}
+
+/// The golden paths of one trace and model: `<stem>.<slug>.v<N>.json` and
+/// `<stem>.<slug>.v<N>.ansi` under `tests/fixtures/`.
+fn golden_paths(name: &str, model: ModelKind) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = pohunek_test_support::manifest_dir().join("tests/fixtures");
+    let stem = name.strip_suffix(".trace").expect("a trace file name");
+    let base = format!("{stem}.{}.v{}", model_slug(model), CURRENT_FORMAT_VERSION);
+    (
+        dir.join(format!("{base}.json")),
+        dir.join(format!("{base}.ansi")),
+    )
+}
+
+/// Writes the golden files of one trace and model (the ignored regen tests).
+fn write_golden(name: &str, model: ModelKind, trace: &Trace) {
+    let snapshot = replay(model, trace).snapshot(0);
+    assert_versioning(&snapshot, model);
+    let (json_path, ansi_path) = golden_paths(name, model);
+    let state = serde_json::to_string_pretty(&GoldenState::from(&snapshot))
+        .expect("the golden state serializes");
+    std::fs::write(&json_path, format!("{state}\n")).expect("the golden state writes");
+    std::fs::write(&ansi_path, &snapshot.ansi).expect("the golden repaint writes");
+}
+
+/// Compares one trace and model against its committed golden files.
+fn check_golden(name: &str, model: ModelKind, trace: &Trace) {
+    let snapshot = replay(model, trace).snapshot(0);
+    assert_versioning(&snapshot, model);
+    let slug = model_slug(model);
+    let (json_path, ansi_path) = golden_paths(name, model);
+    let json_name = json_path
+        .file_name()
+        .expect("a golden file name")
+        .to_string_lossy()
+        .into_owned();
+    let ansi_name = ansi_path
+        .file_name()
+        .expect("a golden file name")
+        .to_string_lossy()
+        .into_owned();
+    let expected_json = std::fs::read_to_string(&json_path).unwrap_or_else(|error| {
+        panic!("{name}/{slug}: the golden {json_name} must exist ({error}); regenerate it")
+    });
+    let expected: GoldenState =
+        serde_json::from_str(&expected_json).expect("the golden state parses");
+    assert_eq!(
+        GoldenState::from(&snapshot),
+        expected,
+        "{name}/{slug}: the state differs from `{json_name}`: bump `CURRENT_FORMAT_VERSION` and regenerate"
+    );
+    let expected_ansi = std::fs::read(&ansi_path).unwrap_or_else(|error| {
+        panic!("{name}/{slug}: the golden {ansi_name} must exist ({error}); regenerate it")
+    });
+    assert_eq!(
+        snapshot.ansi, expected_ansi,
+        "{name}/{slug}: the repaint differs from `{ansi_name}`: bump `CURRENT_FORMAT_VERSION` and regenerate"
+    );
+}
+
+/// Golden row: every trace's state and repaint bytes match the committed
+/// `*.vt100.v<N>.*` goldens on the vt100 model.
+#[test]
+fn golden_state_and_repaint_match_on_the_vt100_model() {
+    for (name, trace) in fixture_traces() {
+        check_golden(&name, ModelKind::Vt100, &trace);
+    }
+}
+
+/// Golden row: every trace's state and repaint bytes match the committed
+/// `*.ghostty.v<N>.*` goldens on the libghostty model.
+#[test]
+#[cfg(feature = "libghostty")]
+fn golden_state_and_repaint_match_on_the_libghostty_model() {
+    for (name, trace) in fixture_traces() {
+        check_golden(&name, ModelKind::Libghostty, &trace);
+    }
+}
+
+/// Regenerates every vt100 golden file. Run with
+/// `cargo test --test screen_backend -- --ignored regenerate_golden`, then
+/// review the diff and commit it.
+#[test]
+#[ignore = "regenerates the committed golden files; review the diff before committing"]
+fn regenerate_golden_vt100() {
+    for (name, trace) in fixture_traces() {
+        write_golden(&name, ModelKind::Vt100, &trace);
+    }
+}
+
+/// Regenerates every libghostty golden file. Run with
+/// `cargo test --test screen_backend --features libghostty -- --ignored regenerate_golden`,
+/// then review the diff and commit it.
+#[test]
+#[cfg(feature = "libghostty")]
+#[ignore = "regenerates the committed golden files; review the diff before committing"]
+fn regenerate_golden_libghostty() {
+    for (name, trace) in fixture_traces() {
+        write_golden(&name, ModelKind::Libghostty, &trace);
+    }
 }
