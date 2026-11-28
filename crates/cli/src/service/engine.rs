@@ -224,7 +224,7 @@ use super::verify::UnitVerifier;
 use crate::commands::integration::IntegrationEnv;
 use crate::paths::Paths;
 
-mod refresh_path;
+pub(crate) mod refresh_path;
 
 /// Durable metadata `--purge` removes from the data directory.
 ///

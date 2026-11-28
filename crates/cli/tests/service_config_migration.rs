@@ -872,6 +872,28 @@ fn check_refuses_a_pending_refresh_over_a_schema_seven_config_like_the_upgrade()
     );
 }
 
+/// An interrupted `refresh-path` over a current-schema `service.toml` that was
+/// edited after the refresh wrote it is refused by the check with the code and
+/// hint the upgrade's rollback gives: the rollback classifies the file against
+/// the journal, so the check does not plan it as a clean roll back.
+#[test]
+fn check_refuses_a_pending_refresh_over_an_edited_config_like_the_upgrade() {
+    let host = Host::current_with_waits(120_000, 2_700_000);
+    let (success, envelope) = check_with_setup(&host, |config, state, source| {
+        pending_refresh(config, state, source);
+        let mut edited = source.to_vec();
+        edited.extend_from_slice(b"\n# edited after the refresh wrote the file\n");
+        fs::write(config, &edited).expect("edit the file while the refresh is pending");
+    });
+    assert!(!success, "{envelope}");
+    let refusal = envelope.get("err").expect("the refusal document");
+    assert_eq!(
+        refusal.get("code").and_then(Value::as_str),
+        Some("service_refresh_config_changed"),
+        "{envelope}"
+    );
+}
+
 /// The same interrupted `refresh-path` over a current-schema file is rolled
 /// back by the upgrade, so the check does not refuse it for the schema. The
 /// check may stop at the service manager on a host without a user manager;

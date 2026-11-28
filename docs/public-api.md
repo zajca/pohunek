@@ -3223,7 +3223,11 @@ carry the codes of the upgrade errors (`service_upgrade_store_unusable`,
 login shell fails, hangs or prints junk or yields no usable directory (the
 fallback list never replaces a recorded path), `service_search_path_unmanaged`
 where the host records no path, `service_refresh_blocked_by_transaction` while an
-install or upgrade record is pending, `service_refresh_config_schema` for a `service.toml` of another
+install or upgrade record is pending, `service_refresh_config_changed` when `service.toml` was edited while a `refresh-path` was pending (`service check` and `service upgrade` give it for a
+pending `refresh-path` record over such a file, because the check previews the rollback's
+classification of the file against the journal; restore the file as the refresh wrote it or as
+it was before, or run `pohunek service uninstall`, which is session-checked and does not need
+the file to match the refresh), `service_refresh_config_schema` for a `service.toml` of another
 schema than this release writes (`service check` and `service upgrade` give it for a
 pending `refresh-path` record over such a file; nothing is rewritten; run the installed release's own
 `refresh-path` when it has the command, otherwise stop the live sessions, save a copy of `service.toml`, uninstall, install the

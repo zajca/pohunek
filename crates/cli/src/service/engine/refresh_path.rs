@@ -28,6 +28,7 @@ use super::{
     JobDefinition, JobPath, LateGate, Operation, PathBuf, PathUse, Plan, Record, ServiceConfig,
     ServiceState, Step,
 };
+use crate::service::context::Context;
 use crate::service::error::{FileEffect, JobMissingEffects, RecordEffect};
 use crate::service::record::{JournaledProcess, RefreshJournal};
 use crate::service::refresh::{self, Discovered};
@@ -38,7 +39,7 @@ use std::path::Path;
 
 /// What the installed `service.toml` is, relative to a refresh's journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileState {
+pub(crate) enum FileState {
     /// The bytes the refresh started from: nothing was written yet.
     Before,
     /// The bytes the refresh writes.
@@ -363,7 +364,7 @@ impl Engine<'_> {
         // as it started. A file restored to the previous path's own rendering
         // (by hand: a rollback marks the record `rolling_back` first) holds no
         // refresh write, so it is written again like the unchanged original.
-        let target_path = self.journaled_path(&journal.target)?;
+        let target_path = journaled_path(&journal.target, &self.store.path())?;
         let target = config.with_search_path(target_path)?;
         let state = classify_file(&journal, config, bytes, &target);
         if state == FileState::Edited {
@@ -579,19 +580,11 @@ impl Engine<'_> {
         record: &Record,
         layout: &InstallLayout,
     ) -> Result<Option<Gated>, Error> {
-        let journal = self.refresh_journal(record)?;
-        // The strict current-schema reader is kept: re-rendering a file of
-        // another schema here would migrate it without a migration. A file of
-        // another schema is refused with `service_refresh_config_schema`,
-        // whose hint names the installed release's own `refresh-path`, and
-        // `uninstall` does not need the read.
-        let (current, bytes) = refresh::load_installed_config(self.context)?;
-        let target = current.with_search_path(self.journaled_path(&journal.target)?)?;
-        let state = classify_file(journal, &current, &bytes, &target);
-        let previous = self.journaled_path(&journal.previous)?;
+        let preview = preview_refresh_rollback(self.context, record, &self.store.path())?;
+        let state = preview.state;
         let restored = match state {
-            FileState::After => current.with_search_path(previous)?,
-            FileState::Before | FileState::Restored => current,
+            FileState::After => preview.config.with_search_path(preview.previous)?,
+            FileState::Before | FileState::Restored => preview.config,
             FileState::Edited => return Err(Error::RefreshConfigChanged),
         };
         self.mark_rolling_back(record)?;
@@ -665,19 +658,71 @@ impl Engine<'_> {
         })
     }
 
-    /// Validates a journaled search path.
-    fn journaled_path(&self, entries: &[PathBuf]) -> Result<SearchPath, Error> {
-        SearchPath::new(entries.to_vec()).map_err(|error| Error::Record {
-            path: self.store.path(),
-            detail: format!("the journaled search path is invalid: {error}"),
-        })
-    }
-
     /// The worker jobs the daemon restart leaves running, when they can be listed.
     async fn workers_kept(&self) -> Option<usize> {
         let workers = self.backend.workers().discover().await.ok()?;
         Some(workers.iter().filter(|worker| job_alive(worker)).count())
     }
+}
+
+/// Validates a journaled search path; `record_path` names the transaction
+/// record in the error.
+fn journaled_path(entries: &[PathBuf], record_path: &Path) -> Result<SearchPath, Error> {
+    SearchPath::new(entries.to_vec()).map_err(|error| Error::Record {
+        path: record_path.to_path_buf(),
+        detail: format!("the journaled search path is invalid: {error}"),
+    })
+}
+
+/// What previewing the rollback of a pending refresh found in the installed
+/// `service.toml`.
+///
+/// The rollback and `service check` judge the installed file the same way, so
+/// both call [`preview_refresh_rollback`] instead of reading it themselves: the
+/// strict reader owns the schema refusal and [`classify_file`] owns the
+/// edited-file one, so a check cannot drift from what a rollback would do.
+pub(crate) struct RefreshRollbackPreview {
+    /// The installed file, read with the current-schema reader.
+    pub(crate) config: ServiceConfig,
+    /// The journaled previous search path, the one a rollback restores.
+    pub(crate) previous: SearchPath,
+    /// Which of the journaled states the installed file is in.
+    pub(crate) state: FileState,
+}
+
+/// Previews the rollback of the pending refresh `record` describes, changing
+/// nothing: it reads the installed `service.toml` with the strict
+/// current-schema reader, resolves the journaled target and previous search
+/// paths, and classifies the file against the journal.
+///
+/// The strict reader is kept because re-rendering a file of another schema here
+/// would migrate it without a migration: such a file is refused with
+/// `service_refresh_config_schema`, whose hint names the installed release's
+/// own `refresh-path`, and `uninstall` does not need the read.
+///
+/// # Errors
+///
+/// Returns the record error of a refresh record without a journal, the
+/// journal's invalid-path error, the reader's [`Error::NotInstalled`] and
+/// [`Error::RefreshConfigSchema`], and the namespace errors of the read.
+pub(crate) fn preview_refresh_rollback(
+    context: &Context,
+    record: &Record,
+    record_path: &Path,
+) -> Result<RefreshRollbackPreview, Error> {
+    let journal = record.refresh.as_ref().ok_or_else(|| Error::Record {
+        path: record_path.to_path_buf(),
+        detail: "a refresh record has no refresh journal".to_owned(),
+    })?;
+    let (config, bytes) = refresh::load_installed_config(context)?;
+    let target = config.with_search_path(journaled_path(&journal.target, record_path)?)?;
+    let previous = journaled_path(&journal.previous, record_path)?;
+    let state = classify_file(journal, &config, &bytes, &target);
+    Ok(RefreshRollbackPreview {
+        config,
+        previous,
+        state,
+    })
 }
 
 /// Which of the journaled states the installed file is in.

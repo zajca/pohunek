@@ -1109,6 +1109,41 @@ async fn a_check_of_an_upgrade_refuses_a_previous_schema_file_under_a_pending_re
 }
 
 #[tokio::test]
+async fn a_check_of_an_upgrade_refuses_an_edited_file_under_a_pending_refresh_like_the_upgrade() {
+    let r = refreshable().await;
+    let harness = &r.harness;
+    interrupt_after(harness, Step::Config).await;
+    let mut edited = config_bytes(harness);
+    edited.extend_from_slice(b"\n# edited after the refresh wrote the file\n");
+    std::fs::write(harness.context.config_path(), &edited).expect("edit the file");
+    let (bytes, record) = (config_bytes(harness), record_bytes(harness));
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await
+    .expect_err("the check refuses what the upgrade refuses");
+    let upgraded = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the upgrade refuses an edited file");
+
+    assert_eq!(
+        checked.code(),
+        "service_refresh_config_changed",
+        "{checked}"
+    );
+    assert_eq!(upgraded.code(), checked.code(), "{upgraded}");
+    assert_eq!(upgraded.hint(), checked.hint());
+    assert_eq!(config_bytes(harness), bytes, "the file is untouched");
+    assert_eq!(record_bytes(harness), record, "the record is kept");
+}
+
+#[tokio::test]
 async fn a_dry_run_over_a_pending_refresh_fails_closed_and_leaves_the_record() {
     let r = refreshable().await;
     let harness = &r.harness;
