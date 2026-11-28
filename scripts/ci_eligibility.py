@@ -106,7 +106,8 @@ def source_is_eligible(
 def consumer_matches(run: dict, consumer_event: str, sha: str) -> bool:
     """Whether a candidate run answers this consumer: a push consumer may
     reuse another commit with the same tree; a delta dispatch only accepts a
-    source on the same commit (`head_sha == GITHUB_SHA`)."""
+    source on the same commit (`head_sha == GITHUB_SHA`). Pull requests are
+    not reuse consumers: a PR run is always a full run (#2599)."""
     if consumer_event == "push":
         return True
     if consumer_event == "workflow_dispatch":

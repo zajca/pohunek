@@ -289,6 +289,37 @@ that path too.
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
 
+### When the macOS lanes run
+
+The macOS jobs of `ci.yml` — `platform contracts (arm64)`, `macOS release
+daemon build (macos-15)`, `macOS package install and upgrade (macos-15)`,
+`pinned Hermes compatibility (macOS arm64, model-free)` and
+`SDK workspace (macOS arm64)` — run on every push to `main`, every nightly
+schedule and every `main`/`nightly` dispatch, and on a pull request only when
+the head carries the `macos-gate` label **and** its diff selects the job's
+paths filter. The label is necessary, never sufficient: a labelled PR whose
+diff matches no macOS path still skips the lanes. The coordinator applies the
+label to every PR that touches `crates/terminal`, `crates/session-worker`,
+`crates/daemon`, `crates/test-support/src`, `crates/platform`,
+`runtime-packages/`, `packaging/` or `.github/`, so the platform-sensitive
+work keeps its lane. Independently of the label, a diff that touches only
+`crates/*/tests/**` of a lane-owned crate — no `src/` file, manifest, script,
+workflow or toolchain file in the same diff — never selects the lane. The
+trade: a macOS-only defect in an unlabelled or tests-only PR is found by the
+post-merge `main` run, never at the PR gate, and a red `main` keeps priority
+one. ([#2599](https://github.com/zajca/pohunek/issues/2599))
+
+The coordinator labels the PR with `macos-gate` **before the first push** (or
+right after it and re-pushes): the `pull_request` trigger deliberately excludes
+the `labeled`/`unlabeled` activity types, because a label event would cancel
+and restart every pull request's full CI on every label edit — that cost is
+why the label event is not used. Escape hatch for a PR that already ran
+unlabelled: push again (an empty commit or a rebase), or dispatch the `main`
+tier for the PR's head. A re-pushed PR run is a full run — pull requests are
+not reuse consumers (reuse is push and delta-dispatch only) — so it costs the
+whole sweep minus the paths-filtered jobs, and the macOS lane runs in it
+because the label is now present.
+
 The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
 `ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
 `library (x86_64-unknown-linux-musl)`, `library (aarch64-apple-darwin)`,
@@ -353,14 +384,17 @@ carry it, because a failed selection runs everything instead of ending the
 run. A fork or Dependabot pull request has a read-only token, so the cancel
 call is refused and the run keeps its real failure.
 
-**Delta dispatch and push reuse.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
-accepts `delta: true`, and a `main` push reuses green jobs while the workflow-level
+**Delta dispatch and push reuse.** A `workflow_dispatch` run of
+`ci.yml` with `tier=main` accepts `delta: true`, and a `main` push reuses green
+jobs while the workflow-level
 `CI_REUSE_PUSH` kill switch is `"true"` (issue #2204; set it to `"false"` to turn
-push reuse off — a tier=main delta dispatch is unaffected): the `reuse` job
+push reuse off — a tier=main delta dispatch is unaffected). Pull requests are
+not reuse consumers: a PR run is always a full run (#2599). The `reuse` job
 finds the newest green legs of the previous runs of the same tree from this
 repository — pull request runs, prior main pushes, and tier=main delta dispatches,
 each within 24 hours, fork runs never — and reuses those green legs (per job, the
-newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push may match by recorded tested tree. A failed `reuse` run fails
+newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push may
+match by recorded tested tree. A failed `reuse` run fails
 the verdict, so no job is wrongly skipped. The record names only legs that were green in their source run, and a fail-open run writes an empty record. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the

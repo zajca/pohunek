@@ -37,15 +37,15 @@ PINNED_BODY_HASHES = {
   "doctests": "d1ae3f494b743d380b638141be939d3a42c597f7928c4fe915670efbb05be943",
   "fast-tests": "bb8a335dd5ec94c10c91f9889eaaa5196254987b611ecea329858ac6e6289a8a",
   "feature-matrix": "e8a32d260282f7abf85cc323e5e9b3e5d2066f95c9454824c8c41821b31ec9d9",
-  "hermes-compatibility-macos": "0c849d5255e245198c4b073e63febe7c81e1c202d468628c985531e02a5b73a7",
+  "hermes-compatibility-macos": "596dfad0f0e14d2defb46ac1f8ba37e314eadaf124dc683bccaf0dbf29e53756",
   "integration": "1626dbb6661d7b5cd5c2baf308d3fd3b8e3a985f7f8269a57aa515fccdd1160f",
-  "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
-  "macos-release-build": "3606ddebf6821c5b43a453417aa4f5077c8843fb5de0a35e0560094fc3746a38",
+  "macos-package": "c86e3a51209b1df8d324f4cbb83ef7339f9c2e5e4f39e70b56f2c7b1b961c5b4",
+  "macos-release-build": "0676af5652b141ed9148792d5ae5a34ae37dfdb93d18f5c5857e2bb4233c8dda",
   "macos-tier": "5c1c709f20f1ed7f77248e9fe66d28174d0174c2f0571fc185eb79367e44c5d1",
-  "platform-contracts": "2478c75e6149df6dc0c3f1968b7a69be8918f0d69ea0e1a88a2e7b6b3a0910aa",
+  "platform-contracts": "da29d518705eda70f3e5a442fe6508729a2ca96e7208168c3535cf3f4a88f95c",
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
   "script-tests": "bc3133fb57737612bb959a951d7e8fb11c10d928cb50458c023abc7f19d5f1bd",
-  "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
+  "sdk-macos": "c0fbfc671604cfdd56bd0bc9df5a98043c34d823e793e0b1604f3651afc5458a",
   "shear": "8e9684845342c677bb4155e024c73fd205e8d1be7582a73a81b75bdff4046c62",
   "systemd-supervision": "8e5004294d8f298c6e5be025b03d5cec5b479e0f5b664d271b1eeee3421fca20",
   "test": "7df6c1fe0ae04f22e2df311364f52a8d96e0f6df4794c10c15cec5862e2929b5",
@@ -59,7 +59,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "befbb451de400878a965c551cbd28868b741eba0ff2ab0650e262ba071207a4d"
+PINNED_PREAMBLE = "e8efc3a006506bbe0fdba96ba9b85c291c774476ceaa08025256e1131fc53a93"
 
 
 def pinned_preamble():

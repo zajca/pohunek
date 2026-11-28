@@ -916,9 +916,10 @@ else:
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
     def test_a_consumer_on_an_unknown_event_refuses_reuse(self):
-        # `ci-reuse` answers only push and delta-dispatch consumers: a
-        # schedule consumer refuses before any listing, so the refusal
-        # text names the event instead of reusing anything.
+        # `ci-reuse` answers only push and delta-dispatch consumers (a
+        # pull request is refused too: a PR run is always a full run,
+        # #2599): a schedule consumer refuses before any listing, so the
+        # refusal text names the event instead of reusing anything.
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": green_jobs()},
@@ -929,6 +930,25 @@ else:
             artifact_zips={"2": selection_zip("full")},
         )
         with self.consumer("schedule"):
+            rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
+
+    def test_a_pull_request_consumer_refuses_reuse(self):
+        # Pull requests are not reuse consumers (#2599): a PR run is always
+        # a full run, so a re-pushed PR after labelling is never silently
+        # narrowed by a same-tree source — the refusal happens before any
+        # listing, exactly like the schedule consumer above.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        with self.consumer("pull_request"):
             rc = self.run_script_with_tree(TREE)
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
