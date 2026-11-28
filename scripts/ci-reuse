@@ -2,7 +2,7 @@
 """Decide which CI jobs a run reuses from same-tree green runs (#2203, #2204).
 
 A `tier=main` dispatch with `delta=true`, a main-branch push and a pull
-request run (including a `labeled` or `unlabeled` re-run of the same head,
+request run (including a re-run of the same head by a re-push or reopen,
 issue #2599) run this script in the `reuse` job. It computes the tree of
 `GITHUB_SHA` and lists recent `ci.yml` runs of this repository whose event
 is in `source_events` of `scripts/ci-reuse.json`, never a fork, never >24h

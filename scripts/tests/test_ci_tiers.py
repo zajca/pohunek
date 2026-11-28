@@ -698,40 +698,47 @@ class CiTierWorkflowTests(unittest.TestCase):
         self.assertRegex(tier, r"(?m)^\s+- main$")
         self.assertRegex(tier, r"(?m)^\s+- nightly$")
 
-    def test_pull_request_triggers_include_labeled_and_unlabeled(self):
-        # A label change must start a run that re-evaluates the macOS label
-        # condition of the macOS jobs (issue #2599): `labeled` starts a run
-        # that can run the lane, `unlabeled` one that skips it. Without them
-        # a label added after the run started would never re-evaluate.
+    def test_pull_request_triggers_exclude_labeled_and_unlabeled(self):
+        # The pre-fix activity set, pinned: a `labeled`/`unlabeled` event
+        # would cancel and restart every pull request's full CI on every
+        # label edit (adding `no-changelog` or `docs-only` included), which
+        # is worse than the problem it solves (issue #2599). The `macos-gate`
+        # label must therefore be on the PR before its first push; a PR that
+        # already ran unlabelled gets the lane by a re-push or a `main` tier
+        # dispatch of its head, never by a label event.
         triggers = CI.split("on:\n", 1)[1]
         pr = block(triggers, "pull_request", indent=2)
         types = re.search(r"(?m)^    types: \[(.+)\]$", pr)
         self.assertIsNotNone(types, "pull_request must pin its activity types")
         self.assertEqual(
             [entry.strip() for entry in types.group(1).split(",")],
-            ["opened", "synchronize", "reopened", "labeled", "unlabeled"],
+            ["opened", "synchronize", "reopened"],
         )
 
-    def test_a_labeled_event_with_the_label_starts_the_lane_and_an_unlabeled_one_skips_it(self):
+    def test_the_lane_condition_follows_the_event_payload_label(self):
+        # `labeled`/`unlabeled` are not in the trigger types (pinned by the
+        # test above), so these rows only pin the job condition's semantics:
+        # on a pull request the lane follows the labels of the event payload
+        # together with the paths filter — the label is necessary, never
+        # sufficient.
         jobs = workflow_jobs()
         lane = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs["platform-contracts"])
         assert lane is not None
-        # A `labeled` event carries the label in the event payload, and a
-        # paths-positive diff selects the lane: the lane starts.
+        # A payload that carries the label, on a paths-positive diff: the
+        # lane starts.
         self.assertTrue(evaluate_job_condition(
             lane.group(1), event="pull_request", action="labeled",
             changes={"macos": "true"}, labels=[MACOS_GATE_LABEL],
         ))
-        # An `unlabeled` event that removed `macos-gate` no longer carries
-        # it: the lane skips.
+        # A payload without the label (an `unlabeled` one): the lane skips.
         self.assertFalse(evaluate_job_condition(
             lane.group(1), event="pull_request", action="unlabeled",
             changes={"macos": "true"}, labels=[],
         ))
-        # The activity type alone never starts the lane without the label.
+        # The label alone never starts the lane on a paths-negative diff.
         self.assertFalse(evaluate_job_condition(
             lane.group(1), event="pull_request", action="labeled",
-            changes={"macos": "true"}, labels=[],
+            changes={"macos": "false"}, labels=[MACOS_GATE_LABEL],
         ))
 
     def test_superseded_pr_runs_cancel_and_main_runs_drain_without_cross_tier_cancellation(self):
@@ -4793,8 +4800,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
             outputs={REUSE_JOB: {"skip": "[]"}},
             changes=dict(changes_of("pull_request")),
         ))
-        self.assertTrue(pr, "a pull request runs reuse, so a labeled/unlabeled "
-                            "re-run of the same head reuses its green legs (#2599)")
+        self.assertTrue(pr, "a pull request runs reuse, so a re-run of the same "
+                            "head (re-push or reopen) reuses its green legs (#2599)")
 
     def test_the_kill_switch_is_documented_and_defaults_on(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text()

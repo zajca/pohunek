@@ -59,7 +59,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "a2b0cc5a9c6d6e8252df39af6c5f1b972b6eb2e8a3dfc4cbcc6f9e0a4a2f3a4d"
+PINNED_PREAMBLE = "e8efc3a006506bbe0fdba96ba9b85c291c774476ceaa08025256e1131fc53a93"
 
 
 def pinned_preamble():

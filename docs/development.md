@@ -309,20 +309,15 @@ trade: a macOS-only defect in an unlabelled or tests-only PR is found by the
 post-merge `main` run, never at the PR gate, and a red `main` keeps priority
 one. ([#2599](https://github.com/zajca/pohunek/issues/2599))
 
-The `pull_request` trigger pins `types: [opened, synchronize, reopened,
-labeled, unlabeled]`, so a label change starts a run that re-evaluates the
-label condition: adding `macos-gate` after a run started begins a new run
-(cancelling the in-progress one through `cancel-in-progress`) in which the
-lane runs; removing it begins one that skips it. The coordinator labels the
-PR before or right after the push, so in the normal flow the lane starts in
-the first run. A `labeled`/`unlabeled` re-run is a `pull_request` consumer
-of the reuse mechanism below: it skips the same-tree green legs of the PR's
-earlier runs and costs only the jobs those runs skipped — the label-skipped
-lane, which was never green, is not in the reuse skip list and runs in the
-re-run. A run started before the label is therefore never excused as a skip
-at the head: its verdict may excuse the label-skipped lane inside that old
-run, but the label event's run supersedes it for the same head SHA (the
-newest run decides each check), and in that run the lane gets its chance.
+The coordinator labels the PR with `macos-gate` **before the first push** (or
+right after it and re-pushes): the `pull_request` trigger deliberately excludes
+the `labeled`/`unlabeled` activity types, because a label event would cancel
+and restart every pull request's full CI on every label edit — that cost is
+why the label event is not used. Escape hatch for a PR that already ran
+unlabelled: push again (an empty commit or a rebase), or dispatch the `main`
+tier for the PR's head; the re-run reuses the same-tree green legs of the
+earlier runs (the `reuse` job runs on pull requests too) and costs only the
+jobs those runs skipped — the unlabelled run's macOS lane.
 
 The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
 `ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
@@ -393,7 +388,7 @@ call is refused and the run keeps its real failure.
 jobs while the workflow-level
 `CI_REUSE_PUSH` kill switch is `"true"` (issue #2204; set it to `"false"` to turn
 push reuse off — a tier=main delta dispatch is unaffected), and a pull request
-run — including a `labeled`/`unlabeled` re-run of the same head (#2599) —
+run — including a re-run of the same head by a re-push or reopen (#2599) —
 reuses by the same rule: a pull request consumer matches source runs by their
 recorded tested tree, like a push, while a delta dispatch matches only the
 same commit. The `reuse` job

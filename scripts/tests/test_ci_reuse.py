@@ -934,11 +934,12 @@ else:
         self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
 
     @as_consumer("pull_request")
-    def test_a_labeled_rerun_of_a_pull_request_reuses_its_same_tree_green_legs(self):
-        # A `labeled`/`unlabeled` re-run of a pull request head (issue #2599)
-        # is a pull_request consumer: it reuses the same-tree green legs of
-        # the earlier runs of the PR, so the re-run costs only what they
-        # skipped (the label-skipped macOS lane). Like a push consumer, a
+    def test_a_rerun_of_a_pull_request_reuses_its_same_tree_green_legs(self):
+        # A re-run of a pull request head (a re-push or reopen; `labeled`/
+        # `unlabeled` are deliberately not trigger types, issue #2599) is a
+        # pull_request consumer: it reuses the same-tree green legs of the
+        # earlier runs of the PR, so the re-run costs only what they
+        # skipped (an unlabelled run's macOS lane). Like a push consumer, a
         # pull_request consumer matches a source on another commit by the
         # recorded tested tree, not by head SHA.
         self.write_fixture(

@@ -24,12 +24,13 @@ on:
   push:
     branches: [main]
   pull_request:
-    # `labeled`/`unlabeled` start a run that re-evaluates the `macos-gate`
-    # label condition of the macOS jobs (issue #2599): adding the label
-    # starts a run that runs the lane, removing it one that skips it. The
-    # run reuses the same-tree green legs (the `reuse` job), so it costs
-    # only the jobs the earlier run skipped.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # The pre-fix activity set, pinned: `labeled`/`unlabeled` are excluded on
+    # purpose — a label event would cancel and restart every pull request's
+    # full CI on every label edit (issue #2599). The `macos-gate` label must
+    # therefore be on the PR before its first push; a PR that already ran
+    # unlabelled gets the lane by a re-push (or a `main` tier dispatch of
+    # its head), not by a label event.
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       tier:
@@ -1044,8 +1045,8 @@ jobs:
     # `CI_REUSE_PUSH` cannot be read here (job `if:` has no `env`), so the
     # kill switch is the `nopus` step below. On a push with the switch
     # off, `decide` and the upload are skipped, every job runs, and the
-    # job still succeeds. A pull request run (including a `labeled` or
-    # `unlabeled` re-run of the same head, issue #2599) reuses the same-tree
+    # job still succeeds. A pull request run (including a re-run of the
+    # same head by a re-push or reopen, issue #2599) reuses the same-tree
     # green legs of its earlier runs; every other event leaves the job
     # skipped.
     permissions:
