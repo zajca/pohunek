@@ -14,7 +14,7 @@ name = "pohunek"
 path = "src/main.rs"
 
 [features]
-default = ["embed-agent-skill"]
+default = ["embed-agent-skill", "libghostty"]
 # xtask builds this crate without the feature so `cargo xtask agent-skill
 # generate` stays runnable even while the generated artifact itself is
 # missing or damaged; every binary build embeds the checked-in artifact.
@@ -24,7 +24,7 @@ embed-agent-skill = ["pohunek-knowledge/agent-skill"]
 test-util = []
 # The libghostty-vt screen model of the worker terminal snapshot (issue
 # #2538); forwarded so one feature switch controls the whole product.
-libghostty = ["pohunek-terminal/libghostty"]
+libghostty = ["pohunek-terminal/libghostty", "pohunek-session-worker/libghostty"]
 
 [dependencies]
 reqwest.workspace = true

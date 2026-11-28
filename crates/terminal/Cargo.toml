@@ -7,11 +7,11 @@ rust-version.workspace = true
 description = "pohunek terminal screen model: vt100-backed grid scraping and an attach compositor."
 
 [features]
-# The default screen model of this slice is vt100; P3 of issue #2538 flips
-# this to ["libghostty"]. vt100 is always compiled: the compositor and the
-# daemon's screen tracker still use it. The fallback build is
-# `--no-default-features`: no Zig, no C library.
-default = []
+# The default screen model is libghostty-vt (issue #2538 P3b); vt100 is always
+# compiled: the compositor and the daemon's screen tracker still use it. The
+# fallback build is `--no-default-features`: the whole product on vt100 with
+# no Zig and no C library.
+default = ["libghostty"]
 # Runs libghostty-vt as the `TerminalTracker` backend through
 # pohunek-terminal-ghostty-sys, the crate that owns the unsafe FFI.
 libghostty = ["dep:pohunek-terminal-ghostty-sys", "pohunek-terminal-ghostty-sys/libghostty"]

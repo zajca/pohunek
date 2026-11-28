@@ -243,7 +243,9 @@ jobs:
           shared-key: ci-
 
       - name: Build docs artifacts
-        run: cargo xtask docs site
+        # Host tool: built without the library, because LIBGHOSTTY_VT_DIR names
+        # the matrix target (musl on that leg), not the host (issue #2538 P3b).
+        run: cargo run -p xtask --no-default-features -- docs site
 
       # The throwaway anchor replaces the production one in this ephemeral
       # checkout only; stage-archive copies it into the daemon archive alone.
@@ -252,7 +254,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked -p xtask
+          # Host tool, built without the library (see "Build docs artifacts").
+          cargo build --locked -p xtask --no-default-features
           XTASK="$PWD/target/debug/xtask" scripts/release-workflow/rehearsal-trust \
             "$RUNNER_TEMP/rehearsal-trust" "$GITHUB_RUN_ID" "$GITHUB_SHA"
           cp "$RUNNER_TEMP/rehearsal-trust/anchor.json" packaging/runtime-catalog-anchor.json
@@ -350,10 +353,11 @@ jobs:
           package_dir="$extract_dir/hermes-package"
           mkdir "$package_dir"
           scripts/build-hermes-package "$package_dir/hermes.tar.zst"
-          cargo xtask hermes throwaway-catalog \
+          # Host tools, built without the library (see "Build docs artifacts").
+          cargo run -p xtask --no-default-features -- hermes throwaway-catalog \
             --package "$package_dir/hermes.tar.zst" \
             --output-dir "$package_dir/trust"
-          cargo xtask hermes compatibility \
+          cargo run -p xtask --no-default-features -- hermes compatibility \
             --hermes-bin "$HERMES_BIN" \
             --bin-dir "$release_root" \
             --package "$package_dir/hermes.tar.zst"

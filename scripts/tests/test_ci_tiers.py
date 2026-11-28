@@ -32,6 +32,9 @@ MACOS_PATH_OWNERSHIP = {
     "platform-contracts": {
         "filter": "macos",
         "pr": {
+            ".github/actions/libghostty-vt/**",
+            ".github/actions/libghostty-vt-macos/**",
+            ".github/actions/setup-zig/**",
             "Cargo.toml",
             "crates/platform/**",
             "crates/paths/**",
@@ -102,6 +105,7 @@ MACOS_PATH_OWNERSHIP = {
     "macos-package": {
         "filter": "macos_package",
         "pr": {
+            ".github/actions/libghostty-vt-macos/**",
             "packaging/**",
             "scripts/acceptance/macos-package-install",
             "scripts/acceptance/launchd_lifetime_evidence.py",
@@ -147,6 +151,7 @@ MACOS_PATH_OWNERSHIP = {
     "hermes-compatibility-macos": {
         "filter": "hermes_macos",
         "pr": {
+            ".github/actions/libghostty-vt-macos/**",
             "compat/hermes/**",
             "runtime-packages/hermes/**",
             "crates/cli/src/hermes_integration/**",
@@ -185,6 +190,7 @@ MACOS_PATH_OWNERSHIP = {
     "sdk-macos": {
         "filter": "sdk_macos",
         "pr": {
+            ".github/actions/libghostty-vt-macos/**",
             "sdk/ts/**",
             "package.json",
             "bun.lock",
@@ -1125,7 +1131,7 @@ class CiTierWorkflowTests(unittest.TestCase):
     def test_consumers_of_the_macos_release_build_download_it_and_never_build_version_a(self):
         jobs = workflow_jobs()
         builder = jobs["macos-release-build"]
-        self.assertRegex(builder, r"(?m)^    needs: \[changes, reuse\]$")
+        self.assertRegex(builder, r"(?m)^    needs: \[changes, libghostty-darwin, reuse\]$")
         build = job_steps(builder)["Build the daemon component"]
         self.assertIn('bindir="$(packaging/macos/build-release daemon)"', step_script(build))
         self.assertNotIn("CARGO_LOCKED_FLAG", step_script(build))
@@ -1136,7 +1142,7 @@ class CiTierWorkflowTests(unittest.TestCase):
         for consumer in MACOS_BUILDER_JOBS["macos-release-build"]:
             with self.subTest(job=consumer):
                 definition = jobs[consumer]
-                self.assertRegex(definition, r"(?m)^    needs: \[changes, macos-release-build, reuse\]$")
+                self.assertRegex(definition, r"(?m)^    needs: \[changes, macos-release-build, libghostty-darwin, reuse\]$")
                 steps = job_steps(definition)
                 download = steps["Download the daemon binaries"]
                 self.assertIn("uses: actions/download-artifact@", download)
@@ -5370,7 +5376,7 @@ class LaneSelectionTests(unittest.TestCase):
 
     def test_the_lane_waits_for_the_selection_and_its_paths_filter(self):
         self.assertEqual(
-            set(job_needs(workflow_jobs()[LANE_JOB])), {"changes", TEST_SELECTOR, "reuse"},
+            set(job_needs(workflow_jobs()[LANE_JOB])), {"changes", TEST_SELECTOR, "libghostty-darwin", "reuse"},
         )
 
     def test_a_narrowed_selection_without_lane_tests_skips_the_lane(self):

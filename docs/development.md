@@ -139,6 +139,31 @@ tarball or runs a compiler:
   x86_64 Linux binary) and reaches the macOS jobs as a run artifact through
   `.github/actions/libghostty-vt-macos`, which records the layout of the
   mirrored types natively and verifies the directory.
+- **Default build and the vt100 fallback (issue #2538 P3b).** The default build
+  of every product crate links the library: `crates/terminal` has
+  `default = ["libghostty"]` and `crates/cli`, `crates/daemon`,
+  `crates/session-worker`, `crates/xtask` and `crates/plugin-kit` forward it in
+  their own `default` (the kit through its own `libghostty` feature, so its
+  `daemon` feature alone is the vt100 kit), so locally
+  `LIBGHOSTTY_VT_DIR=<out-dir> cargo build` (build the pinned library into
+  `<out-dir>` first, as above) links it, and CI provides it through the action.
+  The vt100 product builds with **no Zig and no C library**: `--no-default-features`
+  on the whole workspace is the library-free compile, and the shipped fallback
+  binaries keep everything that is not the screen model — the
+  `terminal-vt100-fallback` lane of `ci.yml` proves
+  `cargo build -p pohunek-cli --no-default-features --features embed-agent-skill`
+  (the embedded agent skill is not tied to the screen model),
+  `cargo build -p pohunek-daemon --no-default-features` and
+  `cargo build -p pohunek-plugin-kit --no-default-features --features daemon`,
+  plus the dependency trees of `pohunek-session-worker`, `pohunek-cli`,
+  `pohunek-daemon` and `pohunek-plugin-kit` holding no ghostty crate.
+  Rollback of the default switch is six manifest lines, not one: drop
+  `"libghostty"` from `default` in `crates/terminal/Cargo.toml` and in
+  `crates/cli`, `crates/daemon`, `crates/session-worker`, `crates/xtask` and
+  `crates/plugin-kit` (each consumer forwards the feature in its own `default`,
+  so flipping the library crate alone leaves the product — `pohunek-sessiond`
+  and the kit's daemon included — on libghostty). The P3a
+  `screen_model`/`format_version` wire fields stay and are harmless.
 - `.github/workflows/libghostty-vt.yml` (dispatch, pull requests that touch the
   build inputs, and pushes to main, which save the cache entries) runs
   `library (<target>)` for the glibc, musl and macOS targets,
@@ -148,9 +173,10 @@ tarball or runs a compiler:
   `macos arm64 (link, minos, size)`, which links the spike's size probe on
   `macos-15` with the release deployment target, checks `minos 14.0` and fails
   when the stripped binary grows by more than `max_stripped_size_delta_bytes`
-  of the pin (3 MiB). The size probe stands in for `pohunek-sessiond` until a
-  crate links the library: on Linux its growth (+1.90 MiB) is slightly above
-  the one measured for `pohunek-sessiond` (+1.82 MiB, `report/sessiond.json`).
+  of the pin (3 MiB). Since the P3b flip `pohunek-sessiond` itself links the
+  library, so the size probe is now only the producer workflow's standalone
+  check: on Linux its growth (+1.90 MiB) is slightly above the one measured
+  for `pohunek-sessiond` (+1.82 MiB, `report/sessiond.json`).
 - Release: `release-build.yml` runs the action in `binaries`, `kit-linux` and
   `packages` and builds the macOS library in `libghostty-darwin` for
   `kit-macos` and `rehearsal-macos`; `release.yml` does the same for
@@ -163,8 +189,9 @@ tarball or runs a compiler:
   one of its refused hosts.
 - `scripts/tests/test_libghostty_vt.py` runs the action's miss, hit and forced
   rebuild, and keeps a list of the workflow jobs that run cargo: each one either
-  uses the action or is listed as not yet linking the library, so a new lane
-  cannot be added without a decision.
+  uses the action or is listed as exempt (`EXEMPT_LANES`) or as the vt100
+  fallback (`FALLBACK_LANES`, which must NOT use it), so a new lane cannot be
+  added without a decision.
 
 Read **[AGENTS.md](../AGENTS.md)** first, then follow its task-specific
 instruction routes.

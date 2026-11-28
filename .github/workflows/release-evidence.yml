@@ -151,9 +151,41 @@ jobs:
   # bind ephemeral loopback ports. Rows run one at a time. A failing row stops
   # the rows after it only when it changed the account or what they trust, or
   # the guards could not check it. See the docstring of run-rows.
+  # The libghostty-vt library for aarch64-apple-darwin, cross-built on Linux
+  # (the pinned Zig is an x86_64 Linux binary); the macOS rows and smoke legs
+  # download it through `libghostty-vt-macos` (issue #2538).
+  libghostty-darwin:
+    name: libghostty-vt for aarch64-apple-darwin
+    needs: [plan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+          export-env: "false"
+
+      - name: Upload the library for the macOS legs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-darwin-evidence
+          path: ${{ steps.library.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   rows:
     name: Rows on ${{ matrix.runner }}
-    needs: [plan]
+    needs: [plan, libghostty-darwin]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     permissions:
@@ -165,6 +197,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      - name: Provide libghostty-vt
+        if: runner.os == 'linux'
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Provide libghostty-vt (macOS)
+        if: runner.os == 'macos'
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-evidence
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -425,6 +470,8 @@ jobs:
       # Only the release archives enter the bundle: the kit bundles
       # (`build-kit-*`, issue #1613) are attested with the other producer
       # artifacts but travel to the kit repository, never here.
+      # No cache is restored in this job (it holds the signing secret), so the
+      # assembler xtask is built without the library (issue #2538 P3b).
       - name: Download the Linux cli archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -476,7 +523,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Build xtask
-        run: cargo build --locked -p xtask
+        run: cargo build --locked -p xtask --no-default-features
 
       - name: Collect the inputs
         run: |
@@ -522,6 +569,8 @@ jobs:
       # Only the release archives enter the rehearsal bundle: the kit
       # bundles (`build-kit-*`, issue #1613) are attested with the other
       # producer artifacts but travel to the kit repository, never here.
+      # No cache is restored in this job, so the assembler xtask is built
+      # without the library (issue #2538 P3b).
       - name: Download the Linux cli archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -569,7 +618,7 @@ jobs:
           save-if: false
 
       - name: Build xtask
-        run: cargo build --locked -p xtask
+        run: cargo build --locked -p xtask --no-default-features
 
       - name: Collect the inputs
         run: |
@@ -652,7 +701,7 @@ jobs:
   # above (in a rehearsal, in ci.yml).
   smoke:
     name: Archive smoke (network-isolated, ${{ matrix.os }})
-    needs: [plan, rows, assemble, assemble-rehearsal]
+    needs: [plan, rows, assemble, assemble-rehearsal, libghostty-darwin]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.assemble.result == 'success' || needs.assemble-rehearsal.result == 'success') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -670,6 +719,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      - name: Provide libghostty-vt
+        if: matrix.os == 'ubuntu-24.04'
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Provide libghostty-vt (macOS)
+        if: matrix.os == 'macos-15'
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-evidence
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -746,7 +808,7 @@ jobs:
   verdict:
     name: Evidence verdict
     if: ${{ always() }}
-    needs: [plan, rows, attest, attest-kit, assemble, assemble-rehearsal, attest-bundle, smoke, smoke-scenarios]
+    needs: [plan, libghostty-darwin, rows, attest, attest-kit, assemble, assemble-rehearsal, attest-bundle, smoke, smoke-scenarios]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -805,11 +867,11 @@ jobs:
           printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" --arg nightly "$NIGHTLY" --arg scenarios "$SCENARIOS" '
             . as $needs
             | (if $mode == "release" then
-                 {success: ["plan","rows","attest","assemble","attest-bundle","smoke","smoke-scenarios"], skipped: ["assemble-rehearsal","attest-kit"]}
+                 {success: ["plan","libghostty-darwin","rows","attest","assemble","attest-bundle","smoke","smoke-scenarios"], skipped: ["assemble-rehearsal","attest-kit"]}
                elif $mode == "rehearsal" and $nightly == "true" then
-                 {success: ["plan","rows","assemble-rehearsal","smoke","attest-kit"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios"]}
+                 {success: ["plan","libghostty-darwin","rows","assemble-rehearsal","smoke","attest-kit"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios"]}
                elif $mode == "rehearsal" then
-                 {success: ["plan","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios","attest-kit"]}
+                 {success: ["plan","libghostty-darwin","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios","attest-kit"]}
                else error("unknown mode") end) as $want
             | all($want.success[]; . as $n | $needs[$n].result == "success")
               and all($want.skipped[]; . as $n | $needs[$n].result == "skipped")

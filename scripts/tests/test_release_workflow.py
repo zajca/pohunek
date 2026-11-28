@@ -786,6 +786,20 @@ class SigningTests(ReleaseWorkflowFiles):
     def test_assemble_restores_no_cache_and_its_key_handling_lives_in_one_script(self):
         assemble = self.evidence_jobs[SIGNING_JOB]
         self.assertNotRegex(assemble, r"rust-cache|sccache|actions/cache")
+        # The rule binds the composites too: a local action that restores a
+        # cache entry would break it just the same, so expand every local
+        # `uses:` of the job through its nested composites.
+        seen = set()
+        pending = [use for use in all_uses(assemble) if LOCAL_ACTION.match(use)]
+        while pending:
+            action = pending.pop()
+            if action in seen:
+                continue
+            seen.add(action)
+            for inner in all_uses((ROOT / action[2:] / "action.yml").read_text()):
+                self.assertNotRegex(inner, r"^actions/cache(/|$)", f"{action} restores a cache")
+                if LOCAL_ACTION.match(inner):
+                    pending.append(inner)
         self.assertIn("persist-credentials: false", assemble)
         script = (SCRIPTS / "assemble").read_text()
         for expected in ("/dev/shm", "chmod 700", "shred -u", "unset CATALOG_SIGNING_KEY_CI", "umask 077"):
@@ -909,12 +923,13 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_the_jobs_run_in_the_documented_order(self):
         needs = {name: needs_of(block) for name, block in self.evidence_jobs.items()}
         self.assertEqual(needs["plan"], [])
-        self.assertEqual(needs["rows"], ["plan"])
+        self.assertEqual(needs["libghostty-darwin"], ["plan"])
+        self.assertEqual(needs["rows"], ["plan", "libghostty-darwin"])
         self.assertEqual(needs["attest"], ["rows"])
         self.assertEqual(needs["attest-kit"], ["rows"])
         self.assertEqual(needs["assemble"], ["rows", "attest"])
         self.assertEqual(needs["assemble-rehearsal"], ["rows"])
-        self.assertEqual(needs["smoke"], ["plan", "rows", "assemble", "assemble-rehearsal"])
+        self.assertEqual(needs["smoke"], ["plan", "rows", "assemble", "assemble-rehearsal", "libghostty-darwin"])
         # The scenarios read no artifact of the build, the bundle or the rows,
         # so they start as soon as the workflow does (issue #1259, D2).
         self.assertEqual(needs["smoke-scenarios"], [])
@@ -925,7 +940,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             sorted(needs_of(verdict)), sorted(name for name in self.evidence_jobs if name != "verdict")
         )
         self.assertIn("    if: ${{ always() }}\n", verdict)
-        for name in ("plan", "rows", "attest", "attest-kit", "assemble", "assemble-rehearsal", "attest-bundle", "smoke", "smoke-scenarios"):
+        for name in ("plan", "libghostty-darwin", "rows", "attest", "attest-kit", "assemble", "assemble-rehearsal", "attest-bundle", "smoke", "smoke-scenarios"):
             self.assertIn(f'"{name}"', verdict)
         self.assertIn('"skipped"', verdict)
 
@@ -1115,7 +1130,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         )
 
     def test_the_verdict_fails_a_phase_that_failed_cancelled_or_was_skipped(self):
-        success = {name: "success" for name in ("plan", "rows", "assemble-rehearsal", "smoke")}
+        success = {name: "success" for name in ("plan", "libghostty-darwin", "rows", "assemble-rehearsal", "smoke")}
         skipped = {name: "skipped" for name in ("attest", "attest-kit", "assemble", "attest-bundle", "smoke-scenarios")}
         passing_rehearsal = {**success, **skipped}
         with self.subTest(case="a passing rehearsal"):
@@ -1144,7 +1159,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
                 self.assertNotEqual(verdict.returncode, 0, verdict.stdout)
 
     def test_the_verdict_fails_a_release_phase_that_did_not_pass(self):
-        release_success = {name: "success" for name in ("plan", "rows", "attest", "assemble", "attest-bundle", "smoke", "smoke-scenarios")}
+        release_success = {name: "success" for name in ("plan", "libghostty-darwin", "rows", "attest", "assemble", "attest-bundle", "smoke", "smoke-scenarios")}
         release_success["assemble-rehearsal"] = "skipped"
         release_success["attest-kit"] = "skipped"
         with self.subTest(case="a passing release"):
@@ -1726,15 +1741,17 @@ class SharedGateTests(ReleaseWorkflowFiles):
         ".github/actions/setup-rust/**",
         ".github/actions/setup-mold/**",
         ".github/actions/setup-sccache/**",
-        ".github/actions/pinned-cache/**",
-        ".github/actions/setup-zig/**",
         ".github/actions/libghostty-vt/**",
+        ".github/actions/setup-zig/**",
+        ".github/actions/pinned-cache/**",
     )
     # The call paths the filter must also cover: the called workflow and
     # every local composite it nests reach their files when the gate runs,
     # so a pull request changing them must start the gate too.
     GATE_CALLED_USES = (
         ".github/workflows/gate-tests.yml",
+        ".github/actions/libghostty-vt/**",
+        ".github/actions/setup-zig/**",
         ".github/actions/pinned-cache/**",
         ".github/actions/setup-mold/**",
         ".github/actions/setup-rust/**",

@@ -11,6 +11,7 @@ name = "pohunekd"
 path = "src/main.rs"
 
 [features]
+default = ["libghostty"]
 # Test-only seams of the daemon (M-TEST-UTIL); never enabled by a release
 # build. Integration tests reach the session registry only through the
 # server, so the readiness-deadline hold travels in `SessionRegistryConfig`
@@ -18,7 +19,7 @@ path = "src/main.rs"
 test-util = []
 # The libghostty-vt screen model of the worker terminal snapshot (issue
 # #2538); forwarded so one feature switch controls the whole product.
-libghostty = ["pohunek-terminal/libghostty"]
+libghostty = ["pohunek-terminal/libghostty", "pohunek-session-worker/libghostty"]
 
 [dependencies]
 base64 = { workspace = true }

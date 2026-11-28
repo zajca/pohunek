@@ -30,7 +30,14 @@ SCRIPTS = ROOT / "scripts"
 PIN = SCRIPTS / "libghostty-vt.pin.toml"
 LIBRARY_ACTION = "./.github/actions/libghostty-vt"
 MACOS_ACTION = "./.github/actions/libghostty-vt-macos"
-ACTIONS_USED = (LIBRARY_ACTION, MACOS_ACTION)
+# The plugin workflows build the core checkout of a plugin repository, so
+# there the same actions run from `core/.github/actions/...`.
+ACTIONS_USED = (
+    LIBRARY_ACTION,
+    MACOS_ACTION,
+    "./core/" + LIBRARY_ACTION[2:],
+    "./core/" + MACOS_ACTION[2:],
+)
 CARGO_LANE = re.compile(
     r"\bcargo\s+(build|check|clippy|test|nextest|run|hack|udeps|xtask|install|doc|bench|llvm-cov|fuzz|zigbuild)\b"
     r"|packaging/macos/build-release|scripts/darwin-check|\bxtask\b"
@@ -56,16 +63,6 @@ WIRED_LANES = {
     "ci.yml:feature-matrix",
     "ci.yml:udeps",
     "gate-tests.yml:tests",
-}
-# Jobs that never link the library.
-EXEMPT_LANES = {
-    "libghostty-spike.yml:spike-linux",
-}
-# Jobs that compile pohunek crates and get the library when `pohunek-terminal`
-# links it (the default screen model switch of issue #2538). Moving a job to
-# WIRED_LANES is the same change that adds the action to it; the list must be
-# empty when the library is the default model.
-PENDING_LANES = {
     "ci.yml:platform-contracts",
     "ci.yml:macos-tier",
     "ci.yml:macos-release-build",
@@ -88,15 +85,33 @@ PENDING_LANES = {
     # Both build the core checkout of a plugin repository; the action lives in
     # that checkout (`core/.github/actions/...`).
     "plugin-ci.yml:check",
-    "plugin-release.yml:build",
     "release-evidence.yml:rows",
-    "release-evidence.yml:assemble",
-    "release-evidence.yml:assemble-rehearsal",
     "release-evidence.yml:smoke",
     "release.yml:docs-gate",
     "release.yml:sdk-gate",
     "release.yml:verify-macos",
 }
+# Jobs that never link the library.
+EXEMPT_LANES = {
+    "libghostty-spike.yml:spike-linux",
+    # These build xtask with `--no-default-features` (the vt100 product), so
+    # they never link the library and must not restore its cache entry either:
+    # `assemble` holds the signing secret and plugin-release's rule is "no
+    # cache is restored" (issue #2538 P3b).
+    "release-evidence.yml:assemble",
+    "release-evidence.yml:assemble-rehearsal",
+    "plugin-release.yml:build",
+}
+# The vt100 fallback lane builds `--no-default-features` on purpose: it must
+# NOT have the action step, it proves the no-Zig, no-C-library product.
+FALLBACK_LANES = {
+    "ci.yml:terminal-vt100-fallback",
+}
+# Jobs that compile pohunek crates and get the library when `pohunek-terminal`
+# links it (the default screen model switch of issue #2538). Moving a job to
+# WIRED_LANES is the same change that adds the action to it; the list is empty
+# because the library is the default model now.
+PENDING_LANES = set()
 
 ZIG_VERSION = "9.9.9"
 
@@ -167,7 +182,7 @@ class LaneGuardTests(unittest.TestCase):
 
     def test_every_cargo_lane_is_classified(self):
         lanes = self.lanes()
-        classified = WIRED_LANES | EXEMPT_LANES | PENDING_LANES
+        classified = WIRED_LANES | EXEMPT_LANES | FALLBACK_LANES | PENDING_LANES
         self.assertEqual(set(lanes) - classified, set(), "a new cargo lane: add the libghostty-vt action or list it")
         self.assertEqual(classified - set(lanes), set(), "a listed lane that no longer exists")
 
@@ -176,7 +191,7 @@ class LaneGuardTests(unittest.TestCase):
         for job in sorted(WIRED_LANES):
             with self.subTest(job=job):
                 self.assertTrue(lanes[job], f"{job} does not use a libghostty-vt action")
-        for job in sorted(EXEMPT_LANES | PENDING_LANES):
+        for job in sorted(EXEMPT_LANES | FALLBACK_LANES | PENDING_LANES):
             with self.subTest(job=job):
                 self.assertFalse(lanes[job], f"{job} uses the action: move it to WIRED_LANES")
 
@@ -216,6 +231,24 @@ class LaneGuardTests(unittest.TestCase):
             with self.subTest(job=job):
                 self.assertEqual([step["with"]["target"] for step in steps], [target])
                 self.assertRegex(str(steps[0].get("timeout-minutes")), r"^\d+$")
+
+    def test_the_release_gate_provides_the_library_before_its_first_cargo_step(self):
+        # Closes #2602: gate-tests.yml (the release gate and the nightly) runs
+        # `--all-features`, whose pohunek-terminal-ghostty-sys build script
+        # needs LIBGHOSTTY_VT_DIR, so the action must sit between the checkout
+        # and the first cargo command.
+        steps = workflow_jobs()["gate-tests.yml:tests"]
+        checkouts = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")]
+        provides = [i for i, s in enumerate(steps) if s.get("uses") == LIBRARY_ACTION]
+        cargo = [i for i, s in enumerate(steps) if CARGO_LANE.search(str(s.get("run", "")))]
+        self.assertEqual(len(provides), 1, "gate-tests.yml:tests must run the libghostty-vt action")
+        self.assertTrue(checkouts, "no checkout step")
+        self.assertTrue(cargo, "no cargo step")
+        self.assertLess(max(checkouts), provides[0])
+        self.assertLess(provides[0], min(cargo))
+        step = steps[provides[0]]
+        self.assertEqual(step["with"]["target"], "x86_64-unknown-linux-gnu")
+        self.assertRegex(str(step.get("timeout-minutes")), r"^\d+$")
 
     def test_the_macos_lanes_download_the_cross_built_library_of_their_workflow(self):
         jobs = workflow_jobs()

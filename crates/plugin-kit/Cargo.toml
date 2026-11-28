@@ -20,15 +20,23 @@ path = "src/lib.rs"
 # feature pulls `pohunek-daemon`, so the `xtask` library build stays
 # daemon-free. The kit binary enables it by default; `xtask` disables
 # default features on its kit dependency.
-default = ["daemon"]
+# `default-features = false` so the kit's `daemon` feature forwards the
+# daemon's default screen model itself and `cargo build -p pohunek-plugin-kit
+# --no-default-features` never links the library (issue #2538 P3b).
+# `libghostty` is its own switch (not hard-wired into `daemon`): the default
+# product links the library, `--no-default-features --features daemon` is the
+# vt100 kit, and dropping `"libghostty"` from `default` rolls the kit back
+# (the sixth line of the rollback, issue #2538 P3b round 3).
+default = ["daemon", "libghostty"]
 daemon = ["dep:pohunek-daemon"]
+libghostty = ["pohunek-daemon?/libghostty"]
 
 [dependencies]
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 nix = { workspace = true, features = ["process", "signal"] }
-pohunek-daemon = { path = "../daemon", optional = true }
+pohunek-daemon = { path = "../daemon", optional = true, default-features = false }
 pohunek-package = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-protocol = { workspace = true }

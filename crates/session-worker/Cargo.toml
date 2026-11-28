@@ -15,6 +15,7 @@ name = "pohunek-sessiond"
 path = "src/main.rs"
 
 [features]
+default = ["libghostty"]
 # Test-only seams of the worker server (M-TEST-UTIL); never enabled by a
 # release build.
 test-util = []
