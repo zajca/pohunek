@@ -39,10 +39,12 @@ pub(crate) use probe_cache::{ProbeCache, ProbeRequest};
 /// Maximum wall time for a local version probe, including interpreter startup.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The clock a version probe's deadline is read from.
+/// The clock a version probe's deadline and the doctor's shared probe budget
+/// are read from.
 ///
 /// The system clock unless a host embeds the daemon with another one, which
-/// lets a scenario reach a probe's full deadline without waiting for it.
+/// lets a scenario reach a probe's full deadline, or spend a probe's share of
+/// the doctor's aggregate budget, without waiting for it.
 #[derive(Clone)]
 pub struct ProbeClock(Arc<dyn Fn() -> Instant + Send + Sync>);
 

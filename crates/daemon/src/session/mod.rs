@@ -609,8 +609,8 @@ pub struct SessionRegistryConfig {
     /// `host.inspect` (`[inventory]` of `service.toml`). Defaults to
     /// [`pohunek_service_config::DEFAULT_INVENTORY_PROBE`].
     pub inventory_probe: pohunek_service_config::InventoryProbe,
-    /// The clock the deadlines of the doctor's version probes are read from.
-    /// Defaults to the system clock.
+    /// The clock the doctor's version-probe deadlines and the shared budget
+    /// they are measured against are read from. Defaults to the system clock.
     pub probe_clock: crate::capabilities::ProbeClock,
     /// The time the doctor's version probes share, counted from the start of
     /// the doctor's profile checks, before the configured profiles are
