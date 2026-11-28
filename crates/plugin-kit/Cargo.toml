@@ -23,8 +23,13 @@ path = "src/lib.rs"
 # `default-features = false` so the kit's `daemon` feature forwards the
 # daemon's default screen model itself and `cargo build -p pohunek-plugin-kit
 # --no-default-features` never links the library (issue #2538 P3b).
-default = ["daemon"]
-daemon = ["dep:pohunek-daemon", "pohunek-daemon/libghostty"]
+# `libghostty` is its own switch (not hard-wired into `daemon`): the default
+# product links the library, `--no-default-features --features daemon` is the
+# vt100 kit, and dropping `"libghostty"` from `default` rolls the kit back
+# (the sixth line of the rollback, issue #2538 P3b round 3).
+default = ["daemon", "libghostty"]
+daemon = ["dep:pohunek-daemon"]
+libghostty = ["pohunek-daemon?/libghostty"]
 
 [dependencies]
 clap = { workspace = true }

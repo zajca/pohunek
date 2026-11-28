@@ -232,6 +232,24 @@ class LaneGuardTests(unittest.TestCase):
                 self.assertEqual([step["with"]["target"] for step in steps], [target])
                 self.assertRegex(str(steps[0].get("timeout-minutes")), r"^\d+$")
 
+    def test_the_release_gate_provides_the_library_before_its_first_cargo_step(self):
+        # Closes #2602: gate-tests.yml (the release gate and the nightly) runs
+        # `--all-features`, whose pohunek-terminal-ghostty-sys build script
+        # needs LIBGHOSTTY_VT_DIR, so the action must sit between the checkout
+        # and the first cargo command.
+        steps = workflow_jobs()["gate-tests.yml:tests"]
+        checkouts = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")]
+        provides = [i for i, s in enumerate(steps) if s.get("uses") == LIBRARY_ACTION]
+        cargo = [i for i, s in enumerate(steps) if CARGO_LANE.search(str(s.get("run", "")))]
+        self.assertEqual(len(provides), 1, "gate-tests.yml:tests must run the libghostty-vt action")
+        self.assertTrue(checkouts, "no checkout step")
+        self.assertTrue(cargo, "no cargo step")
+        self.assertLess(max(checkouts), provides[0])
+        self.assertLess(provides[0], min(cargo))
+        step = steps[provides[0]]
+        self.assertEqual(step["with"]["target"], "x86_64-unknown-linux-gnu")
+        self.assertRegex(str(step.get("timeout-minutes")), r"^\d+$")
+
     def test_the_macos_lanes_download_the_cross_built_library_of_their_workflow(self):
         jobs = workflow_jobs()
         artifacts = {

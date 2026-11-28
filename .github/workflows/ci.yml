@@ -4751,7 +4751,9 @@ jobs:
   # The vt100 fallback lane (issue #2538 P3b): the default build links
   # libghostty-vt, so this job proves the opposite product still builds and
   # tests green with `--no-default-features` — no Zig on PATH and no ghostty
-  # crate in the worker's dependency tree, i.e. no C library linked.
+  # crate in any product package's dependency tree, i.e. no C library linked.
+  # The CLI keeps the embedded agent skill via its explicit feature and the
+  # kit builds its vt100 daemon variant (round 3 of the review).
   terminal-vt100-fallback:
     name: terminal vt100 fallback (--no-default-features)
     if: ${{ !cancelled() }}
@@ -4780,19 +4782,32 @@ jobs:
       - name: Test pohunek-terminal without default features
         run: cargo test -p pohunek-terminal --no-default-features -- --skip new_reports_libghostty_in_its_snapshot_after_the_p3b_flip
 
-      # The whole product on vt100: the CLI and the daemon build without the
-      # library (LIBGHOSTTY_VT_DIR is never set in this job).
-      - name: Build the CLI and daemon without default features
-        run: cargo build -p pohunek-cli -p pohunek-daemon --no-default-features
+      # The whole vt100 product builds without the library (LIBGHOSTTY_VT_DIR
+      # is never set in this job): the CLI keeps the embedded agent skill —
+      # it is not tied to the screen model, so the fallback passes it
+      # explicitly — and the kit's daemon runs on vt100 via
+      # `--no-default-features --features daemon` (its own `libghostty` switch
+      # stays off, issue #2538 P3b round 3).
+      - name: Build the vt100 product without default features
+        run: |
+          set -euo pipefail
+          cargo build -p pohunek-cli --no-default-features --features embed-agent-skill
+          cargo build -p pohunek-daemon --no-default-features
+          cargo build -p pohunek-plugin-kit --no-default-features --features daemon
 
       - name: Assert no product package has a ghostty crate in its tree
         run: |
           set -euo pipefail
-          for package in pohunek-session-worker pohunek-cli pohunek-daemon; do
-            tree="$(cargo tree -p "$package" --no-default-features -e normal)"
+          check() {
+            package="$1"; shift
+            tree="$(cargo tree -p "$package" "$@" -e normal)"
             printf '%s\n' "$tree"
             if printf '%s\n' "$tree" | grep -q ghostty; then
-              echo "::error::the --no-default-features $package tree links a ghostty crate"
+              echo "::error::the $* $package tree links a ghostty crate"
               exit 1
             fi
-          done
+          }
+          check pohunek-session-worker --no-default-features
+          check pohunek-cli --no-default-features --features embed-agent-skill
+          check pohunek-daemon --no-default-features
+          check pohunek-plugin-kit --no-default-features --features daemon

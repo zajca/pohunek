@@ -142,19 +142,27 @@ tarball or runs a compiler:
 - **Default build and the vt100 fallback (issue #2538 P3b).** The default build
   of every product crate links the library: `crates/terminal` has
   `default = ["libghostty"]` and `crates/cli`, `crates/daemon`,
-  `crates/session-worker` and `crates/xtask` forward it in their own
-  `default`, so locally `LIBGHOSTTY_VT_DIR=<out-dir> cargo build` (build the
-  pinned library into `<out-dir>` first, as above) links it, and CI provides it
-  through the action. `--no-default-features` on any consumer (or on the whole
-  workspace) gives the whole product on vt100 with **no Zig and no C library** —
-  the `terminal-vt100-fallback` lane of `ci.yml` proves that build, the CLI and
-  daemon binaries and the dependency trees of `pohunek-terminal`,
-  `pohunek-session-worker`, `pohunek-cli` and `pohunek-daemon`.
-  Rollback of the default switch is five manifest lines, not one: drop
+  `crates/session-worker`, `crates/xtask` and `crates/plugin-kit` forward it in
+  their own `default` (the kit through its own `libghostty` feature, so its
+  `daemon` feature alone is the vt100 kit), so locally
+  `LIBGHOSTTY_VT_DIR=<out-dir> cargo build` (build the pinned library into
+  `<out-dir>` first, as above) links it, and CI provides it through the action.
+  The vt100 product builds with **no Zig and no C library**: `--no-default-features`
+  on the whole workspace is the library-free compile, and the shipped fallback
+  binaries keep everything that is not the screen model — the
+  `terminal-vt100-fallback` lane of `ci.yml` proves
+  `cargo build -p pohunek-cli --no-default-features --features embed-agent-skill`
+  (the embedded agent skill is not tied to the screen model),
+  `cargo build -p pohunek-daemon --no-default-features` and
+  `cargo build -p pohunek-plugin-kit --no-default-features --features daemon`,
+  plus the dependency trees of `pohunek-session-worker`, `pohunek-cli`,
+  `pohunek-daemon` and `pohunek-plugin-kit` holding no ghostty crate.
+  Rollback of the default switch is six manifest lines, not one: drop
   `"libghostty"` from `default` in `crates/terminal/Cargo.toml` and in
-  `crates/cli`, `crates/daemon`, `crates/session-worker` and `crates/xtask`
-  (each consumer forwards the feature in its own `default`, so flipping the
-  library crate alone leaves the product on libghostty). The P3a
+  `crates/cli`, `crates/daemon`, `crates/session-worker`, `crates/xtask` and
+  `crates/plugin-kit` (each consumer forwards the feature in its own `default`,
+  so flipping the library crate alone leaves the product — `pohunek-sessiond`
+  and the kit's daemon included — on libghostty). The P3a
   `screen_model`/`format_version` wire fields stay and are harmless.
 - `.github/workflows/libghostty-vt.yml` (dispatch, pull requests that touch the
   build inputs, and pushes to main, which save the cache entries) runs

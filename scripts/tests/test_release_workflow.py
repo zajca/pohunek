@@ -1744,8 +1744,6 @@ class SharedGateTests(ReleaseWorkflowFiles):
         ".github/actions/libghostty-vt/**",
         ".github/actions/setup-zig/**",
         ".github/actions/pinned-cache/**",
-        ".github/actions/setup-zig/**",
-        ".github/actions/libghostty-vt/**",
     )
     # The call paths the filter must also cover: the called workflow and
     # every local composite it nests reach their files when the gate runs,
