@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Workspace automation for pohunek."
 
+[features]
+# The libghostty-vt screen model of the worker terminal snapshot (issue
+# #2538); forwarded so one feature switch controls the whole product.
+libghostty = ["pohunek-terminal/libghostty"]
+
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
@@ -29,7 +34,7 @@ semver = { workspace = true }
 clap = { workspace = true }
 pulldown-cmark = { workspace = true }
 nix = { workspace = true, features = ["process", "signal"] }
-pohunek-terminal = { workspace = true }
+pohunek-terminal = { workspace = true, default-features = false }
 base64 = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 portable-pty = { workspace = true }

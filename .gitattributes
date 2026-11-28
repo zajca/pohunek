@@ -1,1 +1,3 @@
 sdk/ts/protocol/src/generated/** linguist-generated=true
+# Golden repaint fixtures are compared byte-exactly (CRLF included).
+crates/terminal/tests/fixtures/*.ansi -text

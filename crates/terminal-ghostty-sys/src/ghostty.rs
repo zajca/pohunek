@@ -8,17 +8,20 @@
 //!   query; Pohunek forwards terminal queries to the attached client.
 //! - `CLIPBOARD_READ` stays NULL: an OSC 52 `?` read is ignored and an OSC
 //!   5522 read is refused.
-//! - `CLIPBOARD_WRITE` is a capture callback that records the decoded byte
-//!   length of each write and answers "denied". No clipboard is ever touched.
+//! - `CLIPBOARD_WRITE` is a capture callback that counts the writes and records
+//!   the decoded length of the last one, and answers "denied". No clipboard is
+//!   ever touched, and the record stays two scalars however many writes a
+//!   hostile PTY stream makes.
 //! - Kitty graphics are compiled out of the library; [`HeadlessTerminal::new`]
 //!   checks the build info and that setting a graphics option is unsupported.
 //! - Every size bound (scrollback, APC, unknown and continuation sequences,
-//!   clipboard transactions) comes from `config/model.toml`.
+//!   clipboard transactions) comes from [`crate::config::HeadlessConfig`].
 //!
 //! Ownership: the terminal handle and its callback state are freed on drop.
-//! Threading: the handle is not thread-safe, so the type is neither `Send` nor
-//! `Sync` (it holds raw pointers). A grid reference is used only inside one
-//! method call, before anything can mutate the terminal.
+//! Threading: the handle is not thread-safe, so the type is `Send` but not
+//! `Sync` (it holds raw pointers; see the `Send` impl below). A grid reference
+//! is used only inside one method call, before anything can mutate the
+//! terminal.
 
 // Rust guideline compliant 2026-06-26
 
@@ -30,7 +33,7 @@
 use std::ffi::{c_int, c_void, CStr};
 use std::ptr;
 
-use crate::config::ModelConfig;
+use crate::config::HeadlessConfig;
 use crate::ffi;
 
 /// A libghostty call failed.
@@ -84,9 +87,16 @@ pub struct CellInfo {
 }
 
 /// State the C callbacks write into; heap allocated so its address is stable.
+///
+/// PTY output is hostile input, so this holds two bounded scalars, never one
+/// entry per clipboard write: a program can make any number of OSC 52 writes
+/// and the worker's memory must not grow with them.
 #[derive(Debug, Default)]
 struct CallbackState {
-    clipboard_writes: Vec<usize>,
+    /// How many clipboard writes were answered "denied" so far.
+    clipboard_write_count: usize,
+    /// Decoded byte length of the last clipboard write.
+    last_clipboard_write_bytes: usize,
     progress: Option<String>,
 }
 
@@ -106,6 +116,16 @@ impl std::fmt::Debug for HeadlessTerminal {
     }
 }
 
+// SAFETY: `HeadlessTerminal` is `Send` but not `Sync`, so at most one thread
+// holds the terminal or a reference to it at any time: every call into the C
+// library happens through `&mut self` or through a `&self` that cannot cross
+// threads without `Sync`. The library is therefore never called concurrently,
+// which is its only threading requirement, and it keeps no thread-local state,
+// so sequential calls from different threads behave like calls from one. The
+// callback state is owned by the terminal and freed in `Drop`, after the last
+// possible callback.
+unsafe impl Send for HeadlessTerminal {}
+
 unsafe extern "C" fn on_clipboard_write(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
@@ -120,7 +140,8 @@ unsafe extern "C" fn on_clipboard_write(
         // SAFETY: `contents` points to `contents_len` entries, valid during the call.
         total += unsafe { (*write.contents.add(index)).data.len };
     }
-    state.clipboard_writes.push(total);
+    state.clipboard_write_count += 1;
+    state.last_clipboard_write_bytes = total;
     let reply = ffi::ClipboardWriteReply {
         size: std::mem::size_of::<ffi::ClipboardWriteReply>(),
         result: ffi::CLIPBOARD_WRITE_DENIED,
@@ -165,7 +186,7 @@ impl HeadlessTerminal {
     ///
     /// Returns a [`GhosttyError`] when libghostty rejects a call, or when the
     /// linked library still has Kitty graphics compiled in.
-    pub fn new(config: &ModelConfig, rows: u16, cols: u16) -> Result<Self, GhosttyError> {
+    pub fn new(config: &HeadlessConfig, rows: u16, cols: u16) -> Result<Self, GhosttyError> {
         let mut graphics = true;
         // SAFETY: the build-info key takes a `bool *`.
         check("build_info", unsafe {
@@ -189,13 +210,13 @@ impl HeadlessTerminal {
         let mut terminal = Self {
             handle,
             state: Box::into_raw(Box::default()),
-            cell_px: config.ghostty_cell_px,
+            cell_px: config.cell_px,
         };
         terminal.configure(config)?;
         Ok(terminal)
     }
 
-    fn configure(&mut self, config: &ModelConfig) -> Result<(), GhosttyError> {
+    fn configure(&mut self, config: &HeadlessConfig) -> Result<(), GhosttyError> {
         // SAFETY: `handle` is live; USERDATA stores the pointer, which stays
         // valid because `state` is freed only after the terminal (see `Drop`).
         check("set userdata", unsafe {
@@ -220,27 +241,27 @@ impl HeadlessTerminal {
         for (option, value, name) in [
             (
                 ffi::OPT_SCROLLBACK_MAX_BYTES,
-                config.ghostty_scrollback_max_bytes,
+                config.scrollback_max_bytes,
                 "set scrollback bytes",
             ),
             (
                 ffi::OPT_APC_MAX_BYTES,
-                config.ghostty_apc_max_bytes,
+                config.apc_max_bytes,
                 "set apc max bytes",
             ),
             (
                 ffi::OPT_UNKNOWN_MAX_BYTES,
-                config.ghostty_unknown_max_bytes,
+                config.unknown_max_bytes,
                 "set unknown max bytes",
             ),
             (
                 ffi::OPT_CONTINUATION_MAX_BYTES,
-                config.ghostty_continuation_max_bytes,
+                config.continuation_max_bytes,
                 "set continuation max bytes",
             ),
             (
                 ffi::OPT_CLIPBOARD_WRITE_MAX_BYTES,
-                config.ghostty_clipboard_write_max_bytes,
+                config.clipboard_write_max_bytes,
                 "set clipboard write max bytes",
             ),
         ] {
@@ -318,6 +339,16 @@ impl HeadlessTerminal {
         ))
     }
 
+    /// Whether the cursor has a pending wrap: the next printed character
+    /// soft-wraps to the next row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GhosttyError`] when the read fails.
+    pub fn cursor_pending_wrap(&self) -> Result<bool, GhosttyError> {
+        self.get(ffi::DATA_CURSOR_PENDING_WRAP, "get cursor pending wrap")
+    }
+
     /// Whether the cursor is visible.
     ///
     /// # Errors
@@ -389,11 +420,21 @@ impl HeadlessTerminal {
         unsafe { (*self.state).progress.as_deref() }
     }
 
-    /// Decoded byte length of every clipboard write the program made.
+    /// How many clipboard writes the program made; each was answered "denied".
+    ///
+    /// A count, not a list: untrusted PTY output can produce any number of
+    /// writes, so the product never records one entry per write.
     #[must_use]
-    pub fn clipboard_writes(&self) -> &[usize] {
-        // SAFETY: as in `progress`.
-        unsafe { &(*self.state).clipboard_writes }
+    pub fn clipboard_write_count(&self) -> usize {
+        // SAFETY: `state` is live until `Drop`, and no callback runs during `&self`.
+        unsafe { (*self.state).clipboard_write_count }
+    }
+
+    /// Decoded byte length of the last clipboard write the program made.
+    #[must_use]
+    pub fn last_clipboard_write_bytes(&self) -> usize {
+        // SAFETY: as in `clipboard_write_count`.
+        unsafe { (*self.state).last_clipboard_write_bytes }
     }
 
     fn grid_ref(&self, row: u16, col: u16) -> Result<ffi::GridRef, GhosttyError> {
@@ -532,27 +573,103 @@ impl HeadlessTerminal {
         Ok(String::from_utf8_lossy(&buf[..needed]).into_owned())
     }
 
-    /// The visible text, without styling.
+    /// The visible text of the active screen, without styling: the view
+    /// `pohunek-terminal`'s snapshot reports as `visible_text` (and therefore
+    /// what `session.screen` returns), built cell by cell.
+    ///
+    /// Only the active screen rows are read — the library's scrollback is
+    /// never included, so a long history cannot grow the text past the screen
+    /// (issue #2538 M2). The layout mirrors what the vt100 backend's
+    /// `Screen::contents()` reports (the `Grid::write_contents` algorithm), so
+    /// the two backends agree: a cell with text emits its graphemes, the gap
+    /// before it is filled with spaces up to its column, a wide cell advances
+    /// two columns and its spacer emits nothing, a soft-wrapped row joins the
+    /// previous one instead of breaking the line, and trailing line breaks
+    /// are removed.
+    ///
+    /// For the history view — the same text plus the scrollback rows the
+    /// library retained — use [`HeadlessTerminal::format_plain`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GhosttyError`] when the size, a row flag or a cell read
+    /// fails.
+    pub fn visible_text(&self) -> Result<String, GhosttyError> {
+        let (rows, cols) = self.size()?;
+        let mut wrapped = Vec::with_capacity(usize::from(rows));
+        for row in 0..rows {
+            wrapped.push(self.row_wrapped(row)?);
+        }
+        let mut text = String::new();
+        let mut wrapping = false;
+        for row in 0..rows {
+            let mut prev_was_wide = false;
+            let mut prev_col: u16 = 0;
+            for col in 0..cols {
+                let cell = self.cell(row, col)?;
+                if prev_was_wide {
+                    // The spacer half of a wide cell emits nothing.
+                    prev_was_wide = false;
+                    continue;
+                }
+                prev_was_wide = cell.wide;
+                if !cell.text.is_empty() {
+                    for _ in 0..(col - prev_col) {
+                        text.push(' ');
+                    }
+                    prev_col = col;
+                    text.push_str(&cell.text);
+                    prev_col += if cell.wide { 2 } else { 1 };
+                }
+            }
+            // An empty row that continues the previous soft-wrapped line still
+            // breaks the text line, as in the vt100 grid.
+            if prev_col == 0 && wrapping {
+                text.push('\n');
+            }
+            if !wrapped[usize::from(row)] {
+                text.push('\n');
+            }
+            wrapping = wrapped[usize::from(row)];
+        }
+        while text.ends_with('\n') {
+            text.pop();
+        }
+        Ok(text)
+    }
+
+    /// The full text, without styling: the history view.
+    ///
+    /// UNWRAP joins soft-wrapped rows into one logical line and TRIM drops the
+    /// trailing spaces of each line, which is what the vt100 backend reports as
+    /// its visible text. History rows the library retained are included, so
+    /// this view is unbounded by the screen and must not back a bounded
+    /// snapshot; the active-rows view is [`HeadlessTerminal::visible_text`].
     ///
     /// # Errors
     ///
     /// Returns a [`GhosttyError`] when formatting fails.
     pub fn format_plain(&self) -> Result<Vec<u8>, GhosttyError> {
-        self.format(ffi::FORMATTER_FORMAT_PLAIN, 0, None)
+        self.format(ffi::FORMATTER_FORMAT_PLAIN, 0, Some((true, true)))
     }
 
-    /// A byte stream that recreates the screen, with cursor, modes, styles,
-    /// hyperlinks and keyboard state.
+    /// A byte stream that recreates the screen, with the `extras` state the
+    /// caller names (cursor, modes, styles, hyperlinks, keyboard, ...).
+    ///
+    /// The attach repaint passes [`ffi::FORMATTER_EXTRAS_ATTACH`] so it never
+    /// rewrites the user's palette; [`ffi::FORMATTER_EXTRAS_ALL`] keeps every
+    /// extra for callers that want the full state.
     ///
     /// # Errors
     ///
     /// Returns a [`GhosttyError`] when formatting fails.
-    pub fn format_vt(&self, unwrap: bool, trim: bool) -> Result<Vec<u8>, GhosttyError> {
-        self.format(
-            ffi::FORMATTER_FORMAT_VT,
-            ffi::FORMATTER_EXTRAS_ALL,
-            Some((unwrap, trim)),
-        )
+    pub fn format_vt(
+        &self,
+        unwrap: bool,
+        trim: bool,
+        extras: u32,
+    ) -> Result<Vec<u8>, GhosttyError> {
+        self.format(ffi::FORMATTER_FORMAT_VT, extras, Some((unwrap, trim)))
     }
 
     fn format(

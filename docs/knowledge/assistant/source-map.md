@@ -896,6 +896,7 @@ Workspace crates by role (every workspace crate has an entry in this map;
 - `crates/platform/src/lib.rs` — operating-system contracts shared by the daemon
   and the session worker: process facts, peer identity, the service supervisor.
 - `crates/terminal/src/lib.rs` — VT screen tracking and attach compositing.
+- `crates/terminal-ghostty-sys/src/lib.rs` — safe bindings to the pinned libghostty-vt C ABI (issue #2538); the only crate allowed `unsafe`, linked by `pohunek-terminal`'s `libghostty` feature.
 - `crates/service-config/src/lib.rs` — typed `service.toml` and the upgrade
   preflight reports.
 - `crates/shape-guard/src/lib.rs` — dev-only persisted-shape guard helpers.

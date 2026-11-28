@@ -26,7 +26,9 @@
 )]
 
 use std::ffi::{c_char, c_int, c_void};
-use std::mem::{align_of, offset_of, size_of};
+// `size_of` and `align_of` are in the prelude of this toolchain; `offset_of`
+// is not.
+use std::mem::offset_of;
 
 #[allow(
     non_upper_case_globals,
@@ -157,6 +159,8 @@ pub const DATA_COLS: c_int = 1;
 pub const DATA_ROWS: c_int = 2;
 pub const DATA_CURSOR_X: c_int = 3;
 pub const DATA_CURSOR_Y: c_int = 4;
+/// Whether the cursor has a pending wrap (the next print soft-wraps).
+pub const DATA_CURSOR_PENDING_WRAP: c_int = 5;
 pub const DATA_ACTIVE_SCREEN: c_int = 6;
 pub const DATA_CURSOR_VISIBLE: c_int = 7;
 pub const DATA_KITTY_KEYBOARD_FLAGS: c_int = 8;
@@ -177,14 +181,43 @@ pub const CELL_WIDE_SPACER_TAIL: c_int = 2;
 // `GhosttyBuildInfo`.
 pub const BUILD_INFO_KITTY_GRAPHICS: c_int = 2;
 
-// `GhosttyFormatterOption`, `GhosttyFormatterFormat` and the extras bits.
+// `GhosttyFormatterOption`, `GhosttyFormatterFormat` and the extras bits
+// (`GhosttyFormatterExtras` of include/ghostty/vt/formatter.h, pinned 1.0.2).
 pub const FORMATTER_OPT_EMIT: c_int = 1;
 pub const FORMATTER_OPT_UNWRAP: c_int = 2;
 pub const FORMATTER_OPT_TRIM: c_int = 3;
 pub const FORMATTER_OPT_EXTRAS: c_int = 5;
 pub const FORMATTER_FORMAT_PLAIN: c_int = 0;
 pub const FORMATTER_FORMAT_VT: c_int = 1;
+/// Restore the color palette with OSC 4.
+pub const FORMATTER_EXTRA_PALETTE: u32 = 1 << 0;
+/// Restore terminal modes that differ from their defaults with CSI h/l.
+pub const FORMATTER_EXTRA_MODES: u32 = 1 << 1;
+/// Restore the scrolling region with DECSTBM and DECSLRM.
+pub const FORMATTER_EXTRA_SCROLLING_REGION: u32 = 1 << 2;
+/// Restore tab stops.
+pub const FORMATTER_EXTRA_TABSTOPS: u32 = 1 << 3;
+/// Restore the working directory with OSC 7.
+pub const FORMATTER_EXTRA_PWD: u32 = 1 << 4;
+/// Restore keyboard modes such as modifyOtherKeys.
+pub const FORMATTER_EXTRA_KEYBOARD: u32 = 1 << 5;
+/// Restore the cursor position with CUP.
+pub const FORMATTER_EXTRA_CURSOR: u32 = 1 << 6;
+/// Restore the style the cursor writes new text with, using SGR.
+pub const FORMATTER_EXTRA_STYLE: u32 = 1 << 7;
+/// Restore the hyperlink the cursor writes new text with, using OSC 8.
+pub const FORMATTER_EXTRA_HYPERLINK: u32 = 1 << 8;
+/// Restore character protection with DECSCA.
+pub const FORMATTER_EXTRA_PROTECTION: u32 = 1 << 9;
+/// Restore the Kitty keyboard protocol flags.
+pub const FORMATTER_EXTRA_KITTY_KEYBOARD: u32 = 1 << 10;
+/// Restore the character sets, such as the line drawing set.
+pub const FORMATTER_EXTRA_CHARSETS: u32 = 1 << 11;
 pub const FORMATTER_EXTRAS_ALL: u32 = 0xFFF;
+/// The extras the attach repaint emits: everything except the palette. A
+/// repaint with the palette bit would send 256 OSC 4 sets on every attach and
+/// leave the user's palette changed after detach (issue #2538 M14).
+pub const FORMATTER_EXTRAS_ATTACH: u32 = FORMATTER_EXTRAS_ALL & !FORMATTER_EXTRA_PALETTE;
 
 extern "C" {
     pub fn ghostty_version() -> *const c_char;

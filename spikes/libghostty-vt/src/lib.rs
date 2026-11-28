@@ -12,8 +12,9 @@
 //!   model, the same parser with scrollback, and the models by name.
 //! - [`replay`], [`report`]: replay every fixture through every model and
 //!   list each assertion outcome and each grid difference.
-//! - `ffi`, `ghostty`, `ghostty_model` (feature `libghostty`): the libghostty-vt
-//!   model.
+//! - `ghostty_model` (feature `libghostty`): the libghostty-vt model, driven
+//!   through `pohunek-terminal`'s `with_model` seam and the FFI crate
+//!   `crates/terminal-ghostty-sys` (issue #2538 P2).
 //!
 //! Record a trace: `cargo run --bin record-trace -- --help`; the scripts under
 //! `fixtures/sources/` state their own arguments in a `# record:` line and
@@ -30,9 +31,5 @@ pub mod report;
 pub mod trace;
 pub mod vt100_model;
 
-#[cfg(feature = "libghostty")]
-pub mod ffi;
-#[cfg(feature = "libghostty")]
-pub mod ghostty;
 #[cfg(feature = "libghostty")]
 pub mod ghostty_model;

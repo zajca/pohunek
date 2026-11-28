@@ -31,12 +31,12 @@ def pinned_callee():
 # Populated by the pin-update procedure; see docs/development.md (Delta dispatch).
 PINNED_BODY_HASHES = {
   "build-bins": "fe2f2655ee5dd89c177f8bd4bf72a4cb7b766ca5c133304d2a5611ff7bf3d983",
-  "build-tests": "0c4b15a4ab9a7e5ad82bf21c6489e68f8e5cba2b51b8f15fa218b1e412c318fd",
-  "darwin-check": "4a82af03b6684e8d7c970cd338a799007bbca51e5dfd7681c1e4ccdbfb62612b",
+  "build-tests": "8349ca98ff12ec3b8188910d2bf15ab52e403c2d98bc9744e837aa4010ca1415",
+  "darwin-check": "9d57e45236707f62a3a961302343b80a05bbc111eb3b8b9dcbc0c70fb665b496",
   "docs": "8bcc9f4b97574b58f126265bb747f9b13c0dca8a9fc9d9212f016dd94e16a188",
-  "doctests": "ac487f2a7d06d4aeb8165dc19a9997d851400018763b332ec6f725ef29e245e3",
+  "doctests": "d1ae3f494b743d380b638141be939d3a42c597f7928c4fe915670efbb05be943",
   "fast-tests": "bb8a335dd5ec94c10c91f9889eaaa5196254987b611ecea329858ac6e6289a8a",
-  "feature-matrix": "7f1ff717444cbe6383a275855562cbdd49a1bd8836355baf6259063527b618aa",
+  "feature-matrix": "e8a32d260282f7abf85cc323e5e9b3e5d2066f95c9454824c8c41821b31ec9d9",
   "hermes-compatibility-macos": "0c849d5255e245198c4b073e63febe7c81e1c202d468628c985531e02a5b73a7",
   "integration": "1626dbb6661d7b5cd5c2baf308d3fd3b8e3a985f7f8269a57aa515fccdd1160f",
   "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
@@ -48,9 +48,9 @@ PINNED_BODY_HASHES = {
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "8e9684845342c677bb4155e024c73fd205e8d1be7582a73a81b75bdff4046c62",
   "systemd-supervision": "8e5004294d8f298c6e5be025b03d5cec5b479e0f5b664d271b1eeee3421fca20",
-  "test": "e1e15e7f9c00a4271e353dca87028c3aff6e95d80b89130fef6299c0e9c1f92c",
+  "test": "7df6c1fe0ae04f22e2df311364f52a8d96e0f6df4794c10c15cec5862e2929b5",
   "ts-drift": "d18b132a9b0a47f66735ed031448f0503a5af9840521fb481c69db78d6dc4cc1",
-  "udeps": "4b1c16df0545f348bd7142416d7c2eaa4b84707f004694f346d8538b97020ad3",
+  "udeps": "016994212a2c3306cb518b5a4f155de98fe0b7c58ef5c2f806eee674faffebdd",
   "upgrade-test": "5085c4d9086eb08446a2834e80a94fb0538d52e03fab110d3206f9ff17145053",
 }
 

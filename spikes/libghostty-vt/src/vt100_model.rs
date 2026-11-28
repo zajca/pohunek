@@ -3,7 +3,7 @@
 
 // Rust guideline compliant 2026-06-26
 
-use pohunek_terminal::TerminalTracker;
+use pohunek_terminal::{ModelKind, TerminalTracker};
 
 use crate::model::{CellDump, GridDump, GridModel, ModelError};
 
@@ -39,7 +39,7 @@ impl Vt100Model {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             name: NAME,
-            tracker: TerminalTracker::new(rows, cols),
+            tracker: TerminalTracker::with_model(ModelKind::Vt100, rows, cols),
             parser: vt100::Parser::new(rows, cols, 0),
         }
     }
@@ -50,7 +50,7 @@ impl Vt100Model {
     pub fn with_scrollback(rows: u16, cols: u16, scrollback_rows: usize) -> Self {
         Self {
             name: NAME_SCROLLBACK,
-            tracker: TerminalTracker::new(rows, cols),
+            tracker: TerminalTracker::with_model(ModelKind::Vt100, rows, cols),
             parser: vt100::Parser::new(rows, cols, scrollback_rows),
         }
     }

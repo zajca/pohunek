@@ -21,6 +21,7 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI and scripts). |
 | `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
 | `crates/terminal` | VT screen tracking and attach compositing. |
+| `crates/terminal-ghostty-sys` | Safe Rust bindings to the pinned libghostty-vt static library (issue #2538); the only crate allowed `unsafe`, linked by `crates/terminal`'s `libghostty` feature. |
 | `crates/netbird` | NetBird status parsing, host resolution, bind validation, and overlay adapter. |
 | `crates/overlay-tailscale` | Tailscale status parsing, peer selection, bind validation, and overlay adapter. |
 | `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
@@ -69,12 +70,17 @@ uses it) and through libghostty-vt?
   same model and the two screens are diffed. Assertions whose width depends on
   a method and the mode 2027 state are a separate group, and `pohunek-contract`
   assertions cite Pohunek's own code instead of a public specification.
-- **Build with libghostty.** The `libghostty` cargo feature links a prebuilt
-  static library and is off by default (no Zig, no C library). The library is
-  built as described in [libghostty-vt library](#libghostty-vt-library) below;
+- **Build with libghostty.** The `libghostty` cargo feature of `pohunek-terminal`
+  (issue #2538) links a prebuilt static library through
+  `crates/terminal-ghostty-sys`, the crate that owns the unsafe FFI, and is off
+  by default (no Zig, no C library): `TerminalTracker::new` keeps the vt100
+  model, and `TerminalTracker::with_model(ModelKind::Libghostty, ..)` selects
+  libghostty explicitly so one build can run both. The library is built as
+  described in [libghostty-vt library](#libghostty-vt-library) below;
   `LIBGHOSTTY_VT_DIR=<out-dir> cargo build --features libghostty` links it, and
-  `build.rs` never downloads anything and never runs Zig. Kitty graphics are
-  compiled out, and the headless terminal installs no reply callback.
+  the sys crate's `build.rs` never downloads anything and never runs Zig. Kitty
+  graphics are compiled out, and the headless terminal installs no reply
+  callback. The spike depends on the sys crate instead of its own FFI copy.
 - **Measure.** `vt100-scrollback` (`--models vt100,vt100-scrollback,libghostty`)
   is the same parser with the scrollback rows of `config/model.toml`.
   `scripts/measure --target T --ghostty-dir DIR --runner LABEL --scratch DIR --out FILE`

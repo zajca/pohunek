@@ -38,16 +38,23 @@ enum Subject {
     Tracker(Box<pohunek_terminal::TerminalTracker>),
     /// A bare `vt100` parser, with or without scrollback.
     Parser(Box<vt100::Parser>),
-    /// libghostty-vt with the production settings of the spike.
+    /// libghostty-vt with the production settings of the spike, through the
+    /// sys crate (issue #2538 P2).
     #[cfg(feature = "libghostty")]
-    Ghostty(Box<pohunek_libghostty_spike::ghostty::HeadlessTerminal>),
+    Ghostty(Box<pohunek_terminal_ghostty_sys::HeadlessTerminal>),
 }
 
 impl Subject {
     fn new(name: &str, config: &ModelConfig, rows: u16, cols: u16) -> Result<Self, String> {
         match name {
+            // The vt100 model is selected explicitly: with the `libghostty`
+            // feature `TerminalTracker::new` runs the libghostty backend.
             "vt100" => Ok(Self::Tracker(Box::new(
-                pohunek_terminal::TerminalTracker::new(rows, cols),
+                pohunek_terminal::TerminalTracker::with_model(
+                    pohunek_terminal::ModelKind::Vt100,
+                    rows,
+                    cols,
+                ),
             ))),
             "vt100-parser" => Ok(Self::Parser(Box::new(vt100::Parser::new(rows, cols, 0)))),
             "vt100-scrollback" => Ok(Self::Parser(Box::new(vt100::Parser::new(
@@ -56,11 +63,13 @@ impl Subject {
                 config.vt100_scrollback_rows,
             )))),
             #[cfg(feature = "libghostty")]
-            "libghostty" => {
-                pohunek_libghostty_spike::ghostty::HeadlessTerminal::new(config, rows, cols)
-                    .map(|terminal| Self::Ghostty(Box::new(terminal)))
-                    .map_err(|e| e.to_string())
-            }
+            "libghostty" => pohunek_terminal_ghostty_sys::HeadlessTerminal::new(
+                &pohunek_libghostty_spike::ghostty_model::headless_config(config),
+                rows,
+                cols,
+            )
+            .map(|terminal| Self::Ghostty(Box::new(terminal)))
+            .map_err(|e| e.to_string()),
             other => Err(format!("unknown or disabled model {other}")),
         }
     }

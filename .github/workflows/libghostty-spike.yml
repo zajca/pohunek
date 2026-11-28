@@ -13,6 +13,10 @@ on:
   pull_request:
     paths:
       - spikes/libghostty-vt/**
+      # The spike drives the shipped seam now: the sys crate owns the FFI and
+      # crates/terminal owns the backend switch (issue #2538 P2).
+      - crates/terminal-ghostty-sys/**
+      - crates/terminal/**
       - scripts/build-libghostty-vt
       - scripts/libghostty-vt*
       - .github/actions/libghostty-vt/**
@@ -98,7 +102,7 @@ jobs:
         run: |
           set -eu
           if [ "$EVENT" = workflow_dispatch ] || git diff --name-only "$BASE_SHA" "$HEAD_SHA" |
-            grep -Eq '^(spikes/libghostty-vt/(build.rs|Cargo.(toml|lock)|scripts/|config/|fixtures/|src/(lib|config|trace|expect|model|replay|report|ffi|ghostty|ghostty_model|vt100_model|registry).rs|src/bin/(size-probe|throughput).rs)|scripts/(libghostty-vt.pin.toml|build-libghostty-vt|libghostty-vt-abi-probe.c)|.github/actions/(libghostty-vt|libghostty-vt-macos)/|.github/workflows/libghostty-spike.yml)'; then
+            grep -Eq '^(spikes/libghostty-vt/(Cargo.(toml|lock)|scripts/|config/|fixtures/|src/(lib|config|trace|expect|model|replay|report|ghostty_model|vt100_model|registry).rs|src/bin/(size-probe|throughput).rs)|crates/terminal-ghostty-sys/|crates/terminal/|scripts/(libghostty-vt.pin.toml|build-libghostty-vt|libghostty-vt-abi-probe.c)|.github/actions/(libghostty-vt|libghostty-vt-macos)/|.github/workflows/libghostty-spike.yml)'; then
             echo run=true >> "$GITHUB_OUTPUT"
           else
             echo run=false >> "$GITHUB_OUTPUT"
