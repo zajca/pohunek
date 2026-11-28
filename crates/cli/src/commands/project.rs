@@ -16,13 +16,29 @@ use protocol::{
     ProjectActionsParams, ProjectAddParams, ProjectCandidatesParams, ProjectCandidatesResult,
     ProjectInfo, ProjectListFilter, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
-    PromptLayer, ProviderKind,
+    PromptLayer, ProtocolError, ProviderKind, MAX_PROJECT_NAME_BYTES,
 };
 
 use crate::client::Client;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::is_local_host;
+
+/// The shared [`MAX_PROJECT_NAME_BYTES`] bound of the protocol, enforced before
+/// dialing so an over-cap `project add --name` / `project rename` name fails fast
+/// with the same typed error the daemon answers (#2580).
+const PROJECT_NAME_MAX_BYTES: usize = MAX_PROJECT_NAME_BYTES;
+
+/// Refuses an over-cap custom project name with the daemon's typed error.
+fn check_project_name(name: &str) -> Result<(), CliError> {
+    if name.len() > PROJECT_NAME_MAX_BYTES {
+        return Err(CliError::Protocol(ProtocolError::bad_request(format!(
+            "project name is at most {PROJECT_NAME_MAX_BYTES} bytes ({} given)",
+            name.len()
+        ))));
+    }
+    Ok(())
+}
 
 /// Parse one `project list --filter key=value` argument into a protocol filter.
 ///
@@ -189,6 +205,9 @@ pub(crate) async fn run_add(
     json: bool,
 ) -> Result<(), CliError> {
     let path = resolve_add_path(host, path)?;
+    if let Some(name) = &name {
+        check_project_name(name)?;
+    }
     let params = ProjectAddParams {
         path: Some(path),
         name,
@@ -363,6 +382,7 @@ pub(crate) async fn run_rename(
     name: &str,
     json: bool,
 ) -> Result<(), CliError> {
+    check_project_name(name)?;
     let params = ProjectRenameParams {
         reference: reference.to_owned(),
         name: name.to_owned(),

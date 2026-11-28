@@ -87,6 +87,17 @@ pub const MAX_PROFILE_DISPLAY_NAME_BYTES: usize = 128;
 /// truncated or echoed.
 pub const MAX_CONFIG_NAME_BYTES: usize = 128;
 
+/// Maximum UTF-8 bytes of a custom project display name (`project.add` `--name`,
+/// `project.rename`).
+///
+/// A project record carries the name on every `project.list` page, so the cap
+/// keeps one record far below [`MAX_CONTROL_LINE_BYTES`]: even a maximal name
+/// cannot push the walk's reply over the control-line limit. It matches
+/// [`MAX_CONFIG_NAME_BYTES`], and the daemon's `validate_project_name` and the
+/// CLI's check share it. An over-cap name is refused with `bad_request`, never
+/// truncated or echoed.
+pub const MAX_PROJECT_NAME_BYTES: usize = MAX_CONFIG_NAME_BYTES;
+
 /// Maximum options one agent profile declares under `[options]`.
 ///
 /// An option is one picker in a launch form (model, effort, permission

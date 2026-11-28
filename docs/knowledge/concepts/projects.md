@@ -27,6 +27,9 @@ several pages is still not a snapshot of projects registered or removed meanwhil
 when the reply would exceed one control line, the daemon answers
 `project_actions_too_large`, and a config name (action, template, prompt,
 agent, profile, …) over 128 bytes is refused with `invalid_name`, never echoed.
+A custom project display name (`project add --name`, `project rename`) is capped
+at `MAX_PROJECT_NAME_BYTES` (128 bytes) and an over-cap name is refused with
+`bad_request` naming the cap, so one record stays far below one control line.
 
 Projects give sessions stable targeting. A remote host can resolve a project id
 or label on that host without the local CLI sending a local filesystem path.
