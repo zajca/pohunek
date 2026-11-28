@@ -12,10 +12,10 @@
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::symlink;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-use pohunek_test_support::owner::REAPER_HOME_ENV;
+use pohunek_test_support::owner::{OwnerReaper, REAPER_HOME_ENV};
 use pohunek_test_support::wait::poll_until;
 use pohunek_test_support::{reaper_binary, tempdir, workers};
 use rustix::fs::{flock, FlockOperation};
@@ -82,6 +82,101 @@ fn the_reaper_refuses_a_sweep_root_that_resolves_to_the_armed_home() {
         workers::try_start_of(sleeper_pid).as_deref(),
         Some(sleeper_start.as_str()),
         "the refused root's sleeper survives under its start identity"
+    );
+    sleeper.kill().expect("stop the sleeper");
+    let _ = sleeper.wait();
+}
+
+/// Marker argument that selects the child scenario run of this binary, so a
+/// plain `--ignored` sweep of this binary returns at once.
+const SCENARIO_MARKER: &str = "arm-home-scenario";
+
+/// Child scenario: `HOME` is the root, so [`OwnerReaper::arm`] hands the
+/// helper that home through `POHUNEK_REAPER_HOME`; the child then exits
+/// without unwinding, the kernel releases the owner lock, and the helper
+/// sweeps (or refuses) the root.
+#[test]
+#[ignore = "child process of the armed-reaper scenario"]
+fn arm_home_scenario() {
+    let arguments: Vec<String> = std::env::args().collect();
+    if !arguments.iter().any(|argument| argument == SCENARIO_MARKER) {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("HOME").expect("HOME is the scenario root"));
+    let reaper = OwnerReaper::arm(&root).expect("arm the reaper on the home root");
+    // Exiting must not run the drop that kills the helper before it can sweep.
+    std::mem::forget(reaper);
+    std::process::exit(0);
+}
+
+/// End-to-end proof through [`OwnerReaper::arm`]: a child whose `HOME` is the
+/// root arms the reaper on that root and exits without unwinding; once the
+/// armed helper has finished (its link is gone), the sleeper under the root
+/// survives, because the sweep root resolves to the armed home and is refused.
+#[test]
+fn an_armed_reaper_refuses_the_home_root_when_its_owner_dies() {
+    // The scenario root doubles as the child's HOME.
+    let root = tempdir().expect("scenario root doubling as HOME");
+    let root = std::fs::canonicalize(root.path()).expect("canonical scenario root");
+
+    // A sleeper under the root: the sweep criterion selects it, so an
+    // accepted root would kill it.
+    let mut sleeper = Command::new("sleep")
+        .arg("300")
+        .current_dir(&root)
+        .spawn()
+        .expect("spawn the sleeper under the root");
+    let sleeper_pid = sleeper.id();
+    let sleeper_start = poll_until("the sleeper to run", || workers::try_start_of(sleeper_pid));
+
+    // The scenario child runs with HOME=root, arms the reaper on it, and
+    // exits without unwinding.
+    let exe = std::env::current_exe().expect("path of the running test binary");
+    let [exact, test] =
+        pohunek_test_support::exact_test_filter(module_path!(), "arm_home_scenario");
+    let mut child = Command::new(exe)
+        .arg(exact)
+        .arg(test)
+        .arg("--ignored")
+        .arg(SCENARIO_MARKER)
+        .env("HOME", &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the scenario child");
+    let child_pid = child.id();
+    let status = child.wait().expect("wait for the scenario child");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the child exited without unwinding: {status:?}"
+    );
+
+    // The armed helper finishes when it has swept (or refused) the root and
+    // removed its link: `/tmp/pohunek-test-locks-<uid>/reaper-<pid>-<name>.lock`.
+    let uid = rustix::process::geteuid().as_raw();
+    let root_name = root
+        .file_name()
+        .expect("the root has a directory name")
+        .to_string_lossy()
+        .into_owned();
+    let link = Path::new("/tmp")
+        .join(format!("pohunek-test-locks-{uid}"))
+        .join(format!("reaper-{child_pid}-{root_name}.lock"));
+    poll_until("the armed helper to finish and remove its link", || {
+        std::fs::symlink_metadata(&link).is_err().then_some(())
+    });
+
+    // The home root was refused, so the sleeper under it survives.
+    assert!(
+        sleeper.try_wait().expect("poll the sleeper").is_none(),
+        "the sleeper under the refused home root survives"
+    );
+    assert_eq!(
+        workers::try_start_of(sleeper_pid).as_deref(),
+        Some(sleeper_start.as_str()),
+        "the survivor keeps its start identity"
     );
     sleeper.kill().expect("stop the sleeper");
     let _ = sleeper.wait();
