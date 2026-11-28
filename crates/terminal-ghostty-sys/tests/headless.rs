@@ -8,7 +8,33 @@
 #![cfg(feature = "libghostty")]
 
 use base64::Engine as _;
-use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal};
+use pohunek_terminal_ghostty_sys::{
+    HeadlessConfig, HeadlessTerminal, FORMATTER_EXTRAS_ALL, FORMATTER_EXTRAS_ATTACH,
+};
+
+/// M14: the attach extras mask omits the palette — a repaint must not send
+/// OSC 4 sets that overwrite the user's colors — while `EXTRAS_ALL` still
+/// carries them for callers that want the full state.
+#[test]
+fn the_attach_repaint_extras_omit_the_palette() {
+    let mut terminal =
+        HeadlessTerminal::new(&HeadlessConfig::default(), 24, 80).expect("the terminal inits");
+    terminal.feed(b"hello\r\n");
+    let attach = terminal
+        .format_vt(true, false, FORMATTER_EXTRAS_ATTACH)
+        .expect("the attach repaint formats");
+    assert!(
+        !attach.windows(4).any(|window| window == b"\x1b]4;"),
+        "the attach repaint carries no OSC 4 palette set"
+    );
+    let full = terminal
+        .format_vt(true, false, FORMATTER_EXTRAS_ALL)
+        .expect("the full repaint formats");
+    assert!(
+        full.windows(4).any(|window| window == b"\x1b]4;"),
+        "EXTRAS_ALL still restores the palette"
+    );
+}
 
 /// S6: an OSC 52 clipboard flood is answered with a bounded record — one
 /// counter plus the decoded size of the last write, never one entry per

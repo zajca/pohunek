@@ -1208,11 +1208,9 @@ mod tests {
         assert_eq!(missing, 0..hub.next_offset());
         assert_eq!(terminal.watermark, hub.next_offset());
         assert!(terminal.visible_text.contains("counter:0042-after-outage"));
-        // The repaint opens and closes the synchronized-output bracket on both
-        // screen models (issue #2538); its body is model-specific, so the
-        // vt100 shape is pinned in pohunek-terminal's own tests.
-        assert!(terminal.ansi.starts_with(b"\x1b[?2026h"));
-        assert!(terminal.ansi.ends_with(b"\x1b[?2026l"));
+        // Both screen models emit the same prologue: the synchronized-output
+        // bracket, then the clear (issue #2538 M13).
+        assert!(terminal.ansi.starts_with(b"\x1b[?2026h\x1b[2J\x1b[H"));
 
         let expected_ansi = terminal.ansi;
         let mut subscriber = hub.subscribe(Some(0)).expect("gap subscribe");

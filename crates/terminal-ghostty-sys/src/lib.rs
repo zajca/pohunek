@@ -26,4 +26,6 @@ pub mod ghostty;
 #[cfg(feature = "libghostty")]
 pub use config::HeadlessConfig;
 #[cfg(feature = "libghostty")]
+pub use ffi::{FORMATTER_EXTRAS_ALL, FORMATTER_EXTRAS_ATTACH};
+#[cfg(feature = "libghostty")]
 pub use ghostty::{version, CellInfo, GhosttyError, HeadlessTerminal};

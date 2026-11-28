@@ -1058,7 +1058,12 @@ attach to one session; resize policy when sizes differ is defined by the daemon
 The repaint is produced by the worker's screen model, `TerminalTracker` in
 `crates/terminal`: the vt100 parser by default, or libghostty-vt through
 `crates/terminal-ghostty-sys` when the product is built with the `libghostty`
-cargo feature (issue #2538). OSC metadata (title, progress, OSC 7501 probes) is
+cargo feature (issue #2538). Both models emit the same prologue — the
+synchronized-output bracket, then the screen switch (`?1049h` on the
+alternate screen) and `CSI 2J CSI H` — so an attach clears the client screen
+on either model; only the body is model-specific, and the libghostty body
+carries no palette restore (OSC 4), so a repaint never changes the user's
+colors. OSC metadata (title, progress, OSC 7501 probes) is
 tracked from the raw PTY bytes on both models, so the attach contract above
 does not depend on the screen model.
 

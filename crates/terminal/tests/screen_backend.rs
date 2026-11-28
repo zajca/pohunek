@@ -447,7 +447,8 @@ fn the_ansi_repaint_round_trips_through_a_fresh_tracker_of_the_same_model() {
 }
 
 /// S2: same round trip through the libghostty backend; its repaint body is
-/// `format_vt(unwrap = true, trim = false)` with an empty prefix.
+/// `format_vt(unwrap = true, trim = false)` with the attach extras (no
+/// palette), behind the shared prologue (screen switch + `CSI 2J CSI H`).
 #[test]
 #[cfg(feature = "libghostty")]
 fn the_ghostty_ansi_repaint_round_trips_through_a_fresh_ghostty_tracker() {
@@ -465,6 +466,92 @@ fn the_ghostty_ansi_repaint_round_trips_through_a_fresh_ghostty_tracker() {
             screen_state(&snapshot),
             screen_state(&replayed),
             "{name}: the libghostty repaint does not recreate its screen"
+        );
+    }
+}
+
+/// S2/M13: the repaint clears its target: replaying a snapshot's ansi into a
+/// tracker pre-filled with different content recreates the snapshot's screen
+/// exactly, on both models (the prologue's `CSI 2J CSI H` wipes the stale
+/// cells).
+#[test]
+fn the_ansi_repaint_clears_a_prefilled_tracker() {
+    #[allow(
+        unused_mut,
+        reason = "the libghostty model is added only with the feature"
+    )]
+    let mut models = vec![ModelKind::Vt100];
+    #[cfg(feature = "libghostty")]
+    models.push(ModelKind::Libghostty);
+    for model in models {
+        for name in ["claude.trace", "resize-alt-screen.trace"] {
+            let trace = fixture(name);
+            let snapshot = replay(model, &trace).snapshot(0);
+            let mut prefilled = TerminalTracker::with_model(model, snapshot.rows, snapshot.cols);
+            for _ in 0..snapshot.rows {
+                prefilled.feed(b"stale content that the repaint must wipe\r\n");
+            }
+            prefilled.feed(&snapshot.ansi);
+            assert_eq!(
+                screen_state(&prefilled.snapshot(0)),
+                screen_state(&snapshot),
+                "{name}/{model:?}: the repaint does not clear a pre-filled tracker"
+            );
+        }
+    }
+}
+
+/// S2/M4: the per-row cell layout behind the golden repaint bytes of the
+/// `emoji-width` fixture, read through `HeadlessTerminal::cell`: on every
+/// content row the `x` after the emoji sits at the pinned column (the columns
+/// differ per row because the fixture toggles mode 2027 between rows — the
+/// same expectations as the spike's `emoji-width.expect.toml`), and every wide
+/// cell before it is followed by its spacer. A width or cell-layout change
+/// moves the `x` and fails here, which the golden rows alone cannot show
+/// (they carry no in-row positioning).
+#[test]
+#[cfg(feature = "libghostty")]
+fn the_emoji_width_cell_layout_is_pinned_per_row() {
+    use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal};
+    /// The column of the `x` on rows 0..=6 of the fixture, per mode 2027:
+    /// per-codepoint widths put it at 6 (family), 1 (VS16 heart) or 4 (flag);
+    /// grapheme-cluster mode puts it at 2.
+    const X_COLUMNS: [u16; 7] = [6, 2, 2, 1, 1, 4, 2];
+    let trace = fixture("emoji-width.trace");
+    let mut terminal = HeadlessTerminal::new(&HeadlessConfig::default(), trace.rows, trace.cols)
+        .expect("the headless terminal inits");
+    for record in &trace.records {
+        match record {
+            Record::Output(bytes) => terminal.feed(bytes),
+            Record::Resize { rows, cols } => {
+                terminal.resize(*rows, *cols).expect("the resize applies");
+            }
+        }
+    }
+    let (rows, _cols) = terminal.size().expect("the size reads");
+    assert!(usize::from(rows) >= X_COLUMNS.len());
+    for (row, x_col) in X_COLUMNS.iter().enumerate() {
+        let row = u16::try_from(row).expect("the row fits u16");
+        let first = terminal.cell(row, 0).expect("the first cell reads");
+        assert!(
+            !first.text.is_empty() && !first.spacer_tail,
+            "row {row}: the emoji grapheme starts the row"
+        );
+        for col in 0..*x_col {
+            let cell = terminal.cell(row, col).expect("a cell reads");
+            if cell.wide {
+                let spacer = terminal.cell(row, col + 1).expect("the spacer reads");
+                assert!(
+                    spacer.spacer_tail,
+                    "row {row}: the wide cell at col {col} is followed by its spacer"
+                );
+            }
+        }
+        let x = terminal.cell(row, *x_col).expect("the x cell reads");
+        assert_eq!(x.text, "x", "row {row}: the x sits at column {x_col}");
+        assert!(
+            !x.wide && !x.spacer_tail,
+            "row {row}: the x is a narrow cell"
         );
     }
 }

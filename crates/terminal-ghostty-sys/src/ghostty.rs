@@ -643,18 +643,23 @@ impl HeadlessTerminal {
         self.format(ffi::FORMATTER_FORMAT_PLAIN, 0, Some((true, true)))
     }
 
-    /// A byte stream that recreates the screen, with cursor, modes, styles,
-    /// hyperlinks and keyboard state.
+    /// A byte stream that recreates the screen, with the `extras` state the
+    /// caller names (cursor, modes, styles, hyperlinks, keyboard, ...).
+    ///
+    /// The attach repaint passes [`ffi::FORMATTER_EXTRAS_ATTACH`] so it never
+    /// rewrites the user's palette; [`ffi::FORMATTER_EXTRAS_ALL`] keeps every
+    /// extra for callers that want the full state.
     ///
     /// # Errors
     ///
     /// Returns a [`GhosttyError`] when formatting fails.
-    pub fn format_vt(&self, unwrap: bool, trim: bool) -> Result<Vec<u8>, GhosttyError> {
-        self.format(
-            ffi::FORMATTER_FORMAT_VT,
-            ffi::FORMATTER_EXTRAS_ALL,
-            Some((unwrap, trim)),
-        )
+    pub fn format_vt(
+        &self,
+        unwrap: bool,
+        trim: bool,
+        extras: u32,
+    ) -> Result<Vec<u8>, GhosttyError> {
+        self.format(ffi::FORMATTER_FORMAT_VT, extras, Some((unwrap, trim)))
     }
 
     fn format(

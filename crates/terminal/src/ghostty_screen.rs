@@ -1,13 +1,15 @@
 //! The libghostty-vt backend of [`TerminalTracker`](crate::TerminalTracker).
 //!
 //! All unsafe FFI lives in `pohunek-terminal-ghostty-sys`; this module is safe
-//! code that maps the sys crate onto the screen seam. The repaint is
-//! `format_vt(unwrap = true, trim = false)` with an empty prefix, the pinned
-//! 0.46 model settings of the spike (`spikes/libghostty-vt/config/model.toml`).
+//! code that maps the sys crate onto the screen seam. The repaint body is
+//! `format_vt(unwrap = true, trim = false)` with the attach extras (everything
+//! but the palette), preceded by the same prologue the vt100 backend emits:
+//! the screen switch (`?1049h` on the alternate screen) and `CSI 2J CSI H`,
+//! so an attach clears the client screen on either model (issue #2538 M13/M14).
 
 // Rust guideline compliant 2026-11-27
 
-use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal};
+use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal, FORMATTER_EXTRAS_ATTACH};
 
 use crate::links::{combine_links, text_links, valid_uri, LinkSource, ScreenLink};
 use crate::snapshot::ScreenState;
@@ -16,9 +18,12 @@ use crate::snapshot::ScreenState;
 const REPAINT_UNWRAP: bool = true;
 /// Repaint option: keep trailing spaces of each line.
 const REPAINT_TRIM: bool = false;
-/// Bytes written to a fresh instance before the repaint: none in the pinned
-/// model settings.
-const REPAINT_PREFIX: &[u8] = b"";
+/// Screen switch to the alternate screen, emitted first when it is active.
+const REPAINT_ALT_SCREEN: &[u8] = b"\x1b[?1049h";
+/// Clear the screen and home the cursor, after the screen switch; the vt100
+/// backend emits the same clear, so the attach path wipes stale content on
+/// either model.
+const REPAINT_CLEAR: &[u8] = b"\x1b[2J\x1b[H";
 
 /// A libghostty-vt screen: the `Ghostty` variant of the tracker's backend.
 pub(crate) struct GhosttyScreen {
@@ -76,10 +81,19 @@ impl GhosttyScreen {
         let terminal = &self.terminal;
         let (rows, cols) = self.size();
         let (cursor_row, cursor_col) = terminal.cursor().expect("libghostty read the cursor");
+        let alternate_screen = terminal
+            .alternate_screen()
+            .expect("libghostty read the active screen");
         let body = terminal
-            .format_vt(REPAINT_UNWRAP, REPAINT_TRIM)
+            .format_vt(REPAINT_UNWRAP, REPAINT_TRIM, FORMATTER_EXTRAS_ATTACH)
             .expect("libghostty format the repaint");
-        let mut repaint = REPAINT_PREFIX.to_vec();
+        // The vt100 backend's prologue: screen switch first, then the clear,
+        // so the repaint also wipes a pre-filled client screen on this model.
+        let mut repaint = Vec::new();
+        if alternate_screen {
+            repaint.extend_from_slice(REPAINT_ALT_SCREEN);
+        }
+        repaint.extend_from_slice(REPAINT_CLEAR);
         repaint.extend_from_slice(&body);
         ScreenState {
             rows,
@@ -89,9 +103,7 @@ impl GhosttyScreen {
             cursor_visible: terminal
                 .cursor_visible()
                 .expect("libghostty read the cursor visibility"),
-            alternate_screen: terminal
-                .alternate_screen()
-                .expect("libghostty read the active screen"),
+            alternate_screen,
             // Active screen rows only, via the sys crate's two-view API: the
             // library retains scrollback (up to the configured byte limit) and
             // the history view `format_plain` would leak it into
