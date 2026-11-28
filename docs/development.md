@@ -309,6 +309,21 @@ trade: a macOS-only defect in an unlabelled or tests-only PR is found by the
 post-merge `main` run, never at the PR gate, and a red `main` keeps priority
 one. ([#2599](https://github.com/zajca/pohunek/issues/2599))
 
+The `pull_request` trigger pins `types: [opened, synchronize, reopened,
+labeled, unlabeled]`, so a label change starts a run that re-evaluates the
+label condition: adding `macos-gate` after a run started begins a new run
+(cancelling the in-progress one through `cancel-in-progress`) in which the
+lane runs; removing it begins one that skips it. The coordinator labels the
+PR before or right after the push, so in the normal flow the lane starts in
+the first run. A `labeled`/`unlabeled` re-run is a `pull_request` consumer
+of the reuse mechanism below: it skips the same-tree green legs of the PR's
+earlier runs and costs only the jobs those runs skipped — the label-skipped
+lane, which was never green, is not in the reuse skip list and runs in the
+re-run. A run started before the label is therefore never excused as a skip
+at the head: its verdict may excuse the label-skipped lane inside that old
+run, but the label event's run supersedes it for the same head SHA (the
+newest run decides each check), and in that run the lane gets its chance.
+
 The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
 `ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
 `library (x86_64-unknown-linux-musl)`, `library (aarch64-apple-darwin)`,
@@ -373,14 +388,20 @@ carry it, because a failed selection runs everything instead of ending the
 run. A fork or Dependabot pull request has a read-only token, so the cancel
 call is refused and the run keeps its real failure.
 
-**Delta dispatch and push reuse.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
-accepts `delta: true`, and a `main` push reuses green jobs while the workflow-level
+**Delta dispatch, push and pull-request reuse.** A `workflow_dispatch` run of
+`ci.yml` with `tier=main` accepts `delta: true`, a `main` push reuses green
+jobs while the workflow-level
 `CI_REUSE_PUSH` kill switch is `"true"` (issue #2204; set it to `"false"` to turn
-push reuse off — a tier=main delta dispatch is unaffected): the `reuse` job
+push reuse off — a tier=main delta dispatch is unaffected), and a pull request
+run — including a `labeled`/`unlabeled` re-run of the same head (#2599) —
+reuses by the same rule: a pull request consumer matches source runs by their
+recorded tested tree, like a push, while a delta dispatch matches only the
+same commit. The `reuse` job
 finds the newest green legs of the previous runs of the same tree from this
 repository — pull request runs, prior main pushes, and tier=main delta dispatches,
 each within 24 hours, fork runs never — and reuses those green legs (per job, the
-newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push may match by recorded tested tree. A failed `reuse` run fails
+newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push and a pull request run may
+match by recorded tested tree. A failed `reuse` run fails
 the verdict, so no job is wrongly skipped. The record names only legs that were green in their source run, and a fail-open run writes an empty record. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the

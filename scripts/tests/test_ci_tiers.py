@@ -536,13 +536,15 @@ def evaluate_job_condition(
     results: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
     labels: list[str] | None = None,
+    action: str = "",
 ) -> bool:
     """`evaluate_condition` for a job that may also wait on other jobs: the
     package selection gives `result` and `outputs`, and every other job of
     `needs` reads from `results`. Jobs the caller does not name read as
     success, as when the producers that the scenario holds fixed ran; the
     caller names a producer explicitly to exercise its failure. `labels`
-    are the pull request's label names."""
+    are the pull request's label names and `action` its activity type
+    (`labeled`, `unlabeled`, ...)."""
     merged = {name: "success" for name in re.findall(r"needs\.([a-z][a-z0-9-]*)\.", expression)}
     merged.update(results or {})
     merged.setdefault(PACKAGE_SELECTOR, result)
@@ -550,7 +552,7 @@ def evaluate_job_condition(
     return bool(evaluate_needs_expression(
         expression, event=event, tier=tier, changes=changes,
         results=merged, outputs=merged_outputs, reuse_skip=reuse_skip,
-        labels=labels,
+        labels=labels, action=action,
     ))
 
 
@@ -566,10 +568,12 @@ def evaluate_condition(
     results: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
     labels: list[str] | None = None,
+    action: str = "",
 ) -> bool:
     """Evaluate a job's `if:` in Python for the operators it may use.
 
-    Only `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
+    Only `!cancelled()`, `github.event_name`, `github.event.action`,
+    `inputs.tier`, the `changes`
     job's `outputs.<name>`, the selector's `result` and `outputs.<name>`,
     `needs.<job>.result` (from `results`, defaulting to success as when the
     producers ran), the reuse skip list (`reuse_skip`, defaulting to no
@@ -584,6 +588,7 @@ def evaluate_condition(
     python = expression.replace("needs.release-rehearsal-build.result", "'success'")
     python = python.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
+    python = python.replace("github.event.action", "action")
     python = python.replace("inputs.tier", "tier")
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
     # The pull request's label names (issue #2599), read before the generic
@@ -611,7 +616,7 @@ def evaluate_condition(
     python = re.sub(r"!(?!=)", " not ", python)
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
-        r"'[^']*'|\b(?:not|and|or|event|tier|result|cancelled|outputs\.get|changes\.get|results\.get|reuse_skip|_contains|labels)\b|==|!=|[()\s,\[\]]",
+        r"'[^']*'|\b(?:not|and|or|event|action|tier|result|cancelled|outputs\.get|changes\.get|results\.get|reuse_skip|_contains|labels)\b|==|!=|[()\s,\[\]]",
         "",
         python,
     )
@@ -619,6 +624,7 @@ def evaluate_condition(
         raise AssertionError(f"untranslated condition syntax {leftover!r} in {expression!r}")
     return bool(eval(python, {"__builtins__": {}, "_contains": _contains}, {
         "event": event.lower(),
+        "action": action.lower(),
         "cancelled": cancelled,
         "tier": tier.lower(),
         "changes": {name: value.lower() for name, value in (changes or {}).items()},
@@ -691,6 +697,42 @@ class CiTierWorkflowTests(unittest.TestCase):
         self.assertIn("type: choice", tier)
         self.assertRegex(tier, r"(?m)^\s+- main$")
         self.assertRegex(tier, r"(?m)^\s+- nightly$")
+
+    def test_pull_request_triggers_include_labeled_and_unlabeled(self):
+        # A label change must start a run that re-evaluates the macOS label
+        # condition of the macOS jobs (issue #2599): `labeled` starts a run
+        # that can run the lane, `unlabeled` one that skips it. Without them
+        # a label added after the run started would never re-evaluate.
+        triggers = CI.split("on:\n", 1)[1]
+        pr = block(triggers, "pull_request", indent=2)
+        types = re.search(r"(?m)^    types: \[(.+)\]$", pr)
+        self.assertIsNotNone(types, "pull_request must pin its activity types")
+        self.assertEqual(
+            [entry.strip() for entry in types.group(1).split(",")],
+            ["opened", "synchronize", "reopened", "labeled", "unlabeled"],
+        )
+
+    def test_a_labeled_event_with_the_label_starts_the_lane_and_an_unlabeled_one_skips_it(self):
+        jobs = workflow_jobs()
+        lane = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs["platform-contracts"])
+        assert lane is not None
+        # A `labeled` event carries the label in the event payload, and a
+        # paths-positive diff selects the lane: the lane starts.
+        self.assertTrue(evaluate_job_condition(
+            lane.group(1), event="pull_request", action="labeled",
+            changes={"macos": "true"}, labels=[MACOS_GATE_LABEL],
+        ))
+        # An `unlabeled` event that removed `macos-gate` no longer carries
+        # it: the lane skips.
+        self.assertFalse(evaluate_job_condition(
+            lane.group(1), event="pull_request", action="unlabeled",
+            changes={"macos": "true"}, labels=[],
+        ))
+        # The activity type alone never starts the lane without the label.
+        self.assertFalse(evaluate_job_condition(
+            lane.group(1), event="pull_request", action="labeled",
+            changes={"macos": "true"}, labels=[],
+        ))
 
     def test_superseded_pr_runs_cancel_and_main_runs_drain_without_cross_tier_cancellation(self):
         concurrency = block(CI, "concurrency", indent=0)
@@ -3308,11 +3350,13 @@ def evaluate_needs_expression(
     reuse_skip: list[str] | None = None,
     step_outputs: dict[str, dict[str, str]] | None = None,
     labels: list[str] | None = None,
+    action: str = "",
 ):
     """Evaluate an expression over `needs.<job>.result` and `.outputs.<name>`.
 
     Understands `!cancelled()`, `always()`, `failure()`, `fromJSON`,
-    `contains`, `github.event_name`, `inputs.tier`, `env.<NAME>`,
+    `contains`, `github.event_name`, `github.event.action`, `inputs.tier`,
+    `env.<NAME>`,
     `matrix.<name>`, `github.sha`, `steps.<id>.outcome`,
     `steps.<id>.outputs.<name>` (read from `step_outputs`), the pull
     request's `labels` (for `contains(github.event.pull_request.labels.*.name,
@@ -3343,6 +3387,7 @@ def evaluate_needs_expression(
     python = python.replace("success()", "(True)")
     python = python.replace("fromJSON(", "fromjson(")
     python = python.replace("github.event_name", "event")
+    python = python.replace("github.event.action", "action")
     python = python.replace("inputs.tier", "tier")
     # The pull request's label names (issue #2599), read before the generic
     # `!` translation so a negated `contains(...)` keeps working.
@@ -3371,7 +3416,7 @@ def evaluate_needs_expression(
     python = re.sub(r"!(?!=)", " not ", python)
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
-        r"'[^']*'|\b(?:not|and|or|True|False|event|tier|cancelled|fromjson|contains|changes\.get|"
+        r"'[^']*'|\b(?:not|and|or|True|False|event|action|tier|cancelled|fromjson|contains|changes\.get|"
         r"results\.get|outputs\.get|stepouts\.get|envs\.get|matrix\.get|inputs\.get|reuse_skip|get|labels|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
         "",
         python,
@@ -3380,6 +3425,7 @@ def evaluate_needs_expression(
         raise AssertionError(f"untranslated expression syntax {leftover!r} in {expression!r}")
     return eval(python, {"__builtins__": {}}, {
         "event": event.lower(),
+        "action": action.lower(),
         "cancelled": cancelled,
         "tier": tier.lower(),
         "fromjson": json.loads,
@@ -4679,7 +4725,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
             "this run's own reports arrive through the pinned download action",
         )
 
-    def test_the_reuse_job_runs_on_a_delta_dispatch_and_on_a_push(self):
+    def test_the_reuse_job_runs_on_a_delta_dispatch_a_push_and_a_pull_request(self):
         job = workflow_jobs()[REUSE_JOB]
         self.assertNotRegex(job, r"(?m)^    needs:")
         # The `gh` calls must not hang the 21 jobs that wait on them:
@@ -4689,7 +4735,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
             job_condition(REUSE_JOB),
             "(github.event_name == 'workflow_dispatch' "
             "&& inputs.tier == 'main' && inputs.delta) "
-            "|| github.event_name == 'push'",
+            "|| github.event_name == 'push' "
+            "|| github.event_name == 'pull_request'",
         )
         self.assertNotIn("env.", job_condition(REUSE_JOB))
         for output in ("skip", "source_run", "source_runs", "tree"):
@@ -4703,7 +4750,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertEqual(int(retention.group(1)), 30)
         self.assertIn("overwrite: true", upload)
 
-    def test_the_reuse_job_condition_admits_only_a_push_and_a_delta_main_dispatch(self):
+    def test_the_reuse_job_condition_admits_a_push_a_delta_main_dispatch_and_a_pull_request(self):
         condition = job_condition(REUSE_JOB)
         on = bool(evaluate_needs_expression(
             condition, event="push",
@@ -4746,7 +4793,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
             outputs={REUSE_JOB: {"skip": "[]"}},
             changes=dict(changes_of("pull_request")),
         ))
-        self.assertFalse(pr, "a pull request never runs reuse")
+        self.assertTrue(pr, "a pull request runs reuse, so a labeled/unlabeled "
+                            "re-run of the same head reuses its green legs (#2599)")
 
     def test_the_kill_switch_is_documented_and_defaults_on(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text()

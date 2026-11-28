@@ -24,6 +24,12 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled`/`unlabeled` start a run that re-evaluates the `macos-gate`
+    # label condition of the macOS jobs (issue #2599): adding the label
+    # starts a run that runs the lane, removing it one that skips it. The
+    # run reuses the same-tree green legs (the `reuse` job), so it costs
+    # only the jobs the earlier run skipped.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
     inputs:
       tier:
@@ -1034,11 +1040,14 @@ jobs:
     name: reuse green jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || github.event_name == 'push' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || github.event_name == 'push' || github.event_name == 'pull_request' }}
     # `CI_REUSE_PUSH` cannot be read here (job `if:` has no `env`), so the
     # kill switch is the `nopus` step below. On a push with the switch
     # off, `decide` and the upload are skipped, every job runs, and the
-    # job still succeeds. Every other event leaves the job skipped.
+    # job still succeeds. A pull request run (including a `labeled` or
+    # `unlabeled` re-run of the same head, issue #2599) reuses the same-tree
+    # green legs of its earlier runs; every other event leaves the job
+    # skipped.
     permissions:
       contents: read
       actions: read

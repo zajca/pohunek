@@ -104,10 +104,11 @@ def source_is_eligible(
 
 
 def consumer_matches(run: dict, consumer_event: str, sha: str) -> bool:
-    """Whether a candidate run answers this consumer: a push consumer may
-    reuse another commit with the same tree; a delta dispatch only accepts a
-    source on the same commit (`head_sha == GITHUB_SHA`)."""
-    if consumer_event == "push":
+    """Whether a candidate run answers this consumer: a push or pull
+    request consumer may reuse another commit with the same tree (the
+    caller requires the recorded tested tree to match); a delta dispatch
+    only accepts a source on the same commit (`head_sha == GITHUB_SHA`)."""
+    if consumer_event in ("push", "pull_request"):
         return True
     if consumer_event == "workflow_dispatch":
         return run.get("head_sha") == sha

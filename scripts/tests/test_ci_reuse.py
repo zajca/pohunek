@@ -916,9 +916,9 @@ else:
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
     def test_a_consumer_on_an_unknown_event_refuses_reuse(self):
-        # `ci-reuse` answers only push and delta-dispatch consumers: a
-        # schedule consumer refuses before any listing, so the refusal
-        # text names the event instead of reusing anything.
+        # `ci-reuse` answers only push, pull_request and delta-dispatch
+        # consumers: a schedule consumer refuses before any listing, so the
+        # refusal text names the event instead of reusing anything.
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": green_jobs()},
@@ -932,6 +932,47 @@ else:
             rc = self.run_script_with_tree(TREE)
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
+
+    @as_consumer("pull_request")
+    def test_a_labeled_rerun_of_a_pull_request_reuses_its_same_tree_green_legs(self):
+        # A `labeled`/`unlabeled` re-run of a pull request head (issue #2599)
+        # is a pull_request consumer: it reuses the same-tree green legs of
+        # the earlier runs of the PR, so the re-run costs only what they
+        # skipped (the label-skipped macOS lane). Like a push consumer, a
+        # pull_request consumer matches a source on another commit by the
+        # recorded tested tree, not by head SHA.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="pull_request", head_sha="b" * 40)],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        outputs = self.outputs()
+        skip = json.loads(outputs["skip"])
+        self.assertIn("test", skip)
+        self.assertEqual(outputs["source_run"], "777")
+
+    @as_consumer("pull_request")
+    def test_a_pull_request_consumer_never_reuses_another_tree(self):
+        # The recorded tested tree still binds a pull_request consumer: a
+        # source that tested a different tree supplies nothing.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="pull_request")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": "tested-tree-" + "d" * 40, "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
     @as_consumer("push")
     def test_a_run_created_before_the_window_supplies_nothing(self):
