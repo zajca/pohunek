@@ -427,6 +427,31 @@ fn a_long_scrollback_does_not_exceed_the_output_limit() {
         !ghostty_snapshot.visible_text.contains("line-04000"),
         "scrollback must not leak into visible_text"
     );
+    // The repaint body is `format_vt`, which — unlike `visible_text` — includes
+    // the history rows the library retained, so after the flood the repaint
+    // carries the whole retained history (issue #2596 finding 17, #2593
+    // finding 11): it exceeds the active-screen bound. Measured at this
+    // scenario: a 405,000-byte flood repaints as 405,103 bytes (1.0003x the
+    // input; the +103 is the prologue and the sync bracket), and a flood with
+    // one SGR pair per line repaints as 490,103 bytes for 450,000 input
+    // (1.089x). So the repaint tracks the retained history, and
+    // SCROLLBACK_MAX_BYTES bounds the retained text (an allocation estimate),
+    // not the formatted output — bounding the formatter stays the open
+    // follow-up (plan a-31d1b862e65e section 6 routes it to #2596).
+    assert!(
+        ghostty_snapshot.ansi.len() > bound,
+        "the repaint of {} bytes must exceed the active-screen bound {bound}: \
+         format_vt includes the retained history",
+        ghostty_snapshot.ansi.len()
+    );
+    assert!(
+        ghostty_snapshot.ansi.len() <= input.len() + 4096,
+        "the repaint of {} bytes exceeds the measured bound (input {} + 4096): \
+         for unstyled text the repaint is the retained history plus a small \
+         prologue, not the 8 MiB scrollback allocation",
+        ghostty_snapshot.ansi.len(),
+        input.len()
+    );
 }
 
 /// S6: hostile PTY output cannot break the libghostty backend — malformed

@@ -2043,6 +2043,7 @@ dependencies = [
  "pohunek-test-support",
  "serde",
  "serde_json",
+ "tracing",
  "unicode-width",
  "vt100",
  "vte",

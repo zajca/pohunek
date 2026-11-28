@@ -22,6 +22,58 @@ const SYNCHRONIZED_OUTPUT_MODE: u32 = 2026;
 const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 /// Ends a synchronized-output bracket (DEC private mode 2026).
 const SYNC_END: &[u8] = b"\x1b[?2026l";
+/// Clear the screen and home the cursor: the prologue both backends' repaints
+/// carry and the degraded error snapshot carries (issue #2538 M13).
+const REPAINT_CLEAR: &[u8] = b"\x1b[2J\x1b[H";
+
+/// Reading the screen state of the active backend failed.
+///
+/// The vt100 backend cannot fail; this arises only on the libghostty
+/// backend, whose reads and formatting go through the C library and can
+/// return any `GhosttyResult` code, not only `OUT_OF_MEMORY` (issue #2593
+/// finding 8). [`TerminalTracker::try_snapshot`] reports it;
+/// [`TerminalTracker::snapshot`] degrades to an error snapshot instead of
+/// panicking under the worker's output lock.
+#[derive(Debug)]
+pub struct SnapshotError {
+    /// The library error; only the libghostty backend can produce one.
+    #[cfg(feature = "libghostty")]
+    ghostty: pohunek_terminal_ghostty_sys::GhosttyError,
+}
+
+impl SnapshotError {
+    /// Wraps a libghostty read or format failure.
+    #[cfg(feature = "libghostty")]
+    pub(crate) fn libghostty(error: pohunek_terminal_ghostty_sys::GhosttyError) -> Self {
+        Self { ghostty: error }
+    }
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "libghostty")]
+        {
+            write!(f, "libghostty screen read failed: {}", self.ghostty)
+        }
+        #[cfg(not(feature = "libghostty"))]
+        {
+            write!(f, "the screen state read failed")
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(feature = "libghostty")]
+        {
+            Some(&self.ghostty)
+        }
+        #[cfg(not(feature = "libghostty"))]
+        {
+            None
+        }
+    }
+}
 
 /// Identifier of the screen model that produced a [`TerminalSnapshot`].
 ///
@@ -174,7 +226,12 @@ impl ScreenBackend {
         }
     }
 
-    fn state(&self) -> ScreenState {
+    // Fallible only with the libghostty backend; the vt100 arm always succeeds.
+    #[cfg_attr(
+        not(feature = "libghostty"),
+        allow(clippy::unnecessary_wraps, reason = "the vt100-only build cannot fail")
+    )]
+    fn state(&self) -> Result<ScreenState, SnapshotError> {
         match self {
             Self::Vt100(parser) => {
                 let screen = parser.screen();
@@ -185,11 +242,11 @@ impl ScreenBackend {
                 if alternate_screen {
                     repaint.extend_from_slice(b"\x1b[?1049h");
                 }
-                repaint.extend_from_slice(b"\x1b[2J\x1b[H");
+                repaint.extend_from_slice(REPAINT_CLEAR);
                 repaint.extend_from_slice(&screen.input_mode_formatted());
                 repaint.extend_from_slice(&screen.contents_formatted());
                 repaint.extend_from_slice(&screen.cursor_state_formatted());
-                ScreenState {
+                Ok(ScreenState {
                     rows,
                     cols,
                     cursor_row,
@@ -198,10 +255,12 @@ impl ScreenBackend {
                     alternate_screen,
                     visible_text: screen.contents(),
                     repaint,
-                }
+                })
             }
+            // The libghostty backend can fail; the caller degrades to an
+            // error snapshot instead of panicking (issue #2593 finding 8).
             #[cfg(feature = "libghostty")]
-            Self::Ghostty(screen) => screen.state(),
+            Self::Ghostty(screen) => screen.state().map_err(SnapshotError::libghostty),
         }
     }
 }
@@ -211,6 +270,10 @@ pub struct TerminalTracker {
     backend: ScreenBackend,
     osc: OscTracker,
     anchors: AnchorLog,
+    /// The current size, updated on every resize: the degraded error snapshot
+    /// reports it, because on the error path a failed backend cannot be asked
+    /// (issue #2593 finding 8).
+    size: std::cell::Cell<(u16, u16)>,
 }
 
 impl std::fmt::Debug for TerminalTracker {
@@ -219,6 +282,7 @@ impl std::fmt::Debug for TerminalTracker {
             .field("size", &self.backend.size())
             .field("osc", &self.osc)
             .field("anchors", &self.anchors)
+            .field("tracked_size", &self.size.get())
             .finish()
     }
 }
@@ -249,10 +313,15 @@ impl TerminalTracker {
             backend,
             osc: OscTracker::new(),
             anchors: AnchorLog::default(),
+            size: std::cell::Cell::new((rows, cols)),
         }
     }
 
     /// The screen model this tracker runs.
+    ///
+    /// Public alongside [`with_model`](Self::with_model) and accepted by the
+    /// plan: `snapshot` fills `TerminalSnapshot::model` from it, and tests
+    /// assert the default of a build with it (issue #2593 finding 10).
     #[must_use]
     pub fn model(&self) -> ModelKind {
         match &self.backend {
@@ -316,12 +385,42 @@ impl TerminalTracker {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.backend.resize(rows, cols);
         self.anchors.clear();
+        // The degraded error snapshot reports this size: on the error path a
+        // failed backend cannot be asked, so this is the freshest size known
+        // without a fallible read. A rejected ghostty resize leaves the
+        // library at its old size, so this is the requested size there.
+        self.size.set((rows, cols));
     }
 
     /// Captures a complete state and ANSI repaint at `watermark`.
+    ///
+    /// Never panics: a backend read failure degrades to
+    /// [`degraded_snapshot`](Self::degraded_snapshot) with the failure
+    /// logged. This runs under the worker's output mutex, where a panic would
+    /// poison it (issue #2593 finding 8).
     #[must_use]
     pub fn snapshot(&self, watermark: u64) -> TerminalSnapshot {
-        let state = self.backend.state();
+        match self.try_snapshot(watermark) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "the screen state read failed; degrading to an error snapshot"
+                );
+                self.degraded_snapshot(watermark)
+            }
+        }
+    }
+
+    /// Captures a complete state and ANSI repaint at `watermark`, or reports
+    /// the backend read failure instead of degrading.
+    ///
+    /// The worker calls this one so a degraded snapshot is never cached: on
+    /// `Err` it serves [`degraded_snapshot`](Self::degraded_snapshot) without
+    /// storing it, and the next read retries the backend (issue #2593
+    /// finding 8).
+    pub fn try_snapshot(&self, watermark: u64) -> Result<TerminalSnapshot, SnapshotError> {
+        let state = self.backend.state()?;
         let mut ansi = Vec::new();
         // One bracket spans the whole repaint, so a terminal that implements
         // mode 2026 draws it as one frame however the bytes are chunked.
@@ -333,7 +432,7 @@ impl TerminalTracker {
             ansi.extend_from_slice(SYNC_END);
         }
 
-        TerminalSnapshot {
+        Ok(TerminalSnapshot {
             watermark,
             rows: state.rows,
             cols: state.cols,
@@ -346,6 +445,43 @@ impl TerminalTracker {
             title: self.osc.title.clone(),
             progress: self.osc.progress.clone(),
             visible_text: state.visible_text,
+            ansi,
+        })
+    }
+
+    /// The error snapshot of a failed backend read: the current size, empty
+    /// text, and the same `CSI 2J CSI H` clear the repaints carry, so an
+    /// attach on it still wipes the client screen (issue #2538 M13). The
+    /// caller must not cache it — the next read retries the backend.
+    ///
+    /// Not reachable through the safe API today: every read `state()` makes
+    /// is in bounds, so only an allocation- or I/O-class failure takes the
+    /// error path. Proving the degradation needs a fault-injection hook in
+    /// the sys crate (a test-only handle whose reads fail), which would drive
+    /// `try_snapshot` to `Err` and assert the clear, the fresh size and the
+    /// absent cache (issue #2593 finding 8; the row stays open until then).
+    #[must_use]
+    pub fn degraded_snapshot(&self, watermark: u64) -> TerminalSnapshot {
+        let (rows, cols) = self.size.get();
+        let mut ansi = Vec::new();
+        ansi.extend_from_slice(SYNC_BEGIN);
+        ansi.extend_from_slice(REPAINT_CLEAR);
+        if !self.osc.synchronized_output {
+            ansi.extend_from_slice(SYNC_END);
+        }
+        TerminalSnapshot {
+            watermark,
+            rows,
+            cols,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            alternate_screen: false,
+            model: self.model().into(),
+            format_version: CURRENT_FORMAT_VERSION,
+            title: self.osc.title.clone(),
+            progress: self.osc.progress.clone(),
+            visible_text: String::new(),
             ansi,
         }
     }
