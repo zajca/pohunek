@@ -159,6 +159,8 @@ pub const DATA_COLS: c_int = 1;
 pub const DATA_ROWS: c_int = 2;
 pub const DATA_CURSOR_X: c_int = 3;
 pub const DATA_CURSOR_Y: c_int = 4;
+/// Whether the cursor has a pending wrap (the next print soft-wraps).
+pub const DATA_CURSOR_PENDING_WRAP: c_int = 5;
 pub const DATA_ACTIVE_SCREEN: c_int = 6;
 pub const DATA_CURSOR_VISIBLE: c_int = 7;
 pub const DATA_KITTY_KEYBOARD_FLAGS: c_int = 8;

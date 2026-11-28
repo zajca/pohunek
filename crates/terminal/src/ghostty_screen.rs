@@ -11,7 +11,7 @@
 
 use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal, FORMATTER_EXTRAS_ATTACH};
 
-use crate::links::{combine_links, text_links, valid_uri, LinkSource, ScreenLink};
+use crate::links::{combine_links, text_links, AnchorLog, AnchorScreen, ScreenLink};
 use crate::snapshot::ScreenState;
 
 /// Repaint option: join soft-wrapped rows into one line.
@@ -116,45 +116,30 @@ impl GhosttyScreen {
         }
     }
 
-    /// The links on the visible screen: OSC 8 anchors read from the per-cell
-    /// state the library keeps, plus plain-text URLs in the cell text.
-    pub(crate) fn links(&self, max_url_bytes: usize) -> Vec<ScreenLink> {
+    /// The anchor-log view of this screen: size, cursor and the text between
+    /// two cells, read through the sys crate.
+    pub(crate) fn anchor_view(&self) -> AnchorView<'_> {
+        AnchorView {
+            terminal: &self.terminal,
+        }
+    }
+
+    /// The links on the visible screen: the byte-driven OSC 8 anchors the
+    /// shared [`AnchorLog`] records (same record as the vt100 backend, so a
+    /// scroll, clear, overwrite, resize or buffer switch drops them on either
+    /// model), plus plain-text URLs in the cell text.
+    pub(crate) fn links(&self, anchors: &AnchorLog, max_url_bytes: usize) -> Vec<ScreenLink> {
         let terminal = &self.terminal;
         let (rows, cols) = self.size();
         let mut wrapped = Vec::with_capacity(usize::from(rows));
-        let mut osc8 = Vec::new();
         for row in 0..rows {
             wrapped.push(
                 terminal
                     .row_wrapped(row)
                     .expect("libghostty read the row wrap flag"),
             );
-            let mut col = 0;
-            while col < cols {
-                let cell = terminal.cell(row, col).expect("libghostty read a cell");
-                if cell.hyperlink.is_empty() || !valid_uri(&cell.hyperlink) {
-                    col += 1;
-                    continue;
-                }
-                let url = cell.hyperlink;
-                let start = col;
-                while col < cols
-                    && terminal
-                        .cell(row, col)
-                        .expect("libghostty read a cell")
-                        .hyperlink
-                        == url
-                {
-                    col += 1;
-                }
-                osc8.push(ScreenLink {
-                    url,
-                    source: LinkSource::Osc8,
-                    row,
-                    col: start,
-                });
-            }
         }
+        let osc8 = anchors.live(&self.anchor_view());
         let text = text_links(
             rows,
             cols,
@@ -172,5 +157,122 @@ impl GhosttyScreen {
             max_url_bytes,
         );
         combine_links(osc8, text, max_url_bytes)
+    }
+}
+
+/// The [`AnchorScreen`] view of a libghostty screen, mirroring the vt100
+/// accessors (`size`, `cursor_position`, `contents_between`) over the active
+/// screen cells so the shared anchor log behaves the same on both models.
+pub(crate) struct AnchorView<'a> {
+    terminal: &'a HeadlessTerminal,
+}
+
+impl AnchorView<'_> {
+    fn wrapped(&self, row: u16) -> bool {
+        self.terminal
+            .row_wrapped(row)
+            .expect("libghostty read the row wrap flag")
+    }
+
+    /// The text of `width` cells of `row` from `start_col`, with vt100's
+    /// `Row::write_contents` layout: gap fill by column, a wide cell advances
+    /// two columns and its spacer emits nothing.
+    fn row_text(&self, row: u16, start_col: u16, width: u16) -> String {
+        let (_, cols) = self
+            .terminal
+            .size()
+            .expect("libghostty read the screen size");
+        let end = start_col.saturating_add(width).min(cols);
+        let mut text = String::new();
+        let mut prev_was_wide = false;
+        let mut prev_col = start_col;
+        let mut col = start_col;
+        while col < end {
+            let cell = self
+                .terminal
+                .cell(row, col)
+                .expect("libghostty read a cell");
+            if prev_was_wide {
+                prev_was_wide = false;
+                col += 1;
+                continue;
+            }
+            prev_was_wide = cell.wide;
+            if !cell.text.is_empty() {
+                for _ in 0..(col - prev_col) {
+                    text.push(' ');
+                }
+                prev_col = col;
+                text.push_str(&cell.text);
+                prev_col += if cell.wide { 2 } else { 1 };
+            }
+            col += 1;
+        }
+        text
+    }
+}
+
+impl AnchorScreen for AnchorView<'_> {
+    fn size(&self) -> (u16, u16) {
+        self.terminal
+            .size()
+            .expect("libghostty read the screen size")
+    }
+
+    fn cursor_position(&self) -> (u16, u16) {
+        let (row, col) = self.terminal.cursor().expect("libghostty read the cursor");
+        if self
+            .terminal
+            .cursor_pending_wrap()
+            .expect("libghostty read the cursor pending wrap")
+        {
+            // vt100 reports a pending-wrap cursor one past the last column,
+            // which the anchor log maps to the first cell of the next row.
+            let (_, cols) = self.size();
+            (row, cols)
+        } else {
+            (row, col)
+        }
+    }
+
+    fn contents_between(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> String {
+        let (_, cols) = self.size();
+        match start_row.cmp(&end_row) {
+            std::cmp::Ordering::Less => {
+                let mut contents = String::new();
+                let mut row = start_row;
+                while row <= end_row {
+                    if row == start_row {
+                        contents.push_str(&self.row_text(row, start_col, cols - start_col));
+                        if !self.wrapped(row) {
+                            contents.push('\n');
+                        }
+                    } else if row == end_row {
+                        contents.push_str(&self.row_text(row, 0, end_col));
+                    } else {
+                        contents.push_str(&self.row_text(row, 0, cols));
+                        if !self.wrapped(row) {
+                            contents.push('\n');
+                        }
+                    }
+                    row += 1;
+                }
+                contents
+            }
+            std::cmp::Ordering::Equal => {
+                if start_col < end_col {
+                    self.row_text(start_row, start_col, end_col - start_col)
+                } else {
+                    String::new()
+                }
+            }
+            std::cmp::Ordering::Greater => String::new(),
+        }
     }
 }

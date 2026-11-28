@@ -120,13 +120,13 @@ impl ScreenBackend {
         }
     }
 
-    /// Applies a completed OSC 8 sequence. Only the vt100 backend records
-    /// anchors: the Ghostty backend keeps hyperlink state per cell.
+    /// Applies a completed OSC 8 sequence to the shared anchor record, at the
+    /// cursor the backend has after the bytes fed so far.
     fn apply_hyperlink(&mut self, anchors: &mut AnchorLog, hyperlink: Hyperlink) {
         match self {
             Self::Vt100(parser) => anchors.apply(parser.screen(), hyperlink),
             #[cfg(feature = "libghostty")]
-            Self::Ghostty(_) => {}
+            Self::Ghostty(screen) => anchors.apply(&screen.anchor_view(), hyperlink),
         }
     }
 
@@ -224,7 +224,8 @@ impl TerminalTracker {
     /// of each buffer-switch sequence before it is applied, so an anchor
     /// records the cursor cell the hyperlink takes effect at, and a buffer
     /// switch drops the anchors wherever the output is split into chunks. The
-    /// Ghostty backend keeps OSC 8 state per cell and needs no anchor.
+    /// anchor record is shared and byte-driven on both backends, like the OSC
+    /// metadata.
     pub fn feed(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         while !rest.is_empty() {
@@ -246,8 +247,9 @@ impl TerminalTracker {
     ///
     /// OSC 8 anchors are reported while the text they covered is still in the
     /// cells where it was printed; a scroll, clear, overwrite, resize or
-    /// buffer switch drops them, because the VT model keeps no per-cell
-    /// hyperlink state. Nothing is restored when the buffer is switched back.
+    /// buffer switch drops them, on both backends (the anchor record is
+    /// byte-driven and shared). Nothing is restored when the buffer is
+    /// switched back.
     #[must_use]
     pub fn links(&self, max_url_bytes: usize) -> Vec<ScreenLink> {
         match &self.backend {
@@ -255,7 +257,7 @@ impl TerminalTracker {
                 screen_links(parser.screen(), &self.anchors, max_url_bytes)
             }
             #[cfg(feature = "libghostty")]
-            ScreenBackend::Ghostty(screen) => screen.links(max_url_bytes),
+            ScreenBackend::Ghostty(screen) => screen.links(&self.anchors, max_url_bytes),
         }
     }
 

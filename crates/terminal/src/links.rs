@@ -189,6 +189,44 @@ pub(crate) fn valid_uri(uri: &str) -> bool {
     uri.len() <= MAX_LINK_URL_BYTES && !uri.chars().any(is_unsafe_char)
 }
 
+/// The view of a screen the anchor log needs: size, cursor, and the text
+/// between two cells. Implemented for the vt100 screen and for the libghostty
+/// backend's view, so both models drive the same byte-driven anchor record.
+pub(crate) trait AnchorScreen {
+    /// Rows and columns of the visible screen.
+    fn size(&self) -> (u16, u16);
+    /// Where the next printed character lands.
+    fn cursor_position(&self) -> (u16, u16);
+    /// The text between two cells, as the model reports it.
+    fn contents_between(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> String;
+}
+
+impl AnchorScreen for vt100::Screen {
+    fn size(&self) -> (u16, u16) {
+        vt100::Screen::size(self)
+    }
+
+    fn cursor_position(&self) -> (u16, u16) {
+        vt100::Screen::cursor_position(self)
+    }
+
+    fn contents_between(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> String {
+        vt100::Screen::contents_between(self, start_row, start_col, end_row, end_col)
+    }
+}
+
 /// Bounded record of the OSC 8 anchors seen on one terminal.
 #[derive(Debug, Default)]
 pub(crate) struct AnchorLog {
@@ -198,7 +236,7 @@ pub(crate) struct AnchorLog {
 
 impl AnchorLog {
     /// Applies one hyperlink sequence at the cursor of `screen`.
-    pub(crate) fn apply(&mut self, screen: &vt100::Screen, hyperlink: Hyperlink) {
+    pub(crate) fn apply<S: AnchorScreen>(&mut self, screen: &S, hyperlink: Hyperlink) {
         let cursor = screen.cursor_position();
         if let Some(open) = self.open.take() {
             if let Some(anchor) = close(screen, open, cursor) {
@@ -227,7 +265,7 @@ impl AnchorLog {
     }
 
     /// Returns the anchors whose recorded text is still where it was.
-    fn live(&self, screen: &vt100::Screen) -> Vec<ScreenLink> {
+    pub(crate) fn live<S: AnchorScreen>(&self, screen: &S) -> Vec<ScreenLink> {
         let open = self
             .open
             .clone()
@@ -253,7 +291,7 @@ impl AnchorLog {
 ///
 /// After a write to the last column the VT model keeps the cursor one past it
 /// (a pending wrap), and the next character goes to column 0 of the next row.
-fn text_start(screen: &vt100::Screen, cursor: (u16, u16)) -> (u16, u16) {
+fn text_start<S: AnchorScreen>(screen: &S, cursor: (u16, u16)) -> (u16, u16) {
     let (_, cols) = screen.size();
     if cursor.1 >= cols {
         (cursor.0.saturating_add(1), 0)
@@ -263,7 +301,7 @@ fn text_start(screen: &vt100::Screen, cursor: (u16, u16)) -> (u16, u16) {
 }
 
 /// Closes `open` at `end`, or `None` when it covers no visible text.
-fn close(screen: &vt100::Screen, open: OpenAnchor, end: (u16, u16)) -> Option<Anchor> {
+fn close<S: AnchorScreen>(screen: &S, open: OpenAnchor, end: (u16, u16)) -> Option<Anchor> {
     let text = anchor_text(screen, open.start, end)?;
     Some(Anchor {
         url: open.url,
@@ -277,7 +315,7 @@ fn close(screen: &vt100::Screen, open: OpenAnchor, end: (u16, u16)) -> Option<An
 ///
 /// `None` for an empty or whitespace-only span, a span outside the screen,
 /// or one longer than [`MAX_ANCHOR_TEXT_BYTES`].
-fn anchor_text(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> Option<String> {
+fn anchor_text<S: AnchorScreen>(screen: &S, start: (u16, u16), end: (u16, u16)) -> Option<String> {
     let (rows, cols) = screen.size();
     if start >= end || start.0 >= rows || end.0 >= rows || start.1 >= cols || end.1 > cols {
         return None;

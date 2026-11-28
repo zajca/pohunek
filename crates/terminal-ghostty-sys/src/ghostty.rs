@@ -339,6 +339,16 @@ impl HeadlessTerminal {
         ))
     }
 
+    /// Whether the cursor has a pending wrap: the next printed character
+    /// soft-wraps to the next row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GhosttyError`] when the read fails.
+    pub fn cursor_pending_wrap(&self) -> Result<bool, GhosttyError> {
+        self.get(ffi::DATA_CURSOR_PENDING_WRAP, "get cursor pending wrap")
+    }
+
     /// Whether the cursor is visible.
     ///
     /// # Errors
