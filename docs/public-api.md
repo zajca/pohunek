@@ -2465,8 +2465,8 @@ Two further optional members name the snapshot's provenance: `screen_model`
 and `format_version` (a number, currently `1`) is the wire format version of
 the snapshot payload. A daemon or worker that predates them omits both, and
 their absence reads as `"vt100"` / `1`, so an older client simply ignores the
-extra keys. In this release the default screen model is still `vt100`; the
-`libghostty` model is selected per build and reports itself here.
+extra keys. The default screen model is `libghostty`; the vt100 product is the
+`--no-default-features` fallback build and reports `"vt100"` here.
 
 Visible lines are plain UTF-8 terminal cells with control sequences removed.
 They cover the active screen only: scrolled-off history is never included, so a

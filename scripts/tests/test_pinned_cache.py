@@ -445,6 +445,9 @@ class NpmScenarioTests(Scenario):
     def run_job(self, runner, runtime, steps=None):
         job, title, *_ = self.RUNTIMES[runtime]
         steps = steps or harness.job_steps(ci_text(), job)
+        # The libghostty-vt action needs a Zig fixture this npm scenario does
+        # not stage; the pinned library is orthogonal to the npm cache flow.
+        steps = [step for step in steps if step.get("name") != "Provide libghostty-vt"]
         runner.run_steps(steps, {}, until=f"Save the pinned {title} npm tree")
 
     def test_a_miss_installs_through_the_retry_helper_and_a_later_hit_installs_nothing(self):

@@ -247,6 +247,41 @@ env:
   PACKAGE_BUMP_RELEASE_LIMIT: 200
 
 jobs:
+  # The libghostty-vt library for aarch64-apple-darwin, cross-built on Linux
+  # (the pinned Zig is an x86_64 Linux binary); the macOS lanes download it
+  # through `libghostty-vt-macos` as the `libghostty-vt-darwin-ci` artifact.
+  # It shares its cache entry with the producer jobs of release-build.yml and
+  # release.yml (issue #2538).
+  libghostty-darwin:
+    name: libghostty-vt for aarch64-apple-darwin
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && (needs.changes.outputs.macos == 'true' || needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true' || needs.changes.outputs.sdk_macos == 'true'))) }}
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+          export-env: "false"
+
+      - name: Upload the library for the macOS lanes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-darwin-ci
+          path: ${{ steps.library.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   platform-contracts:
     name: platform contracts (arm64)
     # macOS runners are costly (issue #125): run in the main/nightly tiers or
@@ -254,7 +289,7 @@ jobs:
     # change via the paths filter. A narrowed
     # selection whose lane part selects no lane package skips it (#1225).
     if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') }}
-    needs: [changes, test-selection, reuse]
+    needs: [changes, test-selection, libghostty-darwin, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -274,6 +309,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cross-built library for aarch64-apple-darwin, uploaded by the
+      # `libghostty-darwin` producer job (cached on a hit; issue #2538).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-ci
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
@@ -462,7 +504,7 @@ jobs:
   macos-tier:
     name: macOS tier packages (arm64)
     # No pull_request branch: this job never starts on a pull request.
-    needs: reuse
+    needs: [libghostty-darwin, reuse]
     if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-tier') }}
     runs-on: macos-15
     permissions:
@@ -477,6 +519,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cross-built library for aarch64-apple-darwin, uploaded by the
+      # `libghostty-darwin` producer job (cached on a hit; issue #2538).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-ci
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
@@ -549,7 +598,7 @@ jobs:
   macos-release-build:
     name: macOS release daemon build (macos-15)
     if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-release-build') }}
-    needs: [changes, reuse]
+    needs: [changes, libghostty-darwin, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -564,6 +613,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cross-built library for aarch64-apple-darwin, uploaded by the
+      # `libghostty-darwin` producer job (cached on a hit; issue #2538).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-ci
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
@@ -625,7 +681,7 @@ jobs:
     # supported build target that CI does not run (issue #1224).
     name: macOS package install and upgrade (macos-15)
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.macos_package == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-package') }}
-    needs: [changes, macos-release-build, reuse]
+    needs: [changes, macos-release-build, libghostty-darwin, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -638,6 +694,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cross-built library for aarch64-apple-darwin, uploaded by the
+      # `libghostty-darwin` producer job (cached on a hit; issue #2538).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-ci
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
@@ -926,6 +989,13 @@ jobs:
           fetch-depth: ${{ github.event_name != 'pull_request' && 1 || 0 }}
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/setup-mold
@@ -1434,6 +1504,9 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/pinned-cache/**'
+              - '.github/actions/libghostty-vt/**'
+              - '.github/actions/libghostty-vt-macos/**'
+              - '.github/actions/setup-zig/**'
             # Companion counting filter of `macos` (issue #2599): the `tests/`
             # subtrees of exactly the crates `macos` owns, nothing else. The
             # `macos` job output compares its `_count` with `macos_count`: when
@@ -1478,6 +1551,7 @@ jobs:
               - '.github/workflows/release.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/libghostty-vt-macos/**'
             # The SDK workspace runs natively on Apple Silicon against the
             # real macOS daemon (issue #103): PRs run it for SDK workspace
             # inputs; main and nightly also exercise the Rust binaries.
@@ -1489,6 +1563,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/libghostty-vt-macos/**'
             # Narrow PR filter of the pinned Hermes compatibility job on macOS
             # (issue #125): the locked runtime metadata, the Hermes package,
             # the CLI's Hermes integration, the Hermes harness of xtask, the
@@ -1520,6 +1595,7 @@ jobs:
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-uv/**'
               - '.github/actions/pinned-cache/**'
+              - '.github/actions/libghostty-vt-macos/**'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
             # Covers both generators' inputs and outputs: the main protocol
@@ -1537,6 +1613,8 @@ jobs:
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-mold/**'
               - '.github/actions/pinned-cache/**'
+              - '.github/actions/libghostty-vt/**'
+              - '.github/actions/setup-zig/**'
             # The release build catches a broken release profile before
             # tagging. That is caused by profile/manifest, lockfile, Cargo
             # configuration, toolchain, or packaging changes; ordinary source
@@ -1557,6 +1635,8 @@ jobs:
               - '.github/actions/setup-sccache/**'
               - '.github/actions/setup-mold/**'
               - '.github/actions/pinned-cache/**'
+              - '.github/actions/libghostty-vt/**'
+              - '.github/actions/setup-zig/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, the scripts the rows
@@ -1936,6 +2016,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -2111,6 +2198,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Restore the pinned cargo-nextest
         uses: ./.github/actions/pinned-cache
         with:
@@ -2385,6 +2479,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -2499,6 +2600,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -2552,6 +2660,13 @@ jobs:
       # Bootstrap python3 for the provisioner's helper programs and the shell
       # tests. The Hermes venv itself runs the standalone CPython that the
       # provisioner pins and verifies, never this interpreter.
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install Python
         uses: actions/setup-python@v5
         with:
@@ -2889,6 +3004,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -3024,6 +3146,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -3161,6 +3290,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Read the Pi lock
         id: lock
         shell: bash
@@ -3318,6 +3454,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Read the Codex lock
         id: lock
         shell: bash
@@ -3473,6 +3616,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Read the Claude Code lock
         id: lock
         shell: bash
@@ -3614,7 +3764,7 @@ jobs:
     # core inputs are covered by the main and nightly tiers. The Linux
     # `hermes-package` job follows the runtime package selection instead.
     if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.hermes_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos') }}
-    needs: [changes, macos-release-build, reuse]
+    needs: [changes, macos-release-build, libghostty-darwin, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -3633,6 +3783,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cross-built library for aarch64-apple-darwin, uploaded by the
+      # `libghostty-darwin` producer job (cached on a hit; issue #2538).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-ci
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
@@ -4055,6 +4212,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
@@ -4256,7 +4420,7 @@ jobs:
   sdk-macos:
     name: SDK workspace (macOS arm64)
     if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.sdk_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'sdk-macos') }}
-    needs: [changes, reuse]
+    needs: [changes, libghostty-darwin, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -4270,6 +4434,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The cross-built library for aarch64-apple-darwin, uploaded by the
+      # `libghostty-darwin` producer job (cached on a hit; issue #2538).
+      # Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-ci
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
@@ -4378,6 +4549,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
 
@@ -4568,3 +4746,44 @@ jobs:
         run: |
           set -euo pipefail
           echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+  # The vt100 fallback lane (issue #2538 P3b): the default build links
+  # libghostty-vt, so this job proves the opposite product still builds and
+  # tests green with `--no-default-features` — no Zig on PATH and no ghostty
+  # crate in the worker's dependency tree, i.e. no C library linked.
+  terminal-vt100-fallback:
+    name: terminal vt100 fallback (--no-default-features)
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+
+      - name: Refuse a Zig on PATH
+        run: |
+          set -euo pipefail
+          if command -v zig >/dev/null 2>&1; then
+            echo "::error::the vt100 fallback lane must run without Zig on PATH"
+            exit 1
+          fi
+
+      # The S3 row new_reports_libghostty_in_its_snapshot_after_the_p3b_flip
+      # pins the flipped default and is skipped here: the fallback build
+      # reports vt100 by design (pinned by with_model_selects_the_requested_backend).
+      - name: Test pohunek-terminal without default features
+        run: cargo test -p pohunek-terminal --no-default-features -- --skip new_reports_libghostty_in_its_snapshot_after_the_p3b_flip
+
+      - name: Assert the worker tree has no ghostty crate
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p pohunek-session-worker --no-default-features -e normal)"
+          printf '%s\n' "$tree"
+          if printf '%s\n' "$tree" | grep -q ghostty; then
+            echo "::error::the --no-default-features worker tree links a ghostty crate"
+            exit 1
+          fi

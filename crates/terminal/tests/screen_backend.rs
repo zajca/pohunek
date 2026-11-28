@@ -220,13 +220,14 @@ fn with_model_selects_the_requested_backend() {
     }
 }
 
-/// S3 (P3b row, red by design in P3a): after the P3b flip
-/// (`default = ["libghostty"]` in `crates/terminal/Cargo.toml`),
-/// `TerminalTracker::new` reports the libghostty model in its snapshot. The
-/// flip is off in this slice, so the default build reports vt100 and this
-/// row stays ignored until P3b lands it.
+/// S3 (P3b row, live since the flip): with `default = ["libghostty"]` in
+/// `crates/terminal/Cargo.toml`, `TerminalTracker::new` reports the libghostty
+/// model in its snapshot. On the pre-flip default (`default = []`) this row
+/// fails — that is the red-on-old evidence of the flip — and the
+/// `--no-default-features` fallback build reports vt100, pinned by
+/// `with_model_selects_the_requested_backend`, so the fallback CI lane skips
+/// this row.
 #[test]
-#[ignore = "flipped in P3b (issue #2538): default = [\"libghostty\"] lands there"]
 fn new_reports_libghostty_in_its_snapshot_after_the_p3b_flip() {
     let snapshot = TerminalTracker::new(4, 20).snapshot(0);
     assert_eq!(snapshot.model, ScreenModelId::Libghostty);

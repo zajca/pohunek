@@ -1067,9 +1067,9 @@ attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
 
 The repaint is produced by the worker's screen model, `TerminalTracker` in
-`crates/terminal`: the vt100 parser by default, or libghostty-vt through
-`crates/terminal-ghostty-sys` when the product is built with the `libghostty`
-cargo feature (issue #2538). Both models emit the same prologue — the
+`crates/terminal`: libghostty-vt by default through
+`crates/terminal-ghostty-sys`, or the vt100 parser when the product is built
+with `--no-default-features` (issue #2538). Both models emit the same prologue — the
 synchronized-output bracket, then the screen switch (`?1049h` on the
 alternate screen) and `CSI 2J CSI H` — so an attach clears the client screen
 on either model; only the body is model-specific, and the libghostty body

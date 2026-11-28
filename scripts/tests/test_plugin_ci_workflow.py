@@ -98,10 +98,10 @@ class PluginCiWorkflowTests(unittest.TestCase):
                 else:
                     self.assertRegex(canonical_action(action), PINNED)
 
-    def test_exactly_one_job_holds_a_read_only_token(self):
+    def test_every_read_only_token_job_is_known(self):
         body = self.text.partition("\njobs:\n")[2]
         names = re.findall(r"(?m)^  ([a-z][a-z0-9-]*):$", body)
-        self.assertEqual(names, ["check"])
+        self.assertEqual(names, ["libghostty-darwin", "check"])
         self.assertIn("permissions:\n      contents: read\n", body)
         for scope in ("id-token:", "attestations:", "contents: write", "secrets."):
             self.assertNotIn(scope, body)
@@ -176,7 +176,7 @@ class PluginCiWorkflowTests(unittest.TestCase):
         body = self.text.partition("\njobs:\n")[2]
         job_env = body.partition("steps:")[0]
         self.assertNotIn("GH_TOKEN", job_env)
-        self.assertEqual(body.count("GH_TOKEN: ${{ github.token }}"), 3)
+        self.assertEqual(body.count("GH_TOKEN: ${{ github.token }}"), 4)
 
     def test_the_upstream_install_contract_is_documented(self):
         header = self.text.partition("\njobs:\n")[0]

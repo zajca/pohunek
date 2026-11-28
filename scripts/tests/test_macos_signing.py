@@ -408,7 +408,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("packaging/smoke-hermes-plugin-release", self.release)
         self.assertIn('"$root/$binary" --version', self.release)
         self.assertNotIn("action-gh-release", self.stage + self.package + self.release)
-        self.assertIn("needs: [tier-evidence, package-macos]", self.release)
+        self.assertIn("needs: [tier-evidence, package-macos, libghostty-darwin]", self.release)
         self.assertIn("needs: [tier-evidence, stage-macos]", self.package)
 
     def test_the_evidence_workflow_attests_and_assembles_the_macos_archives(self):

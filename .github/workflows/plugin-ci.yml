@@ -73,6 +73,86 @@ on:
 permissions: {}
 
 jobs:
+  # The libghostty-vt library for aarch64-apple-darwin, cross-built on Linux
+  # for each row's core ref; the `check` job's macOS legs download it through
+  # `libghostty-vt-macos` (issue #2538).
+  libghostty-darwin:
+    name: libghostty-vt for aarch64-apple-darwin (${{ matrix.row }})
+    strategy:
+      fail-fast: false
+      matrix:
+        row: ${{ fromJson(inputs.rows) }}
+    runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve the core ref of the row
+        env:
+          CORE_TAG: ${{ inputs.core-tag }}
+          ROW: ${{ matrix.row }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$ROW" in
+            release) ref="refs/tags/$CORE_TAG" ;;
+            nightly) ref="refs/heads/main" ;;
+            previous-minor) ref="" ;;
+            *) echo "unknown row: $ROW (want release, previous-minor or nightly)" >&2; exit 1 ;;
+          esac
+          # The previous-minor row builds from the newest release of the
+          # previous minor: the greatest release tag below the core tag
+          # whose minor line differs from the core tag's own.
+          if [ "$ROW" = previous-minor ]; then
+            minor_of() { printf '%s' "$1" | sed -E 's/^v([0-9]+)\.([0-9]+)\.[0-9]+$/\1.\2/'; }
+            core_minor="$(minor_of "$CORE_TAG")"
+            # Every stable tag on another minor line, ordered so the core
+            # tag itself marks the boundary: the last tag before it is the
+            # newest release of the previous minor, however many newer
+            # minors exist. `sort -V` compares versions, so `v0.9.0` sorts
+            # below `v0.44.0`, which a lexical compare would get wrong.
+            tag="$(gh release list --repo zajca/pohunek --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | while IFS= read -r candidate; do [ "$(minor_of "$candidate")" != "$core_minor" ] && printf '%s\n' "$candidate"; done | { printf '%s\n' "$CORE_TAG"; cat; } | sort -Vu | awk -v tag="$CORE_TAG" '$0 == tag { exit } { line = $0 } END { print line }')"
+            [ -n "$tag" ] || { echo "no release of a previous minor below $CORE_TAG" >&2; exit 1; }
+            ref="refs/tags/$tag"
+          fi
+          printf 'ref=%s\n' "$ref" >>"$GITHUB_ENV"
+
+      - name: Check out the core ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: ${{ env.ref }}
+          path: core
+          persist-credentials: false
+
+      # The libghostty-vt action and its scripts live in the checked-out core;
+      # the action reads them from the workspace root, so stage them there
+      # (issue #2538).
+      - name: Stage the libghostty-vt action and scripts of the core checkout
+        run: |
+          set -euo pipefail
+          mkdir -p .github/actions scripts
+          cp -R core/.github/actions/libghostty-vt core/.github/actions/libghostty-vt-macos .github/actions/
+          cp -R core/.github/actions/setup-zig core/.github/actions/pinned-cache .github/actions/
+          cp core/scripts/build-libghostty-vt core/scripts/libghostty-vt-abi-probe.c core/scripts/libghostty-vt.pin.toml scripts/
+
+      - name: Provide libghostty-vt
+        id: library
+        uses: ./core/.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: aarch64-apple-darwin
+          export-env: "false"
+
+      - name: Upload the library for the macOS legs of the row
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: libghostty-vt-darwin-plugin-ci-${{ matrix.row }}
+          path: ${{ steps.library.outputs.dir }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
   check:
     name: plugin ci
     strategy:
@@ -89,6 +169,7 @@ jobs:
     # it holds no token that could sign or publish.
     permissions:
       contents: read
+    needs: [libghostty-darwin]
     steps:
       - name: Check out the plugin repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -156,6 +237,30 @@ jobs:
           ref: ${{ env.ref }}
           path: core
           persist-credentials: false
+
+      # The libghostty-vt action and its scripts live in the checked-out core;
+      # the action reads them from the workspace root, so stage them there
+      # (issue #2538).
+      - name: Stage the libghostty-vt action and scripts of the core checkout
+        run: |
+          set -euo pipefail
+          mkdir -p .github/actions scripts
+          cp -R core/.github/actions/libghostty-vt core/.github/actions/libghostty-vt-macos .github/actions/
+          cp -R core/.github/actions/setup-zig core/.github/actions/pinned-cache .github/actions/
+          cp core/scripts/build-libghostty-vt core/scripts/libghostty-vt-abi-probe.c core/scripts/libghostty-vt.pin.toml scripts/
+
+      - name: Provide libghostty-vt
+        if: matrix.platform == 'x86_64-unknown-linux-gnu'
+        uses: ./core/.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      - name: Provide libghostty-vt (macOS)
+        if: matrix.platform == 'aarch64-apple-darwin'
+        uses: ./core/.github/actions/libghostty-vt-macos
+        with:
+          artifact: libghostty-vt-darwin-plugin-ci-${{ matrix.row }}
 
       # Installs the channel the checked-out core pins in its rust-toolchain.toml.
       - name: Install the pinned Rust toolchain

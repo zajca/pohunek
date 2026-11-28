@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Workspace automation for pohunek."
 
 [features]
+default = ["libghostty"]
 # The libghostty-vt screen model of the worker terminal snapshot (issue
 # #2538); forwarded so one feature switch controls the whole product.
 libghostty = ["pohunek-terminal/libghostty"]

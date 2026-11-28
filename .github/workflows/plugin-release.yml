@@ -54,6 +54,23 @@ jobs:
 
       # Only a tag of the core repository: a branch or a bare commit sha never
       # names the xtask that builds the archive.
+      # The libghostty-vt action and its scripts live in the checked-out core;
+      # the action reads them from the workspace root, so stage them there
+      # (issue #2538).
+      - name: Stage the libghostty-vt action and scripts of the core checkout
+        run: |
+          set -euo pipefail
+          mkdir -p .github/actions scripts
+          cp -R core/.github/actions/setup-zig core/.github/actions/pinned-cache .github/actions/
+          cp core/scripts/build-libghostty-vt core/scripts/libghostty-vt-abi-probe.c core/scripts/libghostty-vt.pin.toml scripts/
+
+      # The pinned static library of the host target (cached on a hit; issue
+      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
+      - name: Provide libghostty-vt
+        uses: ./core/.github/actions/libghostty-vt
+        timeout-minutes: 30
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Check out the core tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
