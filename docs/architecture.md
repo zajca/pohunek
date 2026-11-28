@@ -653,16 +653,14 @@ annotation, but never a native reference: it cannot reach the launch identity,
 the pending launch claims, the native reference claim or the resume binding. The
 journal counts every change of the active identity or its release in
 `active_identity_revision`, and the v8 snapshot reports the revision, label,
-origin and annotation. A connection that negotiated v7 sees none of those fields,
-so the claim reads as a provider-only active claim there and in an older reader
-of the journal.
+origin and annotation. An older reader of the journal sees none of those fields,
+so the claim reads as a provider-only active claim there.
 
 Private worker protocol v8 also carries prompt delivery evidence. The write
 acknowledgement reports `submit_mark_ns`, the worker's `CLOCK_MONOTONIC` reading
 taken just before the plan's last fragment is written, and the inspect snapshot
 reports `prompt_accepted_sequence`, the last applied prompt report of the
-runtime. A connection that negotiated v7 sees neither field, and the daemon then
-never matches an acceptance to a submission.
+runtime.
 
 Two properties of the private worker protocol carry the daemon's proof that a
 forwarded request was rejected, so a change to either needs the settlement rule

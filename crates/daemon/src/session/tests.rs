@@ -30654,7 +30654,7 @@ async fn foreign_release_snapshot(
 /// worker without identity revisions and for one with revisions.
 #[tokio::test]
 async fn a_worker_release_of_another_process_leaves_a_memory_claim_and_its_activity() {
-    for (label, revision) in [("v7", None), ("v8", Some(1))] {
+    for (label, revision) in [("journal-snapshot", None), ("v8", Some(1))] {
         let (registry, inspector, created) =
             mock_direct_codex_registry(&format!("claim-foreign-{label}")).await;
         let _ = root_start_identity(&inspector, &created);
@@ -30874,12 +30874,13 @@ async fn a_forwarded_report_leaves_one_origin_on_both_records() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
-/// V7-A: a worker without identity revisions cannot be forwarded to, so a
-/// public report of the process it journaled stays the active claim across
-/// syncs and a public release still ends it.
+/// Journal-snapshot case A: a revision-less (offline journal) snapshot cannot
+/// be forwarded to, so a public report of the process it journaled stays the
+/// active claim across syncs and a public release still ends it.
 #[tokio::test]
-async fn a_sync_from_a_protocol_7_worker_keeps_a_newer_public_report() {
-    let (registry, inspector, created) = mock_direct_codex_registry("claim-v7-overlay").await;
+async fn a_sync_from_a_journal_snapshot_worker_keeps_a_newer_public_report() {
+    let (registry, inspector, created) =
+        mock_direct_codex_registry("claim-journal-snapshot-overlay").await;
     let _ = root_start_identity(&inspector, &created);
     let worker = session_worker(&registry, &created.id).await;
     let mut snapshot = worker.inspect().await.expect("inspect worker");
@@ -30940,11 +30941,13 @@ async fn a_sync_from_a_protocol_7_worker_keeps_a_newer_public_report() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
-/// V7-B: a protocol 7 snapshot of another process generation behind the same
-/// pid replaces the memory report instead of leaving it to the old exit watch.
+/// Journal-snapshot case B: a revision-less (offline journal) snapshot of
+/// another process generation behind the same pid replaces the memory report
+/// instead of leaving it to the old exit watch.
 #[tokio::test]
-async fn a_protocol_7_snapshot_of_another_process_generation_replaces_the_memory_report() {
-    let (registry, inspector, created) = mock_direct_codex_registry("claim-v7-generation").await;
+async fn a_journal_snapshot_of_another_process_generation_replaces_the_memory_report() {
+    let (registry, inspector, created) =
+        mock_direct_codex_registry("claim-journal-snapshot-generation").await;
     let start = root_start_identity(&inspector, &created);
     let worker = session_worker(&registry, &created.id).await;
     let mut snapshot = worker.inspect().await.expect("inspect worker");
