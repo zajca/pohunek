@@ -55,6 +55,7 @@ WIRED_LANES = {
     "ci.yml:doctests",
     "ci.yml:feature-matrix",
     "ci.yml:udeps",
+    "gate-tests.yml:tests",
 }
 # Jobs that never link the library.
 EXEMPT_LANES = {
@@ -84,7 +85,6 @@ PENDING_LANES = {
     "ci.yml:build-bins",
     "ci.yml:sdk-macos",
     "ci.yml:docs",
-    "gate-tests.yml:tests",
     # Both build the core checkout of a plugin repository; the action lives in
     # that checkout (`core/.github/actions/...`).
     "plugin-ci.yml:check",
@@ -179,6 +179,30 @@ class LaneGuardTests(unittest.TestCase):
         for job in sorted(EXEMPT_LANES | PENDING_LANES):
             with self.subTest(job=job):
                 self.assertFalse(lanes[job], f"{job} uses the action: move it to WIRED_LANES")
+
+    def test_the_action_runs_before_the_first_all_features_cargo_command(self):
+        # A lane whose cargo commands pass --all-features compile
+        # pohunek-terminal-ghostty-sys's build script, which fails without
+        # LIBGHOSTTY_VT_DIR, so the action step must precede the first such
+        # command (issue #2602).
+        jobs = workflow_jobs()
+        for job in sorted(WIRED_LANES):
+            steps = jobs[job]
+            action = [i for i, step in enumerate(steps) if step.get("uses") in ACTIONS_USED]
+            all_features = [
+                i
+                for i, step in enumerate(steps)
+                if CARGO_LANE.search(str(step.get("run", "")))
+                and "--all-features" in str(step.get("run", ""))
+            ]
+            with self.subTest(job=job):
+                self.assertTrue(action, f"{job} has no libghostty-vt action step")
+                if all_features:
+                    self.assertLess(
+                        min(action),
+                        min(all_features),
+                        f"{job} provides the library after its first --all-features cargo command",
+                    )
 
     def test_the_linux_lanes_build_the_target_they_link(self):
         jobs = workflow_jobs()

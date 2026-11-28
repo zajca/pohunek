@@ -1727,6 +1727,8 @@ class SharedGateTests(ReleaseWorkflowFiles):
         ".github/actions/setup-mold/**",
         ".github/actions/setup-sccache/**",
         ".github/actions/pinned-cache/**",
+        ".github/actions/setup-zig/**",
+        ".github/actions/libghostty-vt/**",
     )
     # The call paths the filter must also cover: the called workflow and
     # every local composite it nests reach their files when the gate runs,
@@ -1737,6 +1739,8 @@ class SharedGateTests(ReleaseWorkflowFiles):
         ".github/actions/setup-mold/**",
         ".github/actions/setup-rust/**",
         ".github/actions/setup-sccache/**",
+        ".github/actions/setup-zig/**",
+        ".github/actions/libghostty-vt/**",
     )
     CI_IF = (
         "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && "
@@ -1790,12 +1794,16 @@ class SharedGateTests(ReleaseWorkflowFiles):
         called = self.gate_tests_jobs["tests"]
         declared = set(re.findall(r"(?m)^\s*uses:\s*(\./\.github/actions/\S+)\s*$", called))
         self.assertIn("./.github/actions/pinned-cache", declared)
-        for use in declared:
+        pending = set(declared)
+        while pending:
+            use = pending.pop()
             nested = set(re.findall(
                 r"(?m)^\s*uses:\s*(\./\.github/actions/\S+)\s*$",
                 (ROOT / use[2:] / "action.yml").read_text(),
             ))
+            fresh = nested - declared
             declared |= nested
+            pending |= fresh
         covered = {f"{use[2:]}/**" for use in declared} | {".github/workflows/gate-tests.yml"}
         self.assertEqual(covered, set(self.GATE_CALLED_USES))
         missing = covered - filter_paths(self.ci, "release_gate")
