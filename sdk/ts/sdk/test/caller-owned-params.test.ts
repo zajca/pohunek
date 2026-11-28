@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { SESSION_LIST_PAGE_SIZE } from "@pohunek/protocol";
 import {
   connectTcp,
   type SessionListFilter,
@@ -51,6 +52,7 @@ describe("caller-owned parameters over a real TCP daemon", () => {
       expect(sent["params"]).toEqual({
         filters: [{ key: "state", value: "running" }],
         note: "original",
+        limit: SESSION_LIST_PAGE_SIZE,
       });
       await client.close();
     } finally {

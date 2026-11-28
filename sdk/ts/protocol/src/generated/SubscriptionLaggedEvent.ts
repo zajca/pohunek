@@ -5,9 +5,9 @@ import type { SubscriptionChannel } from "./SubscriptionChannel";
 /**
  * Payload of a `subscription_lagged` event.
  *
- * The event precedes every later event on the connection: the subscriber
- * missed `skipped` events of `channel` and re-seeds from the list method of
- * that channel.
+ * A lag is per channel, never per connection: the event precedes every later
+ * event of `channel` only. The subscriber missed `skipped` events of `channel`
+ * and re-seeds from the list method of that channel.
  */
 export type SubscriptionLaggedEvent = {
   /**
@@ -17,5 +17,5 @@ export type SubscriptionLaggedEvent = {
   /**
    * Number of events dropped.
    */
-  skipped: bigint;
+  skipped: number;
 };

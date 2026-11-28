@@ -5,7 +5,7 @@ import type { Readable } from "node:stream";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, jest, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, CLIENT_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
+import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, SESSION_LIST_PAGE_SIZE, CLIENT_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
 import { startTestRelay, type DaemonTarget, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import {
   Client,
@@ -78,7 +78,10 @@ describe("WebSocket transport through relay", () => {
       const sent = parseRequestLine(await fixture.daemon.nextRequest());
       expect(sent["v"]).toEqual(CLIENT_PROTOCOL_VERSIONS);
       expect(sent["method"]).toBe("session.list");
-      expect(sent["params"]).toEqual({ filters: [{ key: "state", value: "running" }] });
+      expect(sent["params"]).toEqual({
+        filters: [{ key: "state", value: "running" }],
+        limit: SESSION_LIST_PAGE_SIZE,
+      });
       expect(String(sent["id"])).toStartWith("sdk-session.list-");
     } finally {
       await fixture.close();

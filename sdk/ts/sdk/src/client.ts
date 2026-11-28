@@ -9,8 +9,12 @@ import {
   type CommandRunParams,
   type CommandRunResult,
   type Methods,
+  type ProjectInfo,
+  type ProjectListParams,
   type ProtocolVersion,
   type ProtocolVersionRange,
+  type SessionInfo,
+  type SessionListParams,
   type SessionOutputParams,
   type SessionOutputResult,
   type SessionInputParams,
@@ -30,6 +34,7 @@ import { ClientError, type LifecycleOperation, type ObservedProtocolError } from
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
 import { hasValidWireOrigin, type RequestOrigin } from "./origin";
+import { compareStrings, everyPage, PROJECT_LIST, SESSION_LIST, type PageSource } from "./paging";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
 import {
@@ -183,6 +188,12 @@ export class Client {
         SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
       );
     }
+    if (method === "session.list") {
+      return this.listSessions(params as SessionListParams);
+    }
+    if (method === "project.list") {
+      return this.listProjects(params as ProjectListParams);
+    }
     if (method === "session.input" && isWaitingSessionInput(params)) {
       return this.sessionInput(params);
     }
@@ -196,6 +207,47 @@ export class Client {
       return this.sessionOutput(params as SessionOutputParams);
     }
     return this.callDirect(method, params);
+  }
+
+  /**
+   * Lists sessions, following `cursor` pages like `Client::session_list`
+   * (`crates/client/src/transport.rs`). An explicit `limit` is one request; the
+   * missing `limit` is what makes the walk, so a caller that wants one page
+   * passes one. The set is ordered by id, so the page order is the answer.
+   */
+  private async listSessions(params: SessionListParams | null): Promise<SessionInfo[]> {
+    const query: SessionListParams = params ?? {};
+    if (query.limit !== undefined) {
+      return this.callDirect("session.list", query);
+    }
+    const source: PageSource<SessionInfo> = {
+      // Mirrors `SessionPages::fetch`: the walk owns `limit` and `cursor`.
+      fetch: (limit, cursor) => this.callDirect("session.list", pagedParams(query, limit, cursor)),
+    };
+    return everyPage(SESSION_LIST, source);
+  }
+
+  /**
+   * Lists projects, following `cursor` pages like `Client::project_list`
+   * (`crates/client/src/transport.rs`). An explicit `limit` is one request, in
+   * id order; without one the walked set is returned ordered by label, then id,
+   * because the pages follow the immutable id.
+   */
+  private async listProjects(params: ProjectListParams | null): Promise<ProjectInfo[]> {
+    const query: ProjectListParams = params ?? {};
+    if (query.limit !== undefined) {
+      return this.callDirect("project.list", query);
+    }
+    const source: PageSource<ProjectInfo> = {
+      // Mirrors `ProjectPages::fetch`: the walk owns `limit` and `cursor`.
+      fetch: (limit, cursor) => this.callDirect("project.list", pagedParams(query, limit, cursor)),
+    };
+    const projects = await everyPage(PROJECT_LIST, source);
+    // Mirrors `Client::project_list`: pages follow the id, the listing reads by label.
+    projects.sort(
+      (a, b) => compareStrings(a.label, b.label) || compareStrings(a.id, b.id),
+    );
+    return projects;
   }
 
   private async callDirect<K extends keyof Methods>(
@@ -927,6 +979,25 @@ function isWaitingSessionInput(value: unknown): value is SessionInputParams & { 
     && value !== null
     && "wait" in value
     && (value as { wait?: unknown }).wait !== undefined;
+}
+
+/**
+ * One page's params: the caller's filters with the walk's `limit` and `cursor`.
+ * Mirrors `SessionPages::fetch`/`ProjectPages::fetch`, which overwrite both
+ * fields, so a caller cursor without a limit is dropped on the first page.
+ */
+function pagedParams<P extends { limit?: number; cursor?: string }>(
+  params: P,
+  limit: number,
+  cursor: string | undefined,
+): P {
+  const page = { ...params, limit };
+  if (cursor === undefined) {
+    delete page.cursor;
+  } else {
+    page.cursor = cursor;
+  }
+  return page;
 }
 
 function isNonzeroU32(value: unknown): value is number {

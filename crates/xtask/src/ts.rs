@@ -30,11 +30,12 @@ use protocol::{
     SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
     SessionWarningKind, SpawnedBy, StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision,
     TerminalCursor, TerminalDimensions, TerminalWatermark, CLIENT_PROTOCOL_VERSIONS,
-    MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS, MAX_CONTROL_LINE_BYTES,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_REMOVE_TREE_SESSIONS,
-    MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS,
-    MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    LIST_WALK_MAX_BYTES, LIST_WALK_MAX_ITEMS, MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS,
+    MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_REMOVE_TREE_SESSIONS, MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES,
+    MIN_PROTOCOL_VERSION, PROJECT_LIST_PAGE_SIZE, PROTOCOL_VERSION, SESSION_LIST_PAGE_SIZE,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -309,6 +310,30 @@ fn emit_command_limits(body: &mut String) {
     .expect("writing to a String cannot fail");
 }
 
+/// Page sizes and walk bounds a list SDK applies when it follows `cursor`.
+fn emit_list_walk_limits(body: &mut String) {
+    writeln!(
+        body,
+        "export const SESSION_LIST_PAGE_SIZE = {SESSION_LIST_PAGE_SIZE} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const PROJECT_LIST_PAGE_SIZE = {PROJECT_LIST_PAGE_SIZE} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const LIST_WALK_MAX_ITEMS = {LIST_WALK_MAX_ITEMS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const LIST_WALK_MAX_BYTES = {LIST_WALK_MAX_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+}
+
 fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     let mut event_specs = event::EVENT_SPECS.to_vec();
     event_specs.sort_by_key(|spec| spec.name);
@@ -360,6 +385,7 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     .expect("writing to a String cannot fail");
     emit_session_limits(&mut body);
     emit_command_limits(&mut body);
+    emit_list_walk_limits(&mut body);
     writeln!(
         body,
         "export const MAX_SESSION_WAIT_TURN_MS = {MAX_SESSION_WAIT_TURN_MS} as const;"

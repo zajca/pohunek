@@ -64,6 +64,24 @@ const client = await connectTcp("build-box", {
 });
 ```
 
+## Listing Sessions and Projects
+
+`client.call("session.list", ...)` and `client.call("project.list", ...)` return
+the whole matching set. When the caller omits an explicit `limit`, the SDK
+walks the daemon's pages itself: it follows `cursor` with pages of 200 records
+and halves the page size when a page does not fit one control line
+(`session_list_too_large` / `project_list_too_large`). A daemon that predates
+paging ignores `limit` and `cursor` and answers the whole set at once; the SDK
+recognizes it (a page longer than the page size, a first page that is not in
+ascending id order, or a later page that starts at or before the cursor) and
+takes that page as the complete, current set. A page that ends at or before its
+cursor fails with the client-raised `session_list_cursor_repeated` /
+`project_list_cursor_repeated`, and a walk past 100000 records or 64 MiB fails
+with `session_list_walk_limit` / `project_list_walk_limit`. An explicit `limit`
+sends one request instead of walking. `project.list` is re-sorted by label, then
+id, so its order does not depend on the paging. The walk mirrors the Rust SDK's
+`Client::session_list` and `Client::project_list`.
+
 ## Lifecycle Budgets
 
 Typed `session.new`, `session.resume`, `session.stop`, `session.remove` and

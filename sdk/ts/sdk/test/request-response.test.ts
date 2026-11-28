@@ -4,6 +4,7 @@ import {
   MAX_SESSION_WAIT_MS,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  SESSION_LIST_PAGE_SIZE,
   SUPPORTED_PROTOCOL_VERSIONS,
   CLIENT_PROTOCOL_VERSIONS,
   type HostGovernanceStatus,
@@ -94,7 +95,10 @@ describe("Client request/response", () => {
       const sent = parseRequestLine(await daemon.nextRequest());
       expect(sent["v"]).toEqual(CLIENT_PROTOCOL_VERSIONS);
       expect(sent["method"]).toBe("session.list");
-      expect(sent["params"]).toEqual({ filters: [{ key: "state", value: "running" }] });
+      expect(sent["params"]).toEqual({
+        filters: [{ key: "state", value: "running" }],
+        limit: SESSION_LIST_PAGE_SIZE,
+      });
       expect(sent["origin_session_id"]).toBeUndefined();
       expect(sent["origin_daemon_id"]).toBeUndefined();
       expect(String(sent["id"])).toStartWith("sdk-session.list-");
