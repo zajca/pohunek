@@ -186,8 +186,15 @@ hierarchy rooted at #94. `docs/design/macos-support-rfc.md` records design
 constraints and rationale, not live delivery state.
 
 CI uses three execution tiers (issue #477). Pull requests always run the
-required Linux checks. On PRs, macOS platform contracts run when their input
-filter matches, and the lane tests follow the `lane` part of the test
+required Linux checks. On PRs, the macOS jobs (platform contracts, the macOS
+release daemon build, the package, Hermes and SDK macOS jobs) run only when
+the head carries the `macos-gate` label AND their input filter matches
+(issue #2599; a tests-only diff — only `crates/*/tests/**` of a lane-owned
+crate — never selects the lane, and the coordinator labels every PR that
+touches the platform-sensitive trees before its first push). On `main`, the
+nightly schedule and `main`/`nightly` dispatches the macOS jobs run as
+before, whatever the label. On a labelled PR whose filter matches, platform
+contracts run, and the lane tests follow the `lane` part of the test
 selection (#1225): it classifies the change without `docs/knowledge/`, the
 platform-neutral bundle whose every reader also runs on Linux, and selects
 every lane test on any dependency input, because the dependency diff covers
@@ -203,7 +210,8 @@ macOS job runs only for its narrow input filter, never because the runtime
 package selection picked Hermes; and the SDK macOS job runs for its own narrow
 input filter. The Linux `hermes-package` job follows the package selection like
 the other runtime package jobs. A change to
-`.github/workflows/ci.yml` selects all four pull-request macOS jobs, and the
+`.github/workflows/ci.yml` matches all four pull-request macOS jobs' filters,
+so a `macos-gate`-labelled PR runs them all, and the
 release daemon build runs with the package or Hermes macOS job. The
 release rehearsal, which a pull request starts through its `release_rehearsal`
 filter, adds macOS jobs from the workflows it calls: the signed
@@ -302,8 +310,10 @@ version window, or what the main and nightly tiers run (their jobs in `ci.yml`,
 the release rehearsal: a pull request that changes a `release_rehearsal` input
 already ran it, and a rehearsal-only failure in the product crates, docs or SDK
 sources, which the filter leaves out, surfaces in the nightly tier. Ordinary
-worker, PTY, hook, daemon, and CLI changes need no dispatch: pull-request CI
-already runs the macOS lanes.
+worker, PTY, hook, daemon, and CLI changes need no dispatch: the coordinator
+labels those PRs with `macos-gate` before the first push, so pull-request CI
+runs the macOS lanes on them; a macOS-only defect in an unlabelled PR
+surfaces on `main` after merge instead.
 
 **Fail fast.** When a cancelling-set job of a pull request run or a
 `workflow_dispatch` run of `ci.yml` fails for a deterministic cause, its
