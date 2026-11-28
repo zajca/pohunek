@@ -3846,7 +3846,7 @@ fields on their daemon-socket fallback. A report that names a `pid` without a
 is bound by the identity the host reports for the `pid` now, so it replaces that
 claim only from the same process with a newer `seq`; a `pid` the host cannot
 read binds nothing. A report that carries `pid` and
-`monotonic_sequence` for a live session whose worker speaks protocol 8 is
+`monotonic_sequence` for a live session whose worker speaks protocol 8 or newer is
 forwarded into the worker, which validates and journals it before the daemon
 answers: `recorded: true` then means the identity is durable, and
 `recorded: false` also covers a report the worker refused (a process outside the
@@ -4276,7 +4276,7 @@ journal names as the session's launch identity (a nested `claude -p` and a
 (Codex, other providers and a shell-hosted Claude are refused), and only with a
 sequence above the last applied one. It keeps the sequence in memory and shows
 it as `prompt_accepted_sequence` in the inspect snapshot of a connection that
-negotiated worker protocol 8. A worker that predates the request refuses it and
+negotiated worker protocol 8 or newer. A worker that predates the request refuses it and
 the hook exits 0 with no output. The report is delivery evidence for a waited
 `session.input`; it never changes activity, the activity revision, events or
 turns.
