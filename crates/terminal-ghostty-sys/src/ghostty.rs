@@ -17,6 +17,12 @@
 //! - Every size bound (scrollback, APC, unknown and continuation sequences,
 //!   clipboard transactions) comes from [`crate::config::HeadlessConfig`].
 //!
+//! Every fallible call returns a [`GhosttyError`] carrying any
+//! `GhosttyResult` code, not only `OUT_OF_MEMORY`: `INVALID_VALUE`,
+//! `NO_VALUE`, `REJECTED`, `LIMIT_EXCEEDED`, `OUT_OF_SPACE` and `IO_ERROR`
+//! are possible answers too, so a caller must handle a non-OOM error as
+//! well (issue #2593 finding 8).
+//!
 //! Ownership: the terminal handle and its callback state are freed on drop.
 //! Threading: the handle is not thread-safe, so the type is `Send` but not
 //! `Sync` (it holds raw pointers; see the `Send` impl below). A grid reference
@@ -656,8 +662,9 @@ impl HeadlessTerminal {
     /// A byte stream that recreates the screen, with the `extras` state the
     /// caller names (cursor, modes, styles, hyperlinks, keyboard, ...).
     ///
-    /// The attach repaint passes [`ffi::FORMATTER_EXTRAS_ATTACH`] so it never
-    /// rewrites the user's palette; [`ffi::FORMATTER_EXTRAS_ALL`] keeps every
+    /// The attach repaint passes [`FORMATTER_EXTRAS_ATTACH`](crate::FORMATTER_EXTRAS_ATTACH)
+    /// so it never rewrites the user's palette;
+    /// [`FORMATTER_EXTRAS_ALL`](crate::FORMATTER_EXTRAS_ALL) keeps every
     /// extra for callers that want the full state.
     ///
     /// # Errors

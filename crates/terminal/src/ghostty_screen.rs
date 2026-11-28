@@ -6,10 +6,19 @@
 //! but the palette), preceded by the same prologue the vt100 backend emits:
 //! the screen switch (`?1049h` on the alternate screen) and `CSI 2J CSI H`,
 //! so an attach clears the client screen on either model (issue #2538 M13/M14).
+//!
+//! Unlike `visible_text`, the repaint body includes the history rows the
+//! library retained, so an attach or gap repaint of a busy session is bounded
+//! by the scrollback byte limit (`SCROLLBACK_MAX_BYTES`, 8 MiB) rather than by
+//! the active screen — the bound P3 accepted (issue #2596 finding 17, #2593
+//! finding 11); `crates/terminal/tests/screen_backend.rs` asserts both sides
+//! after a 5000-line flood.
 
 // Rust guideline compliant 2026-11-27
 
-use pohunek_terminal_ghostty_sys::{HeadlessConfig, HeadlessTerminal, FORMATTER_EXTRAS_ATTACH};
+use pohunek_terminal_ghostty_sys::{
+    GhosttyError, HeadlessConfig, HeadlessTerminal, FORMATTER_EXTRAS_ATTACH,
+};
 
 use crate::links::{combine_links, text_links, AnchorLog, AnchorScreen, ScreenLink};
 use crate::snapshot::ScreenState;
@@ -63,9 +72,17 @@ impl GhosttyScreen {
     ///
     /// A rejected size leaves the terminal at its old size, like the vt100
     /// backend keeps its grid; the next snapshot reports the size the
-    /// library actually has.
+    /// library actually has. The rejection is logged, never dropped
+    /// silently (issue #2593 finding 9).
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
-        let _ = self.terminal.resize(rows, cols);
+        if let Err(error) = self.terminal.resize(rows, cols) {
+            tracing::warn!(
+                error = %error,
+                rows,
+                cols,
+                "libghostty rejected the resize; keeping the previous size"
+            );
+        }
     }
 
     /// Rows and columns of the active screen.
@@ -77,16 +94,17 @@ impl GhosttyScreen {
 
     /// The state [`TerminalTracker::snapshot`](crate::TerminalTracker::snapshot)
     /// fills a snapshot from.
-    pub(crate) fn state(&self) -> ScreenState {
+    ///
+    /// Fallible: every read and the format go through the C library and can
+    /// fail with any `GhosttyResult` code, not only `OUT_OF_MEMORY` (issue
+    /// #2593 finding 8), so the caller degrades to an error snapshot instead
+    /// of panicking under the worker's output lock.
+    pub(crate) fn state(&self) -> Result<ScreenState, GhosttyError> {
         let terminal = &self.terminal;
-        let (rows, cols) = self.size();
-        let (cursor_row, cursor_col) = terminal.cursor().expect("libghostty read the cursor");
-        let alternate_screen = terminal
-            .alternate_screen()
-            .expect("libghostty read the active screen");
-        let body = terminal
-            .format_vt(REPAINT_UNWRAP, REPAINT_TRIM, FORMATTER_EXTRAS_ATTACH)
-            .expect("libghostty format the repaint");
+        let (rows, cols) = terminal.size()?;
+        let (cursor_row, cursor_col) = terminal.cursor()?;
+        let alternate_screen = terminal.alternate_screen()?;
+        let body = terminal.format_vt(REPAINT_UNWRAP, REPAINT_TRIM, FORMATTER_EXTRAS_ATTACH)?;
         // The vt100 backend's prologue: screen switch first, then the clear,
         // so the repaint also wipes a pre-filled client screen on this model.
         let mut repaint = Vec::new();
@@ -95,25 +113,21 @@ impl GhosttyScreen {
         }
         repaint.extend_from_slice(REPAINT_CLEAR);
         repaint.extend_from_slice(&body);
-        ScreenState {
+        Ok(ScreenState {
             rows,
             cols,
             cursor_row,
             cursor_col,
-            cursor_visible: terminal
-                .cursor_visible()
-                .expect("libghostty read the cursor visibility"),
+            cursor_visible: terminal.cursor_visible()?,
             alternate_screen,
             // Active screen rows only, via the sys crate's two-view API: the
             // library retains scrollback (up to the configured byte limit) and
             // the history view `format_plain` would leak it into
             // `session.screen`; `visible_text` is the same definition the
             // spike's dump terminal cross-checks against (issue #2538 M2).
-            visible_text: terminal
-                .visible_text()
-                .expect("libghostty read the active screen text"),
+            visible_text: terminal.visible_text()?,
             repaint,
-        }
+        })
     }
 
     /// The anchor-log view of this screen: size, cursor and the text between

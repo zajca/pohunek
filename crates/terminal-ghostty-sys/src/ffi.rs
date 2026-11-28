@@ -22,7 +22,7 @@
 )]
 #![allow(
     unreachable_pub,
-    reason = "the declarations are public for the wrapper module; nothing outside the crate is meant to call them"
+    reason = "the declarations are visible to the wrapper module; the module itself is crate-private, so nothing outside the crate can call them"
 )]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -214,6 +214,24 @@ pub const FORMATTER_EXTRA_KITTY_KEYBOARD: u32 = 1 << 10;
 /// Restore the character sets, such as the line drawing set.
 pub const FORMATTER_EXTRA_CHARSETS: u32 = 1 << 11;
 pub const FORMATTER_EXTRAS_ALL: u32 = 0xFFF;
+/// The all-extras mask is exactly the twelve extra bits of the header; the
+/// assertion keeps every bit constant reachable now that the module is
+/// crate-private (issue #2593 finding 12).
+const _: () = assert!(
+    FORMATTER_EXTRAS_ALL
+        == FORMATTER_EXTRA_PALETTE
+            | FORMATTER_EXTRA_MODES
+            | FORMATTER_EXTRA_SCROLLING_REGION
+            | FORMATTER_EXTRA_TABSTOPS
+            | FORMATTER_EXTRA_PWD
+            | FORMATTER_EXTRA_KEYBOARD
+            | FORMATTER_EXTRA_CURSOR
+            | FORMATTER_EXTRA_STYLE
+            | FORMATTER_EXTRA_HYPERLINK
+            | FORMATTER_EXTRA_PROTECTION
+            | FORMATTER_EXTRA_KITTY_KEYBOARD
+            | FORMATTER_EXTRA_CHARSETS
+);
 /// The extras the attach repaint emits: everything except the palette. A
 /// repaint with the palette bit would send 256 OSC 4 sets on every attach and
 /// leave the user's palette changed after detach (issue #2538 M14).

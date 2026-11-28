@@ -427,6 +427,25 @@ fn a_long_scrollback_does_not_exceed_the_output_limit() {
         !ghostty_snapshot.visible_text.contains("line-04000"),
         "scrollback must not leak into visible_text"
     );
+    // The repaint body is `format_vt`, which — unlike `visible_text` — includes
+    // the history rows the library retained, so after the flood the repaint
+    // carries the whole retained history: it exceeds the active-screen bound
+    // but stays within the scrollback byte limit (issue #2596 finding 17,
+    // #2593 finding 11).
+    let scrollback_max =
+        pohunek_terminal_ghostty_sys::HeadlessConfig::default().scrollback_max_bytes;
+    assert!(
+        ghostty_snapshot.ansi.len() > bound,
+        "the repaint of {} bytes must exceed the active-screen bound {bound}: \
+         format_vt includes the retained history",
+        ghostty_snapshot.ansi.len()
+    );
+    assert!(
+        ghostty_snapshot.ansi.len() <= scrollback_max + bound + 4096,
+        "the repaint of {} bytes exceeds the scrollback limit ({scrollback_max}) \
+         plus the active screen",
+        ghostty_snapshot.ansi.len()
+    );
 }
 
 /// S6: hostile PTY output cannot break the libghostty backend — malformed

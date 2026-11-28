@@ -21,6 +21,12 @@
   per row of `plugin-ci.yml`).
 - No protocol bump: `screen_model`/`format_version` stay optional on all
   three wire layers (worker stays 9 with window 8..=9, public stays 5).
+- The seam's red-on-old row S4 (default-build selection) is red on the merge
+  base only by hand, because the base tree does not compile the dual-backend
+  scenario; the concrete mutation its manual how names is the Ghostty
+  backend taking title/progress from `HeadlessTerminal::title()/progress()`
+  instead of the shared byte-driven OSC tracker, which makes the model
+  selection observable in the snapshot (#2593 finding 7).
 - The fallback is the whole product, not just the terminal crate: the root
   workspace dependency on `pohunek-session-worker` and plugin-kit's
   `pohunek-daemon` dependency now carry `default-features = false`, and the

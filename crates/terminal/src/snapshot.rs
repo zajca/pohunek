@@ -23,6 +23,54 @@ const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 /// Ends a synchronized-output bracket (DEC private mode 2026).
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 
+/// Reading the screen state of the active backend failed.
+///
+/// The vt100 backend cannot fail; this arises only on the libghostty
+/// backend, whose reads and formatting go through the C library and can
+/// return any `GhosttyResult` code, not only `OUT_OF_MEMORY` (issue #2593
+/// finding 8). [`TerminalTracker::snapshot`] degrades to an empty error
+/// snapshot instead of panicking under the worker's output lock.
+#[derive(Debug)]
+pub(crate) struct SnapshotError {
+    /// The library error; only the libghostty backend can produce one.
+    #[cfg(feature = "libghostty")]
+    ghostty: pohunek_terminal_ghostty_sys::GhosttyError,
+}
+
+impl SnapshotError {
+    /// Wraps a libghostty read or format failure.
+    #[cfg(feature = "libghostty")]
+    pub(crate) fn libghostty(error: pohunek_terminal_ghostty_sys::GhosttyError) -> Self {
+        Self { ghostty: error }
+    }
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "libghostty")]
+        {
+            write!(f, "libghostty screen read failed: {}", self.ghostty)
+        }
+        #[cfg(not(feature = "libghostty"))]
+        {
+            write!(f, "the screen state read failed")
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(feature = "libghostty")]
+        {
+            Some(&self.ghostty)
+        }
+        #[cfg(not(feature = "libghostty"))]
+        {
+            None
+        }
+    }
+}
+
 /// Identifier of the screen model that produced a [`TerminalSnapshot`].
 ///
 /// Serialized as a `snake_case` string so a wire reader can name the backend
@@ -139,6 +187,24 @@ pub(crate) struct ScreenState {
     pub repaint: Vec<u8>,
 }
 
+impl ScreenState {
+    /// An empty state at `rows` x `cols`: the degradation when a backend
+    /// read fails, so a snapshot never panics under the worker's output
+    /// lock (issue #2593 finding 8).
+    pub(crate) fn empty(rows: u16, cols: u16) -> Self {
+        Self {
+            rows,
+            cols,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            alternate_screen: false,
+            visible_text: String::new(),
+            repaint: Vec::new(),
+        }
+    }
+}
+
 impl ScreenBackend {
     fn feed(&mut self, bytes: &[u8]) {
         match self {
@@ -174,7 +240,12 @@ impl ScreenBackend {
         }
     }
 
-    fn state(&self) -> ScreenState {
+    // Fallible only with the libghostty backend; the vt100 arm always succeeds.
+    #[cfg_attr(
+        not(feature = "libghostty"),
+        allow(clippy::unnecessary_wraps, reason = "the vt100-only build cannot fail")
+    )]
+    fn state(&self) -> Result<ScreenState, SnapshotError> {
         match self {
             Self::Vt100(parser) => {
                 let screen = parser.screen();
@@ -189,7 +260,7 @@ impl ScreenBackend {
                 repaint.extend_from_slice(&screen.input_mode_formatted());
                 repaint.extend_from_slice(&screen.contents_formatted());
                 repaint.extend_from_slice(&screen.cursor_state_formatted());
-                ScreenState {
+                Ok(ScreenState {
                     rows,
                     cols,
                     cursor_row,
@@ -198,10 +269,12 @@ impl ScreenBackend {
                     alternate_screen,
                     visible_text: screen.contents(),
                     repaint,
-                }
+                })
             }
+            // The libghostty backend can fail; the caller degrades to an
+            // error snapshot instead of panicking (issue #2593 finding 8).
             #[cfg(feature = "libghostty")]
-            Self::Ghostty(screen) => screen.state(),
+            Self::Ghostty(screen) => screen.state().map_err(SnapshotError::libghostty),
         }
     }
 }
@@ -211,6 +284,9 @@ pub struct TerminalTracker {
     backend: ScreenBackend,
     osc: OscTracker,
     anchors: AnchorLog,
+    /// The size the tracker was created with, the size of the empty state an
+    /// error snapshot degrades to (issue #2593 finding 8).
+    initial_size: (u16, u16),
 }
 
 impl std::fmt::Debug for TerminalTracker {
@@ -219,6 +295,7 @@ impl std::fmt::Debug for TerminalTracker {
             .field("size", &self.backend.size())
             .field("osc", &self.osc)
             .field("anchors", &self.anchors)
+            .field("initial_size", &self.initial_size)
             .finish()
     }
 }
@@ -249,10 +326,15 @@ impl TerminalTracker {
             backend,
             osc: OscTracker::new(),
             anchors: AnchorLog::default(),
+            initial_size: (rows, cols),
         }
     }
 
     /// The screen model this tracker runs.
+    ///
+    /// Public alongside [`with_model`](Self::with_model) and accepted by the
+    /// plan: `snapshot` fills `TerminalSnapshot::model` from it, and tests
+    /// assert the default of a build with it (issue #2593 finding 10).
     #[must_use]
     pub fn model(&self) -> ModelKind {
         match &self.backend {
@@ -319,9 +401,23 @@ impl TerminalTracker {
     }
 
     /// Captures a complete state and ANSI repaint at `watermark`.
+    ///
+    /// A backend read failure degrades to an empty error snapshot at the
+    /// initial size, with the failure logged, instead of panicking: this
+    /// runs under the worker's output mutex, where a panic would poison it
+    /// (issue #2593 finding 8).
     #[must_use]
     pub fn snapshot(&self, watermark: u64) -> TerminalSnapshot {
-        let state = self.backend.state();
+        let state = match self.backend.state() {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "the screen state read failed; degrading to an empty error snapshot"
+                );
+                ScreenState::empty(self.initial_size.0, self.initial_size.1)
+            }
+        };
         let mut ansi = Vec::new();
         // One bracket spans the whole repaint, so a terminal that implements
         // mode 2026 draws it as one frame however the bytes are chunked.

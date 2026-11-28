@@ -8,9 +8,11 @@
 //! without the feature the crate is empty, so a default build needs no Zig
 //! and no C library, and nothing is ever downloaded at build or test time.
 //!
-//! - [`ffi`]: the `extern "C"` declarations and `repr(C)` mirrors, checked at
-//!   compile time against the ABI layout the build script recorded from a C
-//!   probe.
+//! - `ffi`: the crate-private `extern "C"` declarations and `repr(C)`
+//!   mirrors, checked at compile time against the ABI layout the build
+//!   script recorded from a C probe; only the formatter extra masks are
+//!   re-exported at the root, nothing outside the crate can call the raw
+//!   items (issue #2593 finding 12).
 //! - [`ghostty`]: the safe, headless terminal wrapper (`HeadlessTerminal`)
 //!   and its error type.
 //! - [`config`]: the headless bounds and settings the terminal is created
@@ -19,7 +21,7 @@
 #[cfg(feature = "libghostty")]
 pub mod config;
 #[cfg(feature = "libghostty")]
-pub mod ffi;
+pub(crate) mod ffi;
 #[cfg(feature = "libghostty")]
 pub mod ghostty;
 

@@ -7,6 +7,7 @@ User-facing changes of example/app.
 ### Added
 
 - Tailscale can carry the connection between hosts as an opt-in overlay. ([#12](https://github.com/example/app/issues/12))
+- An entry whose fragment already ends with its own issue link. ([#21](https://github.com/example/app/issues/21))
 
 ### Changed
 

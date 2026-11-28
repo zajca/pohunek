@@ -1,0 +1,4 @@
+---
+kind: fixed
+---
+libghostty seam follow-ups: a rejected terminal resize is logged instead of silently dropped, a failing libghostty screen read degrades to an error snapshot instead of panicking under the worker's output lock, the sys crate no longer exposes its raw `ffi` module outside the crate, and the flood scenario now asserts that the attach repaint stays within the 8 MiB scrollback bound (#2596, #2593). The changelog contract fixtures now include a fragment that carries its own issue link, rendered with that link exactly once (#2479); the subscribe stream's lag notice is documented per channel, its TypeScript `skipped` count is a `number`, and the `bad_request` change of the `subscribe` parameters has its fragment (#2564). ([#2596](https://github.com/zajca/pohunek/issues/2596), [#2593](https://github.com/zajca/pohunek/issues/2593), [#2479](https://github.com/zajca/pohunek/issues/2479), [#2564](https://github.com/zajca/pohunek/issues/2564))

@@ -20,6 +20,7 @@ libghostty = ["dep:pohunek-terminal-ghostty-sys", "pohunek-terminal-ghostty-sys/
 base64 = { workspace = true }
 pohunek-terminal-ghostty-sys = { workspace = true, optional = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 unicode-width = { workspace = true }
 vt100 = { workspace = true }
 vte = { workspace = true }
