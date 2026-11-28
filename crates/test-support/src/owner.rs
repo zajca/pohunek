@@ -22,9 +22,11 @@
 //! session started in its own temporary directory) is still covered. Every
 //! signal is preceded by a start-identity re-check, so a recycled PID is never
 //! signalled, and an implausible root (not absolute, fewer than two components,
-//! or `/`, `/tmp`, `/var/tmp` or `$HOME` themselves) is refused. A production
-//! daemon's workers never
-//! work under a test root, so the criterion cannot select them.
+//! or `/`, `/tmp`, `/var/tmp` or the owner's home themselves) is refused: every
+//! refused entry is canonicalized before the comparison, and the home reaches
+//! the helper through [`REAPER_HOME_ENV`], because the helper runs with an
+//! empty environment where `$HOME` is unset. A production daemon's workers
+//! never work under a test root, so the criterion cannot select them.
 //!
 //! On the normal path [`OwnerReaper::drop`] kills the helper before releasing
 //! the lock, so a test that returns pays no sweep and no process-table scan.
@@ -62,6 +64,18 @@ pub use pohunek_platform::process::{
 
 /// File name of the owner lock inside a fixture root.
 pub const OWNER_LOCK_FILE: &str = "owner.lock";
+
+/// Environment variable that carries the owner's canonical home to the reaper
+/// helper.
+///
+/// [`OwnerReaper::arm`] spawns the helper with an empty environment
+/// (`env_clear`), so `$HOME` is unset there and a `$HOME` refusal read from the
+/// process environment would never fire in the only caller that kills. The
+/// home is passed explicitly through this variable instead; it is not under
+/// the fixture root, so the release-consumer and canary guards that attribute
+/// a process to a root by scanning command lines and environments never match
+/// it.
+pub const REAPER_HOME_ENV: &str = "POHUNEK_REAPER_HOME";
 
 /// Mode of the owner lock file: the owner's only.
 ///
@@ -160,6 +174,15 @@ impl OwnerReaper {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .process_group(0);
+            // The one variable the helper needs that its empty environment
+            // cannot supply: the owner's canonical home, for the refusal of a
+            // sweep root that resolves to it (#2585).
+            if let Some(home) = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|home| std::fs::canonicalize(home).ok())
+            {
+                command.env(REAPER_HOME_ENV, home);
+            }
             command.spawn()
         })();
         let child = match spawn {
@@ -206,8 +229,10 @@ impl Drop for OwnerReaper {
 ///
 /// Returns how many signals were sent. The root is canonicalized first and
 /// refused when it is not absolute, has fewer than two path components, or is
-/// `/`, `/tmp`, `/var/tmp` or `$HOME` themselves, so a wrong argument can
-/// never select a directory whose death would take unrelated processes down.
+/// `/`, `/tmp`, `/var/tmp` or the owner's home themselves (each refused entry
+/// canonicalized before the comparison, so `/tmp` on macOS is caught too), so
+/// a wrong argument can never select a directory whose death would take
+/// unrelated processes down.
 /// Each signal is preceded by a start-identity
 /// re-check of the PID, so a process that reused the PID after the snapshot is
 /// never signalled, and the reaper never signals itself.
@@ -310,6 +335,11 @@ pub fn try_scoped_identities(root: &Path) -> io::Result<Vec<ProcessIdentity>> {
 }
 
 /// Canonicalizes `root` and refuses an implausible sweep root.
+///
+/// Every refused entry is canonicalized before the comparison, so a `/tmp`
+/// root on macOS (where it resolves to `/private/tmp`) is refused as well. The
+/// owner's home comes from `$HOME`, or from [`REAPER_HOME_ENV`] in the reaper
+/// helper, which runs with an empty environment where `$HOME` is unset.
 fn canonical_root(root: &Path) -> io::Result<PathBuf> {
     if !root.is_absolute() || root.components().count() < 2 {
         return Err(io::Error::new(
@@ -326,14 +356,21 @@ fn canonical_root(root: &Path) -> io::Result<PathBuf> {
             format!("cannot resolve the sweep root {}: {error}", root.display()),
         )
     })?;
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os(REAPER_HOME_ENV));
     let mut refused = vec![
         PathBuf::from("/"),
         PathBuf::from("/tmp"),
         PathBuf::from("/var/tmp"),
     ];
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home {
         refused.push(PathBuf::from(home));
     }
+    // Canonicalize every refused entry: on macOS `/tmp` and `/var/tmp` resolve
+    // to `/private/...`, so an uncanonicalized comparison would miss them.
+    let refused: Vec<PathBuf> = refused
+        .into_iter()
+        .map(|entry| std::fs::canonicalize(&entry).unwrap_or(entry))
+        .collect();
     if refused.contains(&canonical) || canonical.components().count() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
