@@ -255,6 +255,12 @@ async fn the_client_teardown_resets_a_program_held_mode_on_a_terminal() {
         find(&snapshot(), READY_MARKER).map(|_| ())
     })
     .await;
+    // Prefix check only: bytes after the ready marker have not necessarily
+    // arrived yet, so the exact reset count is asserted on the ended
+    // transcript in the teardown cleanup below.
+    // Prefix check only: bytes after the ready marker have not necessarily
+    // arrived yet, so the exact reset count is asserted on the ended
+    // transcript in the teardown cleanup below.
     assert_eq!(
         find(&snapshot(), SYNC_END),
         None,
@@ -292,6 +298,16 @@ async fn the_client_teardown_resets_a_program_held_mode_on_a_terminal() {
         .rposition(|w| w == SYNC_END)
         .unwrap_or_else(|| panic!("the teardown resets the mode: {all:?}"));
     assert!(last_set < last_reset, "{all:?}");
+    // The complete transcript holds exactly one reset, the teardown's. The
+    // pre-detach check above only saw the transcript as it stood at the ready
+    // marker, so a reset the repaint emitted between the marker and the
+    // detach would slip past it; this count, taken inside the teardown
+    // cleanup once the transcript has ended, catches it.
+    let resets = all
+        .windows(SYNC_END.len())
+        .filter(|window| *window == SYNC_END)
+        .count();
+    assert_eq!(resets, 1, "exactly one reset, the teardown's: {all:?}");
 
     harness.stop().await;
 }

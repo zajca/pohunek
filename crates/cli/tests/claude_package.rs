@@ -40,7 +40,7 @@ use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
 use pohunek_daemon::session::HostTrustAnchor;
 use pohunek_test_support::fs::write_executable;
 use pohunek_test_support::process_env::ProcessEnv;
-use pohunek_test_support::wait::{wait_until, HANG_GUARD};
+use pohunek_test_support::wait::{wait_until, HANG_GUARD, POLL_INTERVAL};
 use pohunek_test_support::workspace_root;
 use protocol::{
     AgentActivity, BindingProvenance, PackageId, PackageVersion, RuntimeId, StateSource,
@@ -4455,6 +4455,10 @@ async fn the_locked_real_claude_monitor_tool_is_recorded() {
 /// second and third main turn each produce one helper stop. Each next turn is
 /// submitted after the previous helper stop was handled, because a new turn
 /// cancels a pending suggestion.
+///
+/// The stop wait is bounded by [`HANG_GUARD`] like every readiness wait, and
+/// on expiry its panic carries the captured stub requests and worker events,
+/// so a recurrence names the missing side instead of a bare hang guard (#2471).
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn real_claude_prompt_suggestion_stops_create_no_subagent_row() {
@@ -4487,15 +4491,7 @@ async fn real_claude_prompt_suggestion_stops_create_no_subagent_row() {
             },
         )
         .await;
-        let (ignored, rows) = wait_until(
-            &format!("helper stop {helpers} (reported after its request)"),
-            || async {
-                let ignored = helper_stops(&fixture.worker_events(&id));
-                let rows = fixture.subagents(&id).await;
-                (ignored.len() >= helpers || !rows.is_empty()).then_some((ignored, rows))
-            },
-        )
-        .await;
+        let (ignored, rows) = wait_for_helper_stop(&fixture, &id, helpers).await;
         assert!(rows.is_empty(), "a helper stop creates no row: {rows:#?}");
         assert_eq!(ignored.len(), helpers, "{ignored:?}");
         // A turn typed while the previous one still runs is queued into it and
@@ -4527,6 +4523,46 @@ fn helper_stops(events: &[Value]) -> Vec<String> {
         })
         .filter_map(|event| event["subagent.id"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// Waits for the `helpers`-th helper stop like [`wait_until`] does, bounded by
+/// the same [`HANG_GUARD`], but on expiry the panic carries what the scenario
+/// captured, so a recurrence names the missing side (#2471): a helper request
+/// that reached the stub without a stop is the reporting path dropping it, no
+/// request at all is Claude never starting the helper. The bound stays
+/// [`HANG_GUARD`]: measured with the locked Claude on an unloaded host (3 runs
+/// of the scenario above), each helper stop was logged 41 to 46 ms after its
+/// request reached the stub, so 120 s is about 2600x the observed
+/// request-to-stop latency.
+async fn wait_for_helper_stop(
+    fixture: &Fixture,
+    id: &str,
+    helpers: usize,
+) -> (Vec<String>, Vec<Value>) {
+    let start = tokio::time::Instant::now();
+    let deadline = start + HANG_GUARD;
+    loop {
+        let ignored = helper_stops(&fixture.worker_events(id));
+        let rows = fixture.subagents(id).await;
+        if ignored.len() >= helpers || !rows.is_empty() {
+            return (ignored, rows);
+        }
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "hang guard of {HANG_GUARD:?} elapsed after {:?} waiting for helper stop {helpers}: \
+             {} prompt-suggestion request(s) reached the stub, the worker logged {} \
+             stop_without_start event(s) ({ignored:?}), subagent rows: {rows:?}, worker events: {:?}",
+            start.elapsed(),
+            fixture
+                .stub
+                .last_messages_containing(messages_stub::SUGGESTION_OPENING),
+            ignored.len(),
+            fixture.worker_events(id),
+        );
+        // timing-allowed: #2471 readiness poll, bounded by HANG_GUARD (measured latency 41-46 ms)
+        tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
+    }
 }
 
 /// A tool approval prompt of the real Claude is blocked, for the daemon and for
