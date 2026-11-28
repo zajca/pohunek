@@ -29,7 +29,8 @@ pub enum HostClass {
     /// A compatible daemon answered with a protocol version inside the asking
     /// client's range.
     ReachableDaemon {
-        /// The daemon version the peer reported.
+        /// The daemon version the peer reported. At most
+        /// [`MAX_HOST_DAEMON_VERSION_BYTES`] bytes when present.
         daemon_version: String,
     },
     /// A daemon answered but speaks a protocol version outside the asking
@@ -45,16 +46,62 @@ pub enum HostClass {
     Candidate,
 }
 
+/// Maximum bytes of a [`HostRecord::name`]: one DNS label.
+pub const MAX_HOST_NAME_BYTES: usize = 63;
+
+/// Maximum bytes of a [`HostRecord::fqdn`]: one DNS name.
+pub const MAX_HOST_FQDN_BYTES: usize = 253;
+
+/// Maximum bytes of a [`HostRecord::peer_id`]: a provider key (a `NetBird`
+/// public key or a Tailscale node ID) with margin.
+pub const MAX_HOST_PEER_ID_BYTES: usize = 64;
+
+/// Maximum bytes of the `daemon_version` a [`HostClass::ReachableDaemon`]
+/// carries: a release version string with margin.
+pub const MAX_HOST_DAEMON_VERSION_BYTES: usize = 32;
+
+/// Maximum bytes of a [`HostRecord::reason`] value; every defined reason code
+/// fits inside it.
+pub const MAX_HOST_REASON_BYTES: usize = 32;
+
+/// `reason` value: the peer's address was withheld because another peer or
+/// this machine lists it too.
+pub const REASON_ADDRESS_AMBIGUOUS: &str = "address_ambiguous";
+
+/// `reason` value: one of the peer's identity strings (`name`, `fqdn`,
+/// `peer_id`) exceeded its field cap, so that field is omitted and not echoed.
+pub const REASON_IDENTITY_TOO_LARGE: &str = "identity_too_large";
+
+/// `reason` value: the peer's health reply carried a `daemon_version` over its
+/// cap, so the peer is reported unreachable and the version is not echoed.
+pub const REASON_DAEMON_VERSION_TOO_LARGE: &str = "daemon_version_too_large";
+
+/// `reason` value on the local record: its own daemon did not answer within
+/// the probe timeout.
+pub const REASON_LOCAL_PROBE_TIMEOUT: &str = "local_probe_timeout";
+
+/// `reason` value on the local record: the probe of its own daemon failed.
+pub const REASON_LOCAL_PROBE_FAILED: &str = "local_probe_failed";
+
+/// `reason` value on the local record: its own daemon answered with an error.
+pub const REASON_LOCAL_DAEMON_ERROR: &str = "local_daemon_error";
+
 /// One enumerated host with its overlay identity and classification.
 ///
 /// Field order and names are part of the wire contract `--json` consumers parse.
+/// The peer-supplied strings (`name`, `fqdn`, `peer_id`, the class's
+/// `daemon_version` and `reason`) are capped at build time: a value over its
+/// cap is omitted and reported through [`HostRecord::reason`], never echoed
+/// verbatim, so one hostile peer cannot inflate the reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostRecord.ts"))]
 pub struct HostRecord {
-    /// Short host name (first DNS label of the fqdn), when derivable.
+    /// Short host name (first DNS label of the fqdn), when derivable. At most
+    /// [`MAX_HOST_NAME_BYTES`] bytes when present.
     pub name: Option<String>,
-    /// The peer's provider-qualified DNS name.
+    /// The peer's provider-qualified DNS name. At most [`MAX_HOST_FQDN_BYTES`]
+    /// bytes when present.
     pub fqdn: Option<String>,
     /// The peer's dialable IP address without a port.
     pub address: Option<String>,
@@ -63,7 +110,7 @@ pub struct HostRecord {
     /// Which overlay transport discovered this peer (e.g. `"netbird"`).
     pub overlay: String,
     /// The overlay's stable provider peer identity (e.g. a `NetBird` public key or
-    /// a Tailscale node ID).
+    /// a Tailscale node ID). At most [`MAX_HOST_PEER_ID_BYTES`] bytes when present.
     pub peer_id: Option<String>,
     /// Whether this record is the machine that enumerated the hosts rather than
     /// a peer. Omitted when `false`, so a peer record is unchanged on the wire
@@ -71,9 +118,12 @@ pub struct HostRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
     pub local: bool,
-    /// Why the probe of this record failed, set only on the local record when
-    /// its own daemon did not answer. Omitted otherwise, so a peer record is
-    /// unchanged on the wire.
+    /// Why this record is not usable as probed or echoed: one of the
+    /// `REASON_*` codes, at most [`MAX_HOST_REASON_BYTES`] bytes. Set on the
+    /// local record when its own daemon did not answer, on a peer record whose
+    /// probe failed in a way the classifier can name, or whose identity
+    /// strings were over cap. Omitted otherwise, so a peer record is unchanged
+    /// on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub reason: Option<String>,

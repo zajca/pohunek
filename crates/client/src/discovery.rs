@@ -13,7 +13,10 @@ use futures::{stream, StreamExt as _};
 use overlay::{OverlayFailure, OverlayRegistry, RoutedPeer};
 use protocol::{
     method, HostClass, HostRecord, ProtocolVersionRange, Request, Response,
-    CLIENT_PROTOCOL_VERSIONS, MAX_CONTROL_LINE_BYTES,
+    CLIENT_PROTOCOL_VERSIONS, MAX_CONTROL_LINE_BYTES, MAX_HOST_DAEMON_VERSION_BYTES,
+    MAX_HOST_FQDN_BYTES, MAX_HOST_NAME_BYTES, MAX_HOST_PEER_ID_BYTES, REASON_ADDRESS_AMBIGUOUS,
+    REASON_DAEMON_VERSION_TOO_LARGE, REASON_IDENTITY_TOO_LARGE, REASON_LOCAL_DAEMON_ERROR,
+    REASON_LOCAL_PROBE_FAILED, REASON_LOCAL_PROBE_TIMEOUT,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -335,7 +338,7 @@ async fn local_records(
             let probe_timeout = options
                 .probe_timeout()
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            let (class, reason) = match addr {
+            let (class, probe_reason) = match addr {
                 Some(addr) => {
                     classify_local(
                         &identity.overlay,
@@ -348,19 +351,29 @@ async fn local_records(
                 }
                 None => (HostClass::Candidate, None),
             };
-            HostRecord {
-                name: identity
+            let mut identity_too_large = false;
+            let name = capped_field(
+                identity
                     .fqdn
                     .as_deref()
                     .map(short_hostname)
                     .map(str::to_owned),
-                fqdn: identity.fqdn,
+                MAX_HOST_NAME_BYTES,
+                &mut identity_too_large,
+            );
+            let fqdn = capped_field(identity.fqdn, MAX_HOST_FQDN_BYTES, &mut identity_too_large);
+            HostRecord {
+                name,
+                fqdn,
                 address: addr.map(|addr| addr.ip().to_string()),
                 port,
                 overlay: identity.overlay.to_string(),
                 peer_id: None,
                 local: true,
-                reason,
+                reason: identity_too_large
+                    .then_some(REASON_IDENTITY_TOO_LARGE)
+                    .or(probe_reason)
+                    .map(str::to_owned),
                 class,
             }
         })
@@ -374,26 +387,46 @@ async fn classify_local(
     timeout: Duration,
     origin: Option<&RequestOrigin>,
     range: ProtocolVersionRange,
-) -> (HostClass, Option<String>) {
+) -> (HostClass, Option<&'static str>) {
     let reason = match tokio::time::timeout(timeout, probe_health(addr, origin, range)).await {
         Ok(Ok(response)) => match classify_response(&response, range) {
-            HostClass::Unreachable => "the daemon answered with an error".to_owned(),
-            class => return (class, None),
+            (HostClass::Unreachable, None) => REASON_LOCAL_DAEMON_ERROR,
+            (class, probe_reason) => return (class, probe_reason),
         },
-        Ok(Err(error)) => error.to_string(),
-        Err(_elapsed) => format!("no answer within {timeout:?}"),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                overlay = %overlay,
+                %addr,
+                reason = REASON_LOCAL_PROBE_FAILED,
+                error = %error,
+                "the local daemon did not answer its own overlay probe"
+            );
+            return (HostClass::Unreachable, Some(REASON_LOCAL_PROBE_FAILED));
+        }
+        Err(_elapsed) => REASON_LOCAL_PROBE_TIMEOUT,
     };
     tracing::warn!(
         overlay = %overlay,
         %addr,
-        reason = %reason,
+        reason,
         "the local daemon did not answer its own overlay probe"
     );
     (HostClass::Unreachable, Some(reason))
 }
 
-/// The `reason` of a record whose address another peer lists too.
-const ADDRESS_AMBIGUOUS_REASON: &str = "address_ambiguous";
+/// Cap a peer-supplied string at `cap` bytes: a value that fits is kept, one
+/// over the cap is omitted (never echoed verbatim) and marks `refused`, so the
+/// caller reports the record with [`REASON_IDENTITY_TOO_LARGE`].
+fn capped_field(value: Option<String>, cap: usize, refused: &mut bool) -> Option<String> {
+    match value {
+        Some(text) if text.len() <= cap => Some(text),
+        Some(_) => {
+            *refused = true;
+            None
+        }
+        None => None,
+    }
+}
 
 /// Classify aggregated overlay peer snapshots.
 #[must_use]
@@ -410,6 +443,7 @@ async fn discover_peers(
                 .clone()
                 .or_else(|| peer.fqdn.as_deref().map(short_hostname).map(str::to_owned));
             let fqdn = peer.fqdn.clone();
+            let peer_id = peer.peer_id.clone();
             let address = peer.addr.map(|addr| addr.ip().to_string());
             let port = peer.port;
             let probe_timeout = deadline.map_or(options.probe_timeout(), |deadline| {
@@ -417,21 +451,30 @@ async fn discover_peers(
                     .probe_timeout()
                     .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
             });
-            let class = match peer.addr {
-                Some(addr) => classify(addr, probe_timeout, origin, options.protocol_range()).await,
-                None => HostClass::Candidate,
+            let (class, probe_reason) = match peer.addr {
+                Some(addr) => {
+                    classify_with_reason(addr, probe_timeout, origin, options.protocol_range())
+                        .await
+                }
+                None => (HostClass::Candidate, None),
             };
+            let mut identity_too_large = false;
+            let name = capped_field(name, MAX_HOST_NAME_BYTES, &mut identity_too_large);
+            let fqdn = capped_field(fqdn, MAX_HOST_FQDN_BYTES, &mut identity_too_large);
+            let peer_id = capped_field(peer_id, MAX_HOST_PEER_ID_BYTES, &mut identity_too_large);
             HostRecord {
                 name,
                 fqdn,
                 address,
                 port,
                 overlay: peer.overlay.to_string(),
-                peer_id: peer.peer_id,
+                peer_id,
                 local: false,
-                reason: peer
-                    .address_ambiguous
-                    .then(|| ADDRESS_AMBIGUOUS_REASON.to_owned()),
+                reason: identity_too_large
+                    .then_some(REASON_IDENTITY_TOO_LARGE)
+                    .or(probe_reason)
+                    .or_else(|| peer.address_ambiguous.then_some(REASON_ADDRESS_AMBIGUOUS))
+                    .map(str::to_owned),
                 class,
             }
         })
@@ -443,15 +486,18 @@ async fn discover_peers(
         .await
 }
 
-async fn classify(
+/// Classify a probed peer together with the bounded `reason` code a refused
+/// record is reported with, when the probe failed in a way the classifier can
+/// name.
+async fn classify_with_reason(
     addr: SocketAddr,
     timeout: Duration,
     origin: Option<&RequestOrigin>,
     range: ProtocolVersionRange,
-) -> HostClass {
+) -> (HostClass, Option<&'static str>) {
     match tokio::time::timeout(timeout, probe_health(addr, origin, range)).await {
         Ok(Ok(response)) => classify_response(&response, range),
-        Ok(Err(_)) | Err(_) => HostClass::Unreachable,
+        Ok(Err(_)) | Err(_) => (HostClass::Unreachable, None),
     }
 }
 
@@ -504,21 +550,41 @@ async fn read_line(
     }
 }
 
-fn classify_response(response: &Response, range: ProtocolVersionRange) -> HostClass {
+fn classify_response(
+    response: &Response,
+    range: ProtocolVersionRange,
+) -> (HostClass, Option<&'static str>) {
     let daemon_protocol_version = response.version().get();
     if !range.contains(response.version()) {
-        return HostClass::VersionMismatch {
-            daemon_protocol_version,
-        };
+        return (
+            HostClass::VersionMismatch {
+                daemon_protocol_version,
+            },
+            None,
+        );
     }
     match response.result() {
-        Ok(ok) => HostClass::ReachableDaemon {
-            daemon_version: ok
-                .get("daemon_version")
-                .and_then(Value::as_str)
-                .map_or_else(|| "<unknown>".to_owned(), str::to_owned),
+        Ok(ok) => match ok.get("daemon_version").and_then(Value::as_str) {
+            // A health-reply version over its cap is not echoed: the peer is
+            // reported unreachable with the bounded reason instead.
+            Some(version) if version.len() > MAX_HOST_DAEMON_VERSION_BYTES => (
+                HostClass::Unreachable,
+                Some(REASON_DAEMON_VERSION_TOO_LARGE),
+            ),
+            Some(version) => (
+                HostClass::ReachableDaemon {
+                    daemon_version: version.to_owned(),
+                },
+                None,
+            ),
+            None => (
+                HostClass::ReachableDaemon {
+                    daemon_version: "<unknown>".to_owned(),
+                },
+                None,
+            ),
         },
-        Err(_) => HostClass::Unreachable,
+        Err(_) => (HostClass::Unreachable, None),
     }
 }
 
@@ -541,6 +607,17 @@ mod tests {
         BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
         OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
+
+    /// Test shortcut for [`classify_with_reason`]: the class without the
+    /// bounded reason code.
+    async fn classify(
+        addr: SocketAddr,
+        timeout: Duration,
+        origin: Option<&RequestOrigin>,
+        range: ProtocolVersionRange,
+    ) -> HostClass {
+        classify_with_reason(addr, timeout, origin, range).await.0
+    }
 
     #[derive(Debug)]
     struct TestTransport {

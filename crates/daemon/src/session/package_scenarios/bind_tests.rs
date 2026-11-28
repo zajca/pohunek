@@ -440,6 +440,35 @@ async fn a_missing_profile_or_name_is_not_found() {
     }
 }
 
+/// A profile file whose name is over the shared 128-byte cap (but within the
+/// 250-byte file-name bound) is on disk: binding answers the typed
+/// `invalid_name` error, never `package_profile_not_found` — a file that is
+/// on disk must not read as absent. Red on the old head, where the refusal
+/// mapped to `ProfileNotFound`.
+#[tokio::test]
+async fn an_over_cap_profile_file_on_disk_is_invalid_name_not_not_found() {
+    let fixture = Fixture::new("bind-overcap-name");
+    install(&fixture, &Package::pi()).await;
+    fs::create_dir_all(&fixture.agents).expect("the agents directory");
+    let name = "p".repeat(200);
+    let path = fixture.agents.join(format!("{name}.toml"));
+    fs::write(&path, unpinned()).expect("write the over-cap profile file");
+
+    let error = fixture
+        .registry
+        .packages()
+        .package_bind_profile(bind(&name, None, false))
+        .await
+        .expect_err("an over-cap name is invalid, not absent");
+    assert_eq!(error, PackageErrorKind::ProfileNameInvalid);
+    assert_eq!(
+        PackageErrorKind::ProfileNameInvalid.code(),
+        "invalid_name",
+        "the refusal is the typed invalid_name error"
+    );
+    assert!(path.is_file(), "the refusal left the file on disk as found");
+}
+
 #[tokio::test]
 async fn the_next_bind_removes_a_temporary_an_interrupted_rewrite_left() {
     let fixture = Fixture::new("bind-recovery");

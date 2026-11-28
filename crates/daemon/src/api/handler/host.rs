@@ -2,14 +2,42 @@
 
 use protocol::{
     HostDiscoverParams, HostInspectParams, HostResolveParams, ProtocolError, Request, Response,
+    MAX_CONTROL_LINE_BYTES,
 };
 
 use super::util::error_value;
 
-use super::util::{ok_value, parse_optional_params, parse_params, run_blocking, selected_version};
+use super::util::{
+    ok_value, ok_value_bounded, parse_optional_params, parse_params, run_blocking, selected_version,
+};
 use super::{ControlTransport, HealthInfo};
 use crate::discovery::DiscoveryCache;
 use crate::session::SessionRegistry;
+
+/// Hard count bound on the `host.discover` reply: 1500 peer records.
+///
+/// The success reply is one control line of at most [`MAX_CONTROL_LINE_BYTES`]
+/// (1 MiB), envelope included. One [`protocol::HostRecord`] is capped at build
+/// time (see `crates/client/src/discovery.rs`): 93 bytes of keys, quotes and
+/// punctuation, `name` at most [`protocol::MAX_HOST_NAME_BYTES`] + 2,
+/// `fqdn` at most [`protocol::MAX_HOST_FQDN_BYTES`] + 2, `address` at most 47,
+/// `port` at most 5, `overlay` at most 11 (a known provider id), `peer_id` at
+/// most [`protocol::MAX_HOST_PEER_ID_BYTES`] + 2, `local` at most 5, `reason`
+/// at most [`protocol::MAX_HOST_REASON_BYTES`] + 2, and the flattened class at
+/// most 89 bytes (`reachable_daemon` with a capped 32-byte version) — at most
+/// 670 bytes, 671 with its separating comma. The bare array adds 2 brackets and
+/// the response envelope at most `MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES`
+/// (158 bytes). The largest count whose worst case fits is
+/// (1 MiB − 158 − 2) / 671 = 1562; the constant is rounded down to 1500, whose
+/// worst case 1500 × 671 + 160 = 1,006,660 bytes stays below 1,048,576. A reply
+/// that is still too large is refused by the reply's byte-level check with the
+/// same `host_discover_too_large` code.
+const MAX_HOST_DISCOVER_RECORDS: usize = 1500;
+
+const _: () = assert!(
+    MAX_HOST_DISCOVER_RECORDS * 671 + 160 <= MAX_CONTROL_LINE_BYTES,
+    "the host.discover count bound must keep its worst-case reply inside one control line"
+);
 
 /// `host.inspect`: report this host's live capability snapshot.
 ///
@@ -94,6 +122,10 @@ fn heartbeat_capability(sessions: &SessionRegistry) -> protocol::SubscribeHeartb
 /// advertised (a client keeps its whole window on this method, see
 /// [`protocol::compat::RANGE_FORWARDING_METHODS`]), and cached per range. Discovery errors retain their typed protocol mapping rather than
 /// being represented as an empty peer list.
+///
+/// The reply is count-bounded by [`MAX_HOST_DISCOVER_RECORDS`] and itself goes
+/// through the control-line check, so an oversized result answers
+/// `host_discover_too_large` instead of a frame the client refuses.
 pub(super) async fn handle_host_discover(
     request: &Request,
     discovery: &DiscoveryCache,
@@ -106,7 +138,12 @@ pub(super) async fn handle_host_discover(
         .records(params.force, request.version_range())
         .await
     {
-        Ok(records) => ok_value(request, &records),
+        Ok(records) if records.len() > MAX_HOST_DISCOVER_RECORDS => {
+            error_value(request, ProtocolError::host_discover_too_large())
+        }
+        Ok(records) => {
+            ok_value_bounded(request, &records, ProtocolError::host_discover_too_large())
+        }
         Err(err) => error_value(request, err.to_protocol_error()),
     }
 }

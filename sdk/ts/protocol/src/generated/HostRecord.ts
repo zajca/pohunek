@@ -4,15 +4,21 @@
  * One enumerated host with its overlay identity and classification.
  *
  * Field order and names are part of the wire contract `--json` consumers parse.
+ * The peer-supplied strings (`name`, `fqdn`, `peer_id`, the class's
+ * `daemon_version` and `reason`) are capped at build time: a value over its
+ * cap is omitted and reported through [`HostRecord::reason`], never echoed
+ * verbatim, so one hostile peer cannot inflate the reply.
  */
 export type HostRecord =
   & {
     /**
-     * Short host name (first DNS label of the fqdn), when derivable.
+     * Short host name (first DNS label of the fqdn), when derivable. At most
+     * [`MAX_HOST_NAME_BYTES`] bytes when present.
      */
     name: string | null;
     /**
-     * The peer's provider-qualified DNS name.
+     * The peer's provider-qualified DNS name. At most [`MAX_HOST_FQDN_BYTES`]
+     * bytes when present.
      */
     fqdn: string | null;
     /**
@@ -29,7 +35,7 @@ export type HostRecord =
     overlay: string;
     /**
      * The overlay's stable provider peer identity (e.g. a `NetBird` public key or
-     * a Tailscale node ID).
+     * a Tailscale node ID). At most [`MAX_HOST_PEER_ID_BYTES`] bytes when present.
      */
     peer_id: string | null;
     /**
@@ -39,9 +45,12 @@ export type HostRecord =
      */
     local?: boolean;
     /**
-     * Why the probe of this record failed, set only on the local record when
-     * its own daemon did not answer. Omitted otherwise, so a peer record is
-     * unchanged on the wire.
+     * Why this record is not usable as probed or echoed: one of the
+     * `REASON_*` codes, at most [`MAX_HOST_REASON_BYTES`] bytes. Set on the
+     * local record when its own daemon did not answer, on a peer record whose
+     * probe failed in a way the classifier can name, or whose identity
+     * strings were over cap. Omitted otherwise, so a peer record is unchanged
+     * on the wire.
      */
     reason?: string;
   }
@@ -49,7 +58,8 @@ export type HostRecord =
     | {
       "classification": "reachable_daemon";
       /**
-       * The daemon version the peer reported.
+       * The daemon version the peer reported. At most
+       * [`MAX_HOST_DAEMON_VERSION_BYTES`] bytes when present.
        */
       daemon_version: string;
     }

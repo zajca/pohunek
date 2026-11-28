@@ -483,6 +483,32 @@ fn read_refuses_links_special_files_group_writable_and_oversized_profiles() {
     assert!(matches!(dir.read("binary"), Err(BindError::Unusable(_))));
 }
 
+/// A file on disk under a name the acceptance rule refuses (here over the
+/// 128-byte cap, within the 250-byte file-name bound) reads as
+/// [`BindError::NameInvalid`], while a refused name with no file stays
+/// [`BindError::NotFound`]: a file that is on disk must not read as absent.
+#[test]
+fn read_distinguishes_an_on_disk_file_under_a_refused_name_from_a_missing_profile() {
+    let fixture = Fixture::new();
+    let dir = fixture.profiles().open_for_bind().expect("open");
+
+    let over_cap = "p".repeat(200);
+    fixture.write(&over_cap, "base = \"shell\"\n");
+    assert_eq!(
+        dir.read(&over_cap).expect_err("over the cap"),
+        BindError::NameInvalid
+    );
+    assert_eq!(
+        dir.read("bad name").expect_err("no file of that name"),
+        BindError::NotFound
+    );
+    assert_eq!(
+        dir.read_existing(&over_cap).expect_err("over the cap"),
+        BindError::NameInvalid
+    );
+    assert!(dir.read_existing("absent").expect("missing").is_none());
+}
+
 #[test]
 fn a_group_writable_agents_directory_is_refused() {
     let fixture = Fixture::new();

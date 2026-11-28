@@ -51,6 +51,15 @@ status_timeout_secs = 10  # optional
   `overlay_host_ambiguous` with every peer that lists it; `host list` and
   `host discover` show them as `candidate` records without an address and with
   `reason = address_ambiguous`.
+- `host.discover` is hard-bounded at 1500 peer records: above the bound, or when
+  the reply would exceed one control line, the daemon answers
+  `host_discover_too_large`, and a peer-supplied field over its cap (`name`
+  63 B, `fqdn` 253 B, `peer_id` 64 B, `daemon_version` 32 B) is omitted and
+  named in the record's `reason` (`identity_too_large`,
+  `daemon_version_too_large`) instead of being echoed. The local record's
+  `reason` is a probe code instead: `local_probe_timeout`, `local_probe_failed`
+  or `local_daemon_error` (the probe's error detail stays in the daemon's WARN
+  log).
 - When nothing exists at `overlays.toml`, the defaults apply and the directory
   is not inspected (a symlinked or group-writable `~/.config` is fine): there
   is no configuration to trust, and a writer in an unsafe directory can only

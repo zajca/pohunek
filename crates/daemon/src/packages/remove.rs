@@ -29,7 +29,6 @@ use super::create::file_digest;
 use super::PackageService;
 use crate::agent::host::ServedBy;
 use crate::agent::{BindError, ProfileRegistry};
-use crate::project::config::validate_name;
 
 impl PackageService {
     /// Removes the host agent profile `params.profile` when its file's digest
@@ -59,9 +58,6 @@ fn remove_profile(
     params: &PackageRemoveProfileParams,
 ) -> Result<PackageRemoveProfileResult, PackageErrorKind> {
     let name = params.profile.as_str();
-    if validate_name("agent", name).is_err() {
-        return Err(PackageErrorKind::ProfileNotFound);
-    }
     let dir = match profiles.open_for_bind() {
         Ok(dir) => dir,
         Err(BindError::NotFound) => return Err(no_profile_file(profiles, name)),
@@ -69,6 +65,9 @@ fn remove_profile(
     };
     let file = match dir.read(name) {
         Ok(file) => file,
+        // A file that is on disk under a name the daemon refuses must not
+        // read as absent: answer the typed invalid_name error.
+        Err(BindError::NameInvalid) => return Err(PackageErrorKind::ProfileNameInvalid),
         Err(BindError::NotFound) => return Err(no_profile_file(profiles, name)),
         Err(error) => return Err(bind_kind(name, error).kind()),
     };

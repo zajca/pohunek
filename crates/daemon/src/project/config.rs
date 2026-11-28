@@ -42,6 +42,9 @@ const PROMPT_EXT: &str = "tmpl";
 const TEMPLATES_FILE: &str = "templates.toml";
 /// Action definitions file under each config layer.
 const ACTIONS_FILE: &str = "actions.toml";
+/// The shared config-name cap; the doc lives on the protocol constant so the
+/// CLI's profile-name check and this daemon guard cannot drift apart.
+pub(crate) use protocol::MAX_CONFIG_NAME_BYTES;
 
 #[derive(Debug, Clone, Deserialize)]
 struct TemplatesFile {
@@ -89,6 +92,28 @@ struct LayeredActions {
     host: HashMap<String, RawAction>,
     repo: HashMap<String, RawAction>,
 }
+
+/// Hard count bound on the resolved `project.actions` list: 3200 actions.
+///
+/// The success reply is one control line of at most `MAX_CONTROL_LINE_BYTES`
+/// (1 MiB), envelope included. One [`ActionSummary`] serializes as
+/// `{"name":"…","provider":"…","template":"…","layer":"…"}`: 50 bytes of keys,
+/// quotes and punctuation, `provider` at most `"linear_issue"` (14 bytes),
+/// `layer` at most `"in_repo"` (9 bytes), and `name` and `template` at most
+/// [`MAX_CONFIG_NAME_BYTES`] (128 bytes) each because [`validate_name`] caps
+/// them, so a record is at most 325 bytes, 326 with its separating comma. The
+/// `{"actions":[…]}` wrapper adds 13 bytes and the response envelope at most
+/// `MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES` (158 bytes). The largest count whose
+/// worst case fits is (1 MiB − 158 − 13) / 326 = 3215; the constant is rounded
+/// down to 3200, whose worst case 3200 × 326 + 171 = 1,043,371 bytes stays
+/// below 1,048,576. A reply that is still too large is refused by the reply's
+/// byte-level check with the same `project_actions_too_large` code.
+pub(crate) const MAX_PROJECT_ACTIONS: usize = 3200;
+
+const _: () = assert!(
+    MAX_PROJECT_ACTIONS * 326 + 171 <= protocol::MAX_CONTROL_LINE_BYTES,
+    "the project.actions count bound must keep its worst-case reply inside one control line"
+);
 
 /// Resolves per-project config from the in-repo and host-default layers, applying
 /// the name + containment guards on every read.
@@ -200,11 +225,19 @@ impl ProjectConfigResolver {
     }
 
     /// List action summaries after applying in-repo-over-host shadowing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `project_actions_too_large` when more than [`MAX_PROJECT_ACTIONS`]
+    /// actions resolve, so the reply stays within one control line.
     pub(crate) fn list_actions(&self) -> Result<Vec<ActionSummary>, ProtocolError> {
         let layers = self.load_actions("actions")?;
         let mut names = BTreeSet::new();
         names.extend(layers.host.keys().cloned());
         names.extend(layers.repo.keys().cloned());
+        if names.len() > MAX_PROJECT_ACTIONS {
+            return Err(ProtocolError::project_actions_too_large());
+        }
 
         let mut actions = Vec::with_capacity(names.len());
         for name in names {
@@ -284,10 +317,11 @@ fn parse_actions(
         .map_err(|err| invalid_action(error_name, &err.to_string()))
 }
 
-/// A.2.1.1 single-segment charset guard. A prompt/action/template/agent/manifest
-/// name must match `^[A-Za-z0-9._-]+$`, be non-empty, and not begin with `.` or
-/// `-`; any `/`, `\`, `..`, or control character is rejected with the neutral
-/// [`invalid_name`] code (one code for every name kind; the message says which).
+/// A.2.1.1 single-segment charset + length guard. A prompt/action/template/
+/// agent/manifest name must match `^[A-Za-z0-9._-]+$`, be non-empty, not begin
+/// with `.` or `-`, and be at most [`MAX_CONFIG_NAME_BYTES`] bytes; any `/`,
+/// `\`, `..`, or control character is rejected with the neutral [`invalid_name`]
+/// code (one code for every name kind; the message says which).
 ///
 /// Stricter than `validate_git_ref_arg` (`worktree/mod.rs`), which permits `/` and
 /// uses `invalid_branch` — do not reuse that guard. Run before any path join/read,
@@ -297,9 +331,15 @@ pub(crate) fn validate_name(kind: &str, name: &str) -> Result<(), ProtocolError>
     let charset_ok = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    // Non-empty, no leading `.`/`-`, charset-clean, and no embedded `..`. `/` and
-    // `\` are not in the charset, so a path separator can never pass.
-    if first.is_some() && first != Some('.') && first != Some('-') && charset_ok {
+    // Non-empty, no leading `.`/`-`, charset-clean, no embedded `..`, and within
+    // the name cap. `/` and `\` are not in the charset, so a path separator can
+    // never pass.
+    if first.is_some()
+        && first != Some('.')
+        && first != Some('-')
+        && charset_ok
+        && name.len() <= MAX_CONFIG_NAME_BYTES
+    {
         if name.contains("..") {
             return Err(invalid_name(kind, name));
         }
@@ -364,13 +404,24 @@ fn prompt_not_found(name: &str) -> ProtocolError {
 
 /// `runtime/invalid_name`: the shared neutral bad-name code (A.2.1.1). The `kind`
 /// names which sort of name failed (prompt/action/template/agent/manifest).
+/// A name within the cap is echoed; an over-cap name is never echoed — the
+/// message carries only its byte length and the limit — so the error reply
+/// itself stays inside one control line.
 pub(crate) fn invalid_name(kind: &str, name: &str) -> ProtocolError {
+    let detail = if name.len() > MAX_CONFIG_NAME_BYTES {
+        format!(
+            "{} bytes, over the {MAX_CONFIG_NAME_BYTES}-byte limit; the name is not echoed",
+            name.len()
+        )
+    } else {
+        format!(
+            "{name:?}: must be a single segment matching [A-Za-z0-9._-] and not start with '.' or '-'"
+        )
+    };
     ProtocolError::new(
         ErrorClass::Runtime,
         "invalid_name",
-        format!(
-            "invalid {kind} name {name:?}: must be a single segment matching [A-Za-z0-9._-] and not start with '.' or '-'"
-        ),
+        format!("invalid {kind} name: {detail}"),
         None,
     )
 }
@@ -528,6 +579,19 @@ mod tests {
         ] {
             let err = r.resolve_prompt(bad).expect_err("must reject");
             assert_eq!(err.code, "invalid_name", "name {bad:?}");
+        }
+        // Over the shared MAX_CONFIG_NAME_BYTES cap (129-250 bytes is the
+        // range the CLI's profile check used to accept alone): refused with
+        // the same code, and the name is not echoed in the message.
+        for len in [MAX_CONFIG_NAME_BYTES + 1, 200, 250] {
+            let bad = "a".repeat(len);
+            let err = r.resolve_prompt(&bad).expect_err("must reject");
+            assert_eq!(err.code, "invalid_name", "{len} bytes");
+            assert!(
+                !err.msg.contains(&bad),
+                "over-cap name must not be echoed: {:.80}",
+                err.msg
+            );
         }
     }
 

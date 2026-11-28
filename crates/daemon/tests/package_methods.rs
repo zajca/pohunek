@@ -24,7 +24,7 @@ use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
 use protocol::{
     method, HostCapabilities, PackageChangeResult, PackageDoctorResult, PackageInspectResult,
     PackageInstallResult, PackageInstallStatus, PackageListResult, PackageUninstallResult,
-    Request as ProtocolRequest, Response,
+    Request as ProtocolRequest, Response, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
@@ -6229,5 +6229,68 @@ async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_not
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(created)).await;
     drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_registry_at_the_package_cap_lists_in_one_control_line() {
+    let servers = spawn_servers("pkg-cap").await;
+    let mut local = connect_unix(&servers.socket).await;
+    // Install one real package so the registry file holds a real record shape.
+    let (bytes, digest) = archive("/bin/sh");
+    let archive_path = servers.plugins.with_file_name("pi.tar.zst");
+    std::fs::write(&archive_path, &bytes).expect("write the archive");
+    let installed: PackageInstallResult = call(
+        &mut local,
+        method::PACKAGE_INSTALL,
+        json!({
+            "archive_path": archive_path,
+            "trust": { "kind": "explicit_digest", "digest": digest },
+            "enable": false,
+            "select": false,
+            "dry_run": false
+        }),
+    )
+    .await;
+    assert_eq!(installed.status, PackageInstallStatus::Installed);
+
+    // Fill the registry to the cap with filler records cloned from the installed
+    // one, the fixture shape of `crates/package/tests/registry.rs`. The write
+    // keeps the file's 0600 mode, which the registry refuses to read otherwise.
+    let registry_path = servers.plugins.join("registry.json");
+    let mut value: Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).expect("read the registry"))
+            .expect("the registry is JSON");
+    let template = value["packages"][0].clone();
+    let packages = value["packages"].as_array_mut().expect("the package list");
+    packages.clear();
+    for index in 0..package::registry::MAX_PACKAGES {
+        let mut record = template.clone();
+        record["digest"] = format!("sha256:{index:064x}").into();
+        record["identity"]["id"] = format!("filler.p{index}").into();
+        packages.push(record);
+    }
+    std::fs::write(
+        &registry_path,
+        serde_json::to_vec(&value).expect("serialize the registry"),
+    )
+    .expect("write the registry");
+
+    // The reply is measured on the wire: the daemon frames every response with
+    // the control-line cap, so receiving it at all proves it fitted, and the
+    // re-serialized line is checked against the cap explicitly.
+    let response = exchange(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    let line = serde_json::to_string(&response).expect("serialize the response");
+    assert!(
+        line.len() < MAX_CONTROL_LINE_BYTES,
+        "the full-registry reply plus its newline is one control line: {} bytes",
+        line.len() + 1
+    );
+    let result = response
+        .into_result()
+        .expect("a registry at the cap lists in one line");
+    let listed = result["packages"].as_array().expect("the package records");
+    assert_eq!(listed.len(), package::registry::MAX_PACKAGES);
+
     servers.stop().await;
 }

@@ -2312,10 +2312,24 @@ async fn daemon_doctor_truncates_oversized_reports_below_control_line_limit() {
     process_env.set("PATH", root.path());
     let agents = root.path().join("agents");
     std::fs::create_dir(&agents).expect("create agents directory");
-    for index in 0..4096 {
-        let name = format!("p{index:04}-{}", "x".repeat(235));
+    for index in 0..4095 {
+        // A profile name at the 128-byte cap: validate_name accepts it, so the
+        // doctor check still echoes the full name and each check is large.
+        // (An over-cap name collapses to a short `agent_profile_invalid_name`
+        // check and shrinks the report below the truncation limit.)
+        let name = format!("p{index:04}-{}", "x".repeat(122));
         std::fs::write(agents.join(format!("{name}.toml")), "base = \"shell\"\n")
             .expect("write large-report profile");
+    }
+    // Manifest overrides grow the report as well: one check per manifest, again
+    // with names at the cap. Profiles plus manifests exceed the doctor report
+    // limit, so bounded_report must truncate and say so explicitly.
+    let manifests = agents.join("manifests");
+    std::fs::create_dir(&manifests).expect("create manifests directory");
+    for index in 0..2048 {
+        let name = format!("m{index:04}-{}", "x".repeat(122));
+        std::fs::write(manifests.join(format!("{name}.toml")), "rules = []\n")
+            .expect("write large-report manifest");
     }
     let config = SessionRegistryConfig {
         agents_dir: Some(agents),

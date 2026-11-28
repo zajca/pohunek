@@ -26,7 +26,7 @@ use protocol::{
     PackageBindStatus, PackageCreatePresetParams, PackageCreateProfileParams,
     PackageCreateProfileResult, PackageCreateProfileStatus, PackageDigest, PackageId, PackageInfo,
     PackageOrigin, PackageRemoveProfileParams, PackageRemoveProfileResult, ProfileDigest,
-    RuntimeId,
+    RuntimeId, MAX_CONFIG_NAME_BYTES,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -52,10 +52,12 @@ const PROFILE_EXTENSION: &str = ".toml";
 
 /// Longest accepted profile name in bytes.
 ///
-/// Filesystems cap a file name at 255 bytes; the `.toml` extension takes five,
-/// so no longer name can exist as a profile file. The daemon sets no tighter
-/// bound, and a tighter one here would hide profiles it can load.
-const PROFILE_NAME_MAX_BYTES: usize = 250;
+/// The shared [`MAX_CONFIG_NAME_BYTES`] bound of the protocol, enforced
+/// identically by the daemon's `validate_name`: the CLI and the daemon refuse
+/// the same names, so a profile the daemon would reject with `invalid_name`
+/// never shows up in listings or completion. (Filesystems cap a file name at
+/// 255 bytes, which is why this used to sit at 250; the shared cap is tighter.)
+const PROFILE_NAME_MAX_BYTES: usize = MAX_CONFIG_NAME_BYTES;
 
 /// Most directory entries one listing or completion reads.
 ///
@@ -327,9 +329,11 @@ pub(crate) struct MigrateArgs {
 
 /// Whether `name` is a valid profile name.
 ///
-/// Mirrors the daemon's single-segment charset guard (`validate_name` in
+/// Mirrors the daemon's guard (`validate_name` in
 /// `crates/daemon/src/project/config.rs`): non-empty, only ASCII letters,
-/// digits, `.`, `_` and `-`, no leading `.` or `-`, and no `..`.
+/// digits, `.`, `_` and `-`, no leading `.` or `-`, no `..`, and at most
+/// [`MAX_CONFIG_NAME_BYTES`] bytes — the same shared constant, so both sides
+/// accept and refuse exactly the same names.
 pub(crate) fn is_valid_profile_name(name: &str) -> bool {
     let Some(first) = name.chars().next() else {
         return false;
@@ -346,6 +350,11 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 pub(super) fn parse_profile_name(value: &str) -> Result<String, String> {
     if is_valid_profile_name(value) {
         Ok(value.to_owned())
+    } else if value.len() > MAX_CONFIG_NAME_BYTES {
+        Err(format!(
+            "profile names are at most {MAX_CONFIG_NAME_BYTES} bytes ({} given)",
+            value.len()
+        ))
     } else {
         Err(
             "expected letters, digits, `.`, `_` and `-`, with no leading `.` or `-` and no `..`"

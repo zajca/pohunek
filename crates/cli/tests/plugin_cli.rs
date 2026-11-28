@@ -1491,6 +1491,55 @@ fn profile_migrate_rejects_invalid_names_before_any_io() {
 }
 
 #[test]
+fn a_profile_name_over_the_shared_cap_is_refused_identically_by_cli_and_daemon() {
+    let fixture = Fixture::new();
+    // 200 bytes: inside the old CLI-only 250-byte bound, but over the shared
+    // 128-byte cap the daemon enforces, so both sides must refuse it.
+    let long_name = "p".repeat(200);
+    fixture.profile(&long_name, &profile_text(), 0o600);
+    fixture.profile("work", &profile_text(), 0o600);
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    // The listing does not treat the over-cap name as a loadable profile:
+    // it shows as unreadable with the validity detail, never as a normal row.
+    let output = fixture.run(&["plugin", "profile", "list", "--json", "--all"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let document = stdout_json(&output);
+    let profiles = document["ok"]["profiles"].as_array().expect("profiles");
+    let long = profiles
+        .iter()
+        .find(|entry| entry["name"] == long_name)
+        .expect("the over-cap file is listed as refused");
+    assert_eq!(long["state"], "unreadable", "{document}");
+    assert!(
+        long["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("not a valid profile name"),
+        "{document}"
+    );
+    let work = profiles
+        .iter()
+        .find(|entry| entry["name"] == "work")
+        .expect("the valid profile is listed normally");
+    assert_ne!(work["state"], "unreadable", "{document}");
+
+    // A subcommand naming it is refused at parse time with a message that
+    // names the shared 128-byte limit, before any daemon IO — the same
+    // refusal the daemon's own load and remove give (invalid_name, covered
+    // by the daemon tests over the same protocol constant).
+    let output = fixture.run(&["plugin", "profile", "rm", &long_name]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("at most 128 bytes"),
+        "the parse refusal names the byte limit: {stderr}"
+    );
+
+    drop(daemon.finish());
+}
+
+#[test]
 fn profile_list_refuses_an_unsafe_agents_directory() {
     let fixture = Fixture::new();
     fixture.profile("work", &profile_text(), 0o600);
