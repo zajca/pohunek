@@ -2461,6 +2461,8 @@ omitted):
 ```
 
 Visible lines are plain UTF-8 terminal cells with control sequences removed.
+They cover the active screen only: scrolled-off history is never included, so a
+long scrollback cannot push the result past the row and column bounds below.
 The protocol ceiling for the serialized result is
 `MAX_SESSION_SCREEN_RESPONSE_BYTES` (1,048,418 bytes), derived from the 1 MiB control-line cap
 with response-envelope headroom. The daemon additionally defaults to at most

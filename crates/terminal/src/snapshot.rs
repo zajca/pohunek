@@ -44,7 +44,13 @@ pub struct TerminalSnapshot {
     pub title: Option<String>,
     /// Current OSC progress payload, when observed.
     pub progress: Option<String>,
-    /// Visible text without terminal styling.
+    /// Visible text of the active screen rows only, without terminal styling.
+    ///
+    /// Scrolled-off history is never included on either backend, so a long
+    /// scrollback cannot grow the snapshot past the screen (issue #2538 M2);
+    /// the libghostty backend takes this view from the sys crate's
+    /// `HeadlessTerminal::visible_text`, the vt100 backend from
+    /// `Screen::contents`.
     pub visible_text: String,
     /// ANSI stream that recreates the complete visible state.
     pub ansi: Vec<u8>,

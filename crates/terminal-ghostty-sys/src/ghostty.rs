@@ -563,11 +563,78 @@ impl HeadlessTerminal {
         Ok(String::from_utf8_lossy(&buf[..needed]).into_owned())
     }
 
-    /// The visible text, without styling.
+    /// The visible text of the active screen, without styling: the view
+    /// `pohunek-terminal`'s snapshot reports as `visible_text` (and therefore
+    /// what `session.screen` returns), built cell by cell.
+    ///
+    /// Only the active screen rows are read — the library's scrollback is
+    /// never included, so a long history cannot grow the text past the screen
+    /// (issue #2538 M2). The layout mirrors what the vt100 backend's
+    /// `Screen::contents()` reports (the `Grid::write_contents` algorithm), so
+    /// the two backends agree: a cell with text emits its graphemes, the gap
+    /// before it is filled with spaces up to its column, a wide cell advances
+    /// two columns and its spacer emits nothing, a soft-wrapped row joins the
+    /// previous one instead of breaking the line, and trailing line breaks
+    /// are removed.
+    ///
+    /// For the history view — the same text plus the scrollback rows the
+    /// library retained — use [`HeadlessTerminal::format_plain`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`GhosttyError`] when the size, a row flag or a cell read
+    /// fails.
+    pub fn visible_text(&self) -> Result<String, GhosttyError> {
+        let (rows, cols) = self.size()?;
+        let mut wrapped = Vec::with_capacity(usize::from(rows));
+        for row in 0..rows {
+            wrapped.push(self.row_wrapped(row)?);
+        }
+        let mut text = String::new();
+        let mut wrapping = false;
+        for row in 0..rows {
+            let mut prev_was_wide = false;
+            let mut prev_col: u16 = 0;
+            for col in 0..cols {
+                let cell = self.cell(row, col)?;
+                if prev_was_wide {
+                    // The spacer half of a wide cell emits nothing.
+                    prev_was_wide = false;
+                    continue;
+                }
+                prev_was_wide = cell.wide;
+                if !cell.text.is_empty() {
+                    for _ in 0..(col - prev_col) {
+                        text.push(' ');
+                    }
+                    prev_col = col;
+                    text.push_str(&cell.text);
+                    prev_col += if cell.wide { 2 } else { 1 };
+                }
+            }
+            // An empty row that continues the previous soft-wrapped line still
+            // breaks the text line, as in the vt100 grid.
+            if prev_col == 0 && wrapping {
+                text.push('\n');
+            }
+            if !wrapped[usize::from(row)] {
+                text.push('\n');
+            }
+            wrapping = wrapped[usize::from(row)];
+        }
+        while text.ends_with('\n') {
+            text.pop();
+        }
+        Ok(text)
+    }
+
+    /// The full text, without styling: the history view.
     ///
     /// UNWRAP joins soft-wrapped rows into one logical line and TRIM drops the
     /// trailing spaces of each line, which is what the vt100 backend reports as
-    /// its visible text. History rows the library retained are included.
+    /// its visible text. History rows the library retained are included, so
+    /// this view is unbounded by the screen and must not back a bounded
+    /// snapshot; the active-rows view is [`HeadlessTerminal::visible_text`].
     ///
     /// # Errors
     ///

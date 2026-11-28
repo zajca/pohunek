@@ -27,9 +27,10 @@ const MAX_OSC52_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// The tracker supplies feed, resize and the repaint; the terminal supplies
 /// the cell dump. `dump` fails when the two disagree on the visible text,
-/// which keeps the dump a description of what the seam really runs. The
-/// per-write clipboard record lives here, in the spike only: the product's
-/// sys crate keeps a bounded counter and the last size (issue #2538 M3).
+/// which keeps the dump a description of what the seam really runs; both use
+/// the sys crate's active-rows `visible_text` view. The per-write clipboard
+/// record lives here, in the spike only: the product's sys crate keeps a
+/// bounded counter and the last size (issue #2538 M3).
 #[derive(Debug)]
 pub struct GhosttyModel {
     tracker: TerminalTracker,
@@ -106,8 +107,13 @@ impl GridModel for GhosttyModel {
     fn dump(&self) -> Result<GridDump, ModelError> {
         let snapshot = self.tracker.snapshot(0);
         let terminal = &self.terminal;
-        let visible =
-            String::from_utf8_lossy(&terminal.format_plain().map_err(model_error)?).into_owned();
+        // Like with like: both sides report the active-rows view. The
+        // tracker's `visible_text` and the sys crate's `visible_text()` are
+        // the same definition (the one `session.screen` reports); the history
+        // view `format_plain` includes scrollback and is not what the seam
+        // reports, so comparing against it would flag every trace that
+        // scrolled (issue #2538 M2).
+        let visible = terminal.visible_text().map_err(model_error)?;
         if snapshot.visible_text != visible {
             return Err(ModelError {
                 model: NAME,
