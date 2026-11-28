@@ -237,6 +237,18 @@ fn an_absent_runtime_directory_resolves_to_the_socket_path() {
 }
 
 #[test]
+fn an_unsafe_ancestor_of_the_runtime_directory_is_refused() {
+    let runtime = Runtime::new();
+    runtime.create_dir();
+    // A group- and world-writable ancestor of the runtime directory fails the
+    // trusted-directory ancestor policy (#2563).
+    set_mode(&runtime.root, OPEN_MODE);
+
+    let error = runtime.resolve().expect_err("an unsafe ancestor is unsafe");
+    assert_eq!(unsafe_reason(&error), UnsafeEndpointReason::UnsafeAncestor);
+}
+
+#[test]
 fn a_symlinked_runtime_directory_is_refused() {
     let runtime = Runtime::new();
     let elsewhere = runtime.root.join("elsewhere");

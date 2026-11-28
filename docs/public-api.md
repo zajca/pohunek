@@ -5469,11 +5469,13 @@ Public exports:
   the daemon's local socket path, resolved by the shared `pohunek-paths`
   contract (`XDG_RUNTIME_DIR` on Linux, the per-user temporary root on macOS).
   An existing runtime directory or socket must be private to the caller: not a
-  symlink, owned by the effective user, no group or other access; a missing
+  symlink, owned by the effective user, no group or other access, a private ACL,
+  and every ancestor passing the trusted-directory policy — the same
+  `TrustedDir` validation the daemon applies when it creates the directory
+  (`pohunek-platform`, #2563); a missing
   entry passes, so connecting reports an absent daemon. The check is a
-  point-in-time inspection of the two entries by name, not a guarantee about the
-  peer of a later connect: it does not inspect ancestor directories or ACLs and
-  does not verify the connected peer's uid. Failures are typed:
+  point-in-time inspection of the entries, not a guarantee about the
+  peer of a later connect: it does not verify the connected peer's uid. Failures are typed:
   `ClientError::LocalSocketUnresolvable` (`local_socket_unresolvable`: the
   runtime directory variable is missing or malformed), `LocalSocketPathInvalid`
   (`local_socket_path_invalid`: not absolute, a `..` component, a NUL byte or

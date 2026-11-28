@@ -21,6 +21,8 @@ pub mod filesystem;
 pub mod peer;
 pub mod process;
 pub mod shell_env;
+#[cfg(unix)]
+pub mod socket_endpoint;
 pub mod supervisor;
 
 #[cfg(test)]
