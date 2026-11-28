@@ -36,6 +36,7 @@ use std::future::Future;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use pohunek_paths::InstallLayout;
 use pohunek_service_config::runtimes::AcceptedGap;
@@ -73,6 +74,15 @@ use crate::service::runtimes::{
 };
 use crate::service::{self, Context, VERSION};
 use crate::target::LOCAL_HOST;
+
+/// Response budget of every daemon call of a host setup, check or assistant
+/// selection.
+///
+/// A setup installs a service and then drives a daemon that may still be
+/// starting under its supervisor while the package catalog is served, so on a
+/// loaded runner one response can outlast the client's default 5 s budget
+/// (#2595). The wait stays a bounded per-request ceiling for this flow only.
+pub(crate) const SETUP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Name of the signed catalog inside the release's `runtime/` directory.
 ///
@@ -829,7 +839,13 @@ async fn plan_assistant(
 ) -> Option<AssistantStep> {
     let index = options.assistant.as_ref()?;
     let mut client = match service {
-        ServiceStep::Present => Client::connect(LOCAL_HOST, &paths_of(context)).await.ok(),
+        ServiceStep::Present => Client::connect_with_request_timeout(
+            LOCAL_HOST,
+            &paths_of(context),
+            SETUP_RESPONSE_TIMEOUT,
+        )
+        .await
+        .ok(),
         ServiceStep::Install { .. } => None,
     };
     Some(setup_assistant::plan(index.url(), client.as_mut()).await)
@@ -907,7 +923,8 @@ async fn apply_steps(
     };
 
     let paths = paths_of(context);
-    let mut client = Client::connect(LOCAL_HOST, &paths).await?;
+    let mut client =
+        Client::connect_with_request_timeout(LOCAL_HOST, &paths, SETUP_RESPONSE_TIMEOUT).await?;
     let installs_packages = remaining
         .packages
         .iter()
