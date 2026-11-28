@@ -92,6 +92,9 @@ fn operator_plugin_runtime_suite_passes() {
 
 #[test]
 fn release_plugin_smoke_self_test_passes() {
+    // Regression note (#2587): the smoke polls the daemon log for the
+    // `--local-only` line with a bounded deadline instead of reading it once,
+    // because the line can be written after the control socket already accepts.
     let suite = repository_root().join("scripts/tests/smoke-hermes-plugin-release.sh");
     let env = TestEnv::new().expect("hermetic test environment");
     let output = env

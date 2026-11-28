@@ -498,10 +498,22 @@ else
     "$SLEEP_EXECUTABLE" "$DAEMON_READY_INTERVAL_SECONDS"
   done
 
-  if ! grep -Fq -- 'remote control listener disabled by --local-only' "$release_smoke_daemon_log"; then
-    daemon_log_tail
-    fail "the release daemon did not run with --local-only: no overlay-disabled line in its log"
-  fi
+  # The listener line can be flushed after the socket already accepts, so the
+  # log is polled with the same bounded attempts as the readiness wait above,
+  # not read once (#2587).
+  attempt=0
+  until grep -Fq -- 'remote control listener disabled by --local-only' "$release_smoke_daemon_log"; do
+    if ! kill -0 "$release_smoke_daemon_pid" 2>/dev/null; then
+      daemon_log_tail
+      fail "the release daemon exited before it logged --local-only"
+    fi
+    attempt=$((attempt + 1))
+    if (( attempt >= DAEMON_READY_ATTEMPTS )); then
+      daemon_log_tail
+      fail "the release daemon did not run with --local-only: no overlay-disabled line in its log"
+    fi
+    "$SLEEP_EXECUTABLE" "$DAEMON_READY_INTERVAL_SECONDS"
+  done
 
   # Each result is captured by a plain assignment, so a failing command ends the
   # smoke through `set -e` before its output is inspected.

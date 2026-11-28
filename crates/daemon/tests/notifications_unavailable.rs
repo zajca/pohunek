@@ -15,6 +15,7 @@ use std::process::Stdio;
 
 use pohunek_client::ClientError;
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::host_lock::{HostLock, UNREADABLE_HOLDERS};
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{bin_exe, worker_binary};
 use protocol::{
@@ -221,6 +222,17 @@ async fn assert_notification_calls_refused(client: &mut pohunek_client::Client, 
 
 #[tokio::test]
 async fn a_store_this_build_cannot_use_leaves_the_daemon_running_and_the_files_untouched() {
+    // The session removal sweeps the whole same-user process table and refuses
+    // on a process whose environment it cannot read, so this test joins the
+    // `unreadable-holders` nextest group and holds the host lock for its whole
+    // run: a parallel test's non-dumpable fixture process would otherwise be
+    // unattributable and the removal refused (#2575).
+    let _host_lock = HostLock::acquire(
+        UNREADABLE_HOLDERS,
+        std::thread::current()
+            .name()
+            .unwrap_or("notifications_unavailable"),
+    );
     for (case, files) in unavailable_cases() {
         let env = TestEnv::new().expect("create short test environment");
         let layout = Layout::new(&env, &files);
