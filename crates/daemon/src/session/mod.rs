@@ -208,9 +208,18 @@ pub(crate) use observation::{observation_worker_error, runtime_identity};
 
 /// Test-only seam (M-TEST-UTIL): the `session.screen` result the daemon
 /// builds from a worker wire snapshot, so an integration scenario can drive
-/// the wire-to-public mapping (issue #2538 P3a) without a live PTY.
+/// the wire-to-public mapping (issue #2538 P3a) without a live PTY. Declared
+/// here, in the public module and behind the `test-util` feature like every
+/// other seam, so a non-test build never sees a `pub` item it cannot reach.
 #[cfg(feature = "test-util")]
-pub use observation::screen_result;
+pub fn screen_result(
+    session_id: &SessionId,
+    worker_id: String,
+    runtime: protocol::SessionRuntimeIdentity,
+    snapshot: &pohunek_worker_protocol::TerminalSnapshot,
+) -> Result<protocol::SessionScreenResult, protocol::ProtocolError> {
+    observation::screen_result(session_id, worker_id, runtime, snapshot)
+}
 
 use attach::{generate_daemon_instance_id, ActiveAttach, PendingAttach};
 use hooks::SessionHookRequest;

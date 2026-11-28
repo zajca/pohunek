@@ -645,8 +645,9 @@ fn screen_model(model: pohunek_worker_protocol::ScreenModelId) -> ScreenModelId 
 ///
 /// Issue #2538 P3a: `model`/`format_version` are carried through unchanged
 /// and omitted when the worker did not send them, so an N-1 worker produces
-/// exactly the pre-P3 reply shape.
-pub fn screen_result(
+/// exactly the pre-P3 reply shape. Re-exported as a test-only seam from
+/// [`super::screen_result`] under the `test-util` feature.
+pub(crate) fn screen_result(
     session_id: &SessionId,
     worker_id: String,
     runtime: SessionRuntimeIdentity,
