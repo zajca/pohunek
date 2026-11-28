@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use protocol::{
     ErrorClass, OutputOffset, ProtocolError, RuntimeGeneration, ScreenLink, ScreenLinkSource,
-    SessionInfo, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    ScreenModelId, SessionInfo, SessionOutputGap, SessionOutputParams, SessionOutputResult,
     SessionRuntimeIdentity, SessionScreenResult, SessionWaitParams, SessionWaitReason,
     SessionWaitResult, TerminalCursor, TerminalDimensions, TerminalWatermark,
 };
@@ -119,6 +119,10 @@ impl SessionRegistry {
                 visible: snapshot.cursor.visible,
             },
             alternate_screen: snapshot.alternate_screen,
+            // Absent when the worker predates the field (issue #2538 P3): an
+            // N-1 worker then produces exactly today's reply shape.
+            screen_model: snapshot.model.map(screen_model),
+            format_version: snapshot.format_version,
             title: snapshot.title,
             progress: snapshot.progress,
             visible_lines: snapshot.visible_lines,
@@ -646,6 +650,14 @@ fn bounded_links(
         bounded.push(link);
     }
     bounded
+}
+
+/// Maps the worker wire screen model onto the public type (issue #2538 P3).
+fn screen_model(model: pohunek_worker_protocol::ScreenModelId) -> ScreenModelId {
+    match model {
+        pohunek_worker_protocol::ScreenModelId::Vt100 => ScreenModelId::Vt100,
+        pohunek_worker_protocol::ScreenModelId::Libghostty => ScreenModelId::Libghostty,
+    }
 }
 
 fn log_wait_completed(params: &SessionWaitParams, result: &SessionWaitResult, started: Instant) {

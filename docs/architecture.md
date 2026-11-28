@@ -573,6 +573,19 @@ daemon uses that version's bounded replay attach path. A daemon upgrade must
 never make an otherwise live PTY unreachable merely because it cannot provide a
 newer terminal snapshot feature.
 
+Every terminal snapshot that crosses the worker wire carries `model`
+(`vt100` or `libghostty`) and `format_version` (currently `1`) next to the
+screen state, and the daemon forwards both to `session.screen` as
+`screen_model`/`format_version` (issue #2538). The fields are optional on the
+wire: an older peer omits them and a newer peer ignores them, because no
+receiving type in either protocol window denies unknown fields, so they are
+additive without a version bump (worker protocol stays 9, window 8..=9; public
+protocol stays 5). Absent means `vt100` / `1`, i.e. an N-1 worker or the vt100
+fallback build. The tracker stamps both from `TerminalTracker::model()` and
+`CURRENT_FORMAT_VERSION`, which a pin or repaint change bumps; the committed
+golden fixtures are keyed by `(model, format_version)` so such a bump is a
+visible file rename, not a silent byte change.
+
 A worker answers the OSC 7501 program-status probe for its own PTY when the
 daemon sets `answers_program_status_probe` in `Initialize` (an additive field: a
 worker that predates it ignores it and never answers). The daemon derives the

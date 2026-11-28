@@ -2,6 +2,7 @@
 
 import type { RuntimeGeneration } from "./RuntimeGeneration";
 import type { ScreenLink } from "./ScreenLink";
+import type { ScreenModelId } from "./ScreenModelId";
 import type { SessionId } from "./SessionId";
 import type { TerminalCursor } from "./TerminalCursor";
 import type { TerminalDimensions } from "./TerminalDimensions";
@@ -35,6 +36,20 @@ export type SessionScreenResult = {
    * Whether the terminal is in its alternate screen buffer.
    */
   alternate_screen: boolean;
+  /**
+   * Screen model that rendered this snapshot, when the worker reports one.
+   *
+   * Omitted by a worker that predates the field; a reader treats that
+   * absence as `vt100`.
+   */
+  screen_model?: ScreenModelId;
+  /**
+   * Wire format version of the snapshot payload, when the worker reports
+   * one.
+   *
+   * Omitted by a worker that predates the field.
+   */
+  format_version?: number;
   /**
    * Sanitized terminal title when available.
    */

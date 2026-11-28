@@ -23,6 +23,44 @@ const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 /// Ends a synchronized-output bracket (DEC private mode 2026).
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 
+/// Identifier of the screen model that produced a [`TerminalSnapshot`].
+///
+/// Serialized as a `snake_case` string so a wire reader can name the backend
+/// that rendered the snapshot. A new model is a new variant; an older reader
+/// that does not know it fails the decode of that one field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenModelId {
+    /// The pure-Rust `vt100` parser, the model Pohunek ships today.
+    #[default]
+    Vt100,
+    /// libghostty-vt through `pohunek-terminal-ghostty-sys`, available only
+    /// with the `libghostty` feature.
+    Libghostty,
+}
+
+impl From<ModelKind> for ScreenModelId {
+    fn from(model: ModelKind) -> Self {
+        match model {
+            ModelKind::Vt100 => Self::Vt100,
+            #[cfg(feature = "libghostty")]
+            ModelKind::Libghostty => Self::Libghostty,
+        }
+    }
+}
+
+/// Wire format version of the snapshot payload this build emits.
+///
+/// Bump this whenever the meaning of a snapshot field changes, a parser pin
+/// moves, or a repaint option changes, so a reader of the bytes can tell which
+/// pin produced them. A snapshot without the field decodes as version 1.
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
+
+/// serde default of [`TerminalSnapshot::format_version`].
+fn current_format_version() -> u32 {
+    CURRENT_FORMAT_VERSION
+}
+
 /// Provider-independent current terminal state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
@@ -40,6 +78,12 @@ pub struct TerminalSnapshot {
     pub cursor_visible: bool,
     /// Whether the alternate screen is active.
     pub alternate_screen: bool,
+    /// Screen model that produced this snapshot.
+    #[serde(default)]
+    pub model: ScreenModelId,
+    /// Wire format version of the snapshot payload.
+    #[serde(default = "current_format_version")]
+    pub format_version: u32,
     /// Current OSC title, when observed.
     pub title: Option<String>,
     /// Current OSC progress payload, when observed.
@@ -297,6 +341,8 @@ impl TerminalTracker {
             cursor_col: state.cursor_col,
             cursor_visible: state.cursor_visible,
             alternate_screen: state.alternate_screen,
+            model: self.model().into(),
+            format_version: CURRENT_FORMAT_VERSION,
             title: self.osc.title.clone(),
             progress: self.osc.progress.clone(),
             visible_text: state.visible_text,

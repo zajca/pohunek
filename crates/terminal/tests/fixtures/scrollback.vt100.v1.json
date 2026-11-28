@@ -1,0 +1,13 @@
+{
+  "rows": 5,
+  "cols": 10,
+  "cursor_row": 4,
+  "cursor_col": 0,
+  "cursor_visible": true,
+  "alternate_screen": false,
+  "model": "vt100",
+  "format_version": 1,
+  "title": null,
+  "progress": null,
+  "visible_text": "line13\nline14\nline15\ndone"
+}

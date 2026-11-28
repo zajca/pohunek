@@ -8,7 +8,18 @@
 
 // Rust guideline compliant 2026-11-26
 
-use pohunek_terminal::{LinkSource, ModelKind, ScreenLink, TerminalTracker, MAX_LINK_URL_BYTES};
+use pohunek_terminal::{
+    LinkSource, ModelKind, ScreenLink, ScreenModelId, TerminalTracker, CURRENT_FORMAT_VERSION,
+    MAX_LINK_URL_BYTES,
+};
+
+/// Asserts the versioning fields of a vt100 tracker's snapshot (issue #2538
+/// P3a case-table rows 5 and 11 pin the anchors; they also pin the fields).
+fn assert_versioning(tracker: &TerminalTracker) {
+    let snapshot = tracker.snapshot(0);
+    assert_eq!(snapshot.model, ScreenModelId::from(ModelKind::Vt100));
+    assert_eq!(snapshot.format_version, CURRENT_FORMAT_VERSION);
+}
 
 fn osc8(url: &str, text: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
@@ -34,6 +45,8 @@ fn an_osc8_sequence_split_between_two_feeds_reports_like_an_unsplit_one() {
     let expected = vec![link("http://split.test/a", LinkSource::Osc8, 0, 0)];
     assert_eq!(whole.links(MAX_LINK_URL_BYTES), expected);
     assert_eq!(split.links(MAX_LINK_URL_BYTES), expected);
+    assert_versioning(&whole);
+    assert_versioning(&split);
 }
 
 #[test]
@@ -98,6 +111,7 @@ fn every_encoding_of_an_alternate_screen_switch_drops_the_anchors() {
         tracker.feed(format!("{switch}\x1b[Hclick").as_bytes());
 
         assert_eq!(tracker.links(MAX_LINK_URL_BYTES), Vec::new(), "{name}");
+        assert_versioning(&tracker);
     }
 }
 

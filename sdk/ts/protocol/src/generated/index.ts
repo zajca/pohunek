@@ -191,6 +191,7 @@ export type { RuntimeRef } from "./RuntimeRef";
 export type { RuntimeState } from "./RuntimeState";
 export type { ScreenLink } from "./ScreenLink";
 export type { ScreenLinkSource } from "./ScreenLinkSource";
+export type { ScreenModelId } from "./ScreenModelId";
 export type { SessionAdoptParams } from "./SessionAdoptParams";
 export type { SessionAdoptResult } from "./SessionAdoptResult";
 export type { SessionAttachParams } from "./SessionAttachParams";
