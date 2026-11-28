@@ -457,7 +457,8 @@ impl OscTracker {
                 self.state = OscState::Escape;
             }
             0x18 | 0x1a => self.state = OscState::Ground,
-            // DEL is ignored inside a sequence, as terminals do.
+            // DEL is ignored and the other C0 controls execute without
+            // ending the sequence, as a VT parser treats both CSI states.
             0x00..=0x1f | 0x7f => {}
             _ => self.state = OscState::Ground,
         }
@@ -504,6 +505,10 @@ impl OscTracker {
                         self.escape_at = self.consumed;
                         OscState::Escape
                     }
+                    0x18 | 0x1a => OscState::Ground,
+                    // A VT parser ignores DEL in CSI entry and executes the
+                    // other C0 controls there without ending the sequence.
+                    0x00..=0x1f | 0x7f => OscState::Csi,
                     _ => OscState::Ground,
                 };
             }
@@ -594,7 +599,13 @@ enum OscState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelKind, TerminalTracker};
+    use super::{ModelKind, TerminalTracker, SYNC_END};
+
+    /// Whether the program's own mode 2026 is tracked as set: the repaint
+    /// appends its closing reset only while the mode is unset.
+    fn mode_2026_is_set(tracker: &TerminalTracker) -> bool {
+        !tracker.snapshot(0).ansi.ends_with(SYNC_END)
+    }
 
     #[test]
     fn fragmented_vt_and_osc_sequences_produce_complete_snapshot() {
@@ -623,5 +634,37 @@ mod tests {
         tracker.feed(b"\x07\x1b]2;safe\x07");
 
         assert_eq!(tracker.snapshot(0).title.as_deref(), Some("safe"));
+    }
+
+    #[test]
+    fn del_and_c0_in_csi_entry_do_not_end_the_sequence() {
+        // A VT parser ignores DEL in CSI entry and executes the other C0
+        // controls there without ending the sequence, so `ESC [ DEL ? 2026 h`
+        // and `ESC [ NUL ? 2026 h` set mode 2026 on a real terminal and here.
+        for prefix in [&b"\x1b[\x7f"[..], &b"\x1b[\x00"[..], &b"\x1b[\x1b["[..]] {
+            let mut tracker = TerminalTracker::with_model(ModelKind::Vt100, 2, 10);
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(b"?2026h");
+            tracker.feed(&bytes);
+            assert!(
+                mode_2026_is_set(&tracker),
+                "{prefix:?} must not end the CSI: the private mode still applies"
+            );
+        }
+    }
+
+    #[test]
+    fn can_and_sub_in_csi_entry_abort_the_sequence() {
+        // CAN and SUB end any escape sequence, so the `? 2026 h` after them is
+        // printed text and mode 2026 stays unset.
+        for abort in [0x18_u8, 0x1a] {
+            let mut tracker = TerminalTracker::with_model(ModelKind::Vt100, 2, 10);
+            tracker.feed(&[b"\x1b["[0], abort]);
+            tracker.feed(b"?2026h");
+            assert!(
+                !mode_2026_is_set(&tracker),
+                "byte {abort:#x} must abort the CSI before the private marker"
+            );
+        }
     }
 }

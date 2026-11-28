@@ -2034,13 +2034,26 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
         agents_dir: Some(agents),
         ..shell_config()
     };
-    let (_addr, socket, shutdown, handle) =
-        spawn_dual_servers_serving_official_runtimes("doctor-probe-budget", "0.0.0", config).await;
+    // timing-allowed: #2526 every wait of the scenario is bounded by HANG_GUARD
+    // (below nextest's 180 s kill) and named, so a recurrence fails at 120 s
+    // naming the blocked frame instead of ending as a silent nextest timeout.
+    let (_addr, socket, shutdown, handle) = pohunek_test_support::wait::guard(
+        "the doctor fixture servers to start, official packages installed",
+        Box::pin(spawn_dual_servers_serving_official_runtimes(
+            "doctor-probe-budget",
+            "0.0.0",
+            config,
+        )),
+    )
+    .await;
     let mut client = connect_unix(&socket).await;
     let payload = ok_payload(
-        exchange(
-            &mut client,
-            &Request::make("doctor-probe-budget", method::DAEMON_DOCTOR, Value::Null),
+        pohunek_test_support::wait::guard(
+            "the doctor answer with the aggregate probe budget spent",
+            exchange(
+                &mut client,
+                &Request::make("doctor-probe-budget", method::DAEMON_DOCTOR, Value::Null),
+            ),
         )
         .await,
     );
@@ -2072,7 +2085,9 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
     );
 
     let _ = shutdown.send(());
-    let _ = handle.await;
+    let _ =
+        pohunek_test_support::wait::guard("the fixture servers to stop after the shutdown", handle)
+            .await;
 }
 
 /// The aggregate probe budget of the scenario below. It is read on the
@@ -2122,9 +2137,18 @@ async fn daemon_doctor_names_a_version_probe_that_ran_to_its_deadline() {
         doctor_probe_budget: DOCTOR_PROBE_BUDGET,
         ..shell_config()
     };
-    let (_addr, socket, shutdown, handle) =
-        spawn_dual_servers_serving_official_runtimes("doctor-probe-deadline", "0.0.0", config)
-            .await;
+    // timing-allowed: #2526 the spawn and the teardown are bounded like the
+    // exchange below, so a hung frame fails at HANG_GUARD naming it instead of
+    // ending as a silent nextest timeout (the shape of the 180 s try-1 kill).
+    let (_addr, socket, shutdown, handle) = pohunek_test_support::wait::guard(
+        "the doctor fixture servers to start, official packages installed",
+        Box::pin(spawn_dual_servers_serving_official_runtimes(
+            "doctor-probe-deadline",
+            "0.0.0",
+            config,
+        )),
+    )
+    .await;
     let mut client = connect_unix(&socket).await;
     // A probe that never ends would otherwise run into the nextest kill with
     // no output; the guard names the unanswered doctor request instead.
@@ -2174,7 +2198,9 @@ async fn daemon_doctor_names_a_version_probe_that_ran_to_its_deadline() {
     }
 
     let _ = shutdown.send(());
-    let _ = handle.await;
+    let _ =
+        pohunek_test_support::wait::guard("the fixture servers to stop after the shutdown", handle)
+            .await;
 }
 
 #[tokio::test]
@@ -2214,10 +2240,13 @@ async fn daemon_doctor_bounds_a_probe_by_the_remaining_shared_budget() {
         doctor_probe_budget: std::time::Duration::from_secs(4),
         ..shell_config()
     };
-    let (_addr, socket, shutdown, handle) = spawn_dual_servers_serving_official_runtimes(
-        "doctor-probe-remaining-budget",
-        "0.0.0",
-        config,
+    let (_addr, socket, shutdown, handle) = pohunek_test_support::wait::guard(
+        "the doctor fixture servers to start, official packages installed",
+        Box::pin(spawn_dual_servers_serving_official_runtimes(
+            "doctor-probe-remaining-budget",
+            "0.0.0",
+            config,
+        )),
     )
     .await;
     let mut client = connect_unix(&socket).await;
@@ -2262,7 +2291,9 @@ async fn daemon_doctor_bounds_a_probe_by_the_remaining_shared_budget() {
     );
 
     let _ = shutdown.send(());
-    let _ = handle.await;
+    let _ =
+        pohunek_test_support::wait::guard("the fixture servers to stop after the shutdown", handle)
+            .await;
 }
 
 /// Opens the write end of the FIFO at `path` without waiting for a reader.
