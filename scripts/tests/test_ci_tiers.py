@@ -68,6 +68,34 @@ MACOS_PATH_OWNERSHIP = {
             ".github/actions/setup-rust/**",
             ".github/actions/pinned-cache/**",
         },
+        # The `tests/` subtrees of exactly the crates the `macos` filter owns
+        # (issue #2599): a diff whose every `macos`-matched file lies under
+        # one of these is a tests-only diff and does not select the macOS
+        # lane. The `macos_tests` companion filter in ci.yml lists exactly
+        # these globs and nothing else.
+        "tests_only": {
+            "crates/platform/tests/**",
+            "crates/paths/tests/**",
+            "crates/worker-protocol/tests/**",
+            "crates/session-worker/tests/**",
+            "crates/terminal/tests/**",
+            "crates/logging/tests/**",
+            "crates/service-config/tests/**",
+            "crates/test-support/tests/**",
+            "crates/shape-guard/tests/**",
+            "crates/daemon/tests/**",
+            "crates/cli/tests/**",
+            "crates/protocol/tests/**",
+            "crates/client/tests/**",
+            "crates/knowledge/tests/**",
+            "crates/hostcheck/tests/**",
+            "crates/netbird/tests/**",
+            "crates/overlay/tests/**",
+            "crates/overlay-tailscale/tests/**",
+            "crates/prompt/tests/**",
+            "crates/assistant/tests/**",
+            "crates/package/tests/**",
+        },
         # Platform-neutral data whose readers all run on Linux (#1225).
         "main": {"docs/knowledge/**"},
     },
@@ -193,6 +221,14 @@ MACOS_PATH_OWNERSHIP = {
 # macOS jobs that never run on a pull request, whatever their paths filter
 # matches: the main and nightly tiers run them unconditionally.
 MACOS_TIER_JOBS = {"macos-tier"}
+# The companion counting filter of `macos` in ci.yml (issue #2599): it lists
+# the tests-only globs above, so `macos_count == macos_tests_count` means the
+# diff is tests-only.
+MACOS_TESTS_FILTER = "macos_tests"
+# The pull-request label that unlocks the macOS jobs' paths filters on a PR
+# (issue #2599). It is necessary, never sufficient: a labelled PR whose diff
+# matches no macOS path still skips the lanes.
+MACOS_GATE_LABEL = "macos-gate"
 # macOS jobs that build for other macOS jobs of the run, by the jobs that
 # download what they build (issue #1210). Each runs exactly when one of its
 # consumers does, so it adds no macOS slot to a run that has none of them.
@@ -499,12 +535,14 @@ def evaluate_job_condition(
     outputs: dict[str, str] | None = None,
     results: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
+    labels: list[str] | None = None,
 ) -> bool:
     """`evaluate_condition` for a job that may also wait on other jobs: the
     package selection gives `result` and `outputs`, and every other job of
     `needs` reads from `results`. Jobs the caller does not name read as
     success, as when the producers that the scenario holds fixed ran; the
-    caller names a producer explicitly to exercise its failure."""
+    caller names a producer explicitly to exercise its failure. `labels`
+    are the pull request's label names."""
     merged = {name: "success" for name in re.findall(r"needs\.([a-z][a-z0-9-]*)\.", expression)}
     merged.update(results or {})
     merged.setdefault(PACKAGE_SELECTOR, result)
@@ -512,6 +550,7 @@ def evaluate_job_condition(
     return bool(evaluate_needs_expression(
         expression, event=event, tier=tier, changes=changes,
         results=merged, outputs=merged_outputs, reuse_skip=reuse_skip,
+        labels=labels,
     ))
 
 
@@ -526,6 +565,7 @@ def evaluate_condition(
     outputs: dict[str, str] | None = None,
     results: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
+    labels: list[str] | None = None,
 ) -> bool:
     """Evaluate a job's `if:` in Python for the operators it may use.
 
@@ -533,8 +573,9 @@ def evaluate_condition(
     job's `outputs.<name>`, the selector's `result` and `outputs.<name>`,
     `needs.<job>.result` (from `results`, defaulting to success as when the
     producers ran), the reuse skip list (`reuse_skip`, defaulting to no
-    reuse as on a full run), string literals, `==`, `!=`, `&&`, `||` and
-    parentheses are understood; anything else fails the translation. A
+    reuse as on a full run), the pull request's `labels`, string literals,
+    `==`, `!=`, `&&`, `||` and parentheses are understood; anything else
+    fails the translation. A
     missing output reads as the empty string and string comparison ignores
     case, as in GitHub Actions.
     """
@@ -545,6 +586,13 @@ def evaluate_condition(
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
+    # The pull request's label names (issue #2599), read before the generic
+    # `!contains(` translation so the negation keeps working.
+    python = re.sub(
+        r"contains\(github\.event\.pull_request\.labels\.\*\.name, ",
+        "_contains(labels, ",
+        python,
+    )
     python = re.sub(
         rf"needs\.{re.escape(PACKAGE_SELECTOR)}\.outputs\.([a-z_]+)",
         r"outputs.get('\1', '')",
@@ -563,7 +611,7 @@ def evaluate_condition(
     python = re.sub(r"!(?!=)", " not ", python)
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
-        r"'[^']*'|\b(?:not|and|or|event|tier|result|cancelled|outputs\.get|changes\.get|results\.get|reuse_skip|_contains)\b|==|!=|[()\s,\[\]]",
+        r"'[^']*'|\b(?:not|and|or|event|tier|result|cancelled|outputs\.get|changes\.get|results\.get|reuse_skip|_contains|labels)\b|==|!=|[()\s,\[\]]",
         "",
         python,
     )
@@ -578,6 +626,7 @@ def evaluate_condition(
         "outputs": {name: value.lower() for name, value in (outputs or {}).items()},
         "results": {name: value.lower() for name, value in (results or {}).items()},
         "reuse_skip": [name.lower() for name in (reuse_skip or [])],
+        "labels": [label.lower() for label in (labels or [])],
     }))
 
 
@@ -616,6 +665,16 @@ class CiTierWorkflowTests(unittest.TestCase):
                     self.assertFalse(any(
                         glob_covers(pattern, path)
                         for pattern in filter_paths("docs_only_paths")
+                        for path in TOOLCHAIN_INPUTS
+                    ))
+                    continue
+                if name == MACOS_TESTS_FILTER:
+                    # A counting companion, not a selector: it must NOT react
+                    # to a toolchain change, so a toolchain-only diff keeps
+                    # the lane (macos_count != macos_tests_count, #2599).
+                    self.assertFalse(any(
+                        glob_covers(pattern, path)
+                        for pattern in filter_paths(name)
                         for path in TOOLCHAIN_INPUTS
                     ))
                     continue
@@ -854,10 +913,21 @@ class CiTierWorkflowTests(unittest.TestCase):
                     self.assertTrue(evaluate_job_condition(
                         expression.group(1), event="pull_request",
                         changes={ownership["filter"]: "true"}, result=result, outputs=outputs,
+                        labels=[MACOS_GATE_LABEL],
+                    ))
+                    # The macos-gate label is necessary, never sufficient
+                    # (#2599): without it the job skips even on a
+                    # paths-positive diff, and with it the job still skips
+                    # on a paths-negative one.
+                    self.assertFalse(evaluate_job_condition(
+                        expression.group(1), event="pull_request",
+                        changes={ownership["filter"]: "true"}, result=result, outputs=outputs,
+                        labels=[],
                     ))
                     self.assertFalse(evaluate_job_condition(
                         expression.group(1), event="pull_request",
                         changes=other_filters, result=result, outputs=outputs,
+                        labels=[MACOS_GATE_LABEL],
                     ))
             for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly")):
                 with self.subTest(job=name, event=event, tier=tier):
@@ -890,8 +960,9 @@ class CiTierWorkflowTests(unittest.TestCase):
                           for consumers in MACOS_BUILDER_JOBS.values()
                           for consumer in consumers})
         events = (
-            ("pull_request", ""), ("push", ""), ("schedule", ""),
-            ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly"),
+            ("pull_request", "", []), ("pull_request", "", [MACOS_GATE_LABEL]),
+            ("push", "", []), ("schedule", "", []),
+            ("workflow_dispatch", "main", []), ("workflow_dispatch", "nightly", []),
         )
         for builder, consumers in MACOS_BUILDER_JOBS.items():
             condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[builder])
@@ -902,21 +973,105 @@ class CiTierWorkflowTests(unittest.TestCase):
                 match = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[consumer])
                 assert match is not None
                 consumer_conditions[consumer] = match.group(1)
-            for event, tier in events:
+            for event, tier, labels in events:
                 for values in range(2 ** len(filters)):
                     changes = {
                         name: "true" if values >> index & 1 else "false"
                         for index, name in enumerate(filters)
                     }
-                    with self.subTest(builder=builder, event=event, tier=tier, changes=changes):
+                    with self.subTest(builder=builder, event=event, tier=tier, labels=labels, changes=changes):
                         expected = any(
-                            evaluate_condition(expression, event=event, tier=tier, changes=changes)
+                            evaluate_condition(expression, event=event, tier=tier, changes=changes, labels=labels)
                             for expression in consumer_conditions.values()
                         )
                         self.assertEqual(
-                            evaluate_condition(condition.group(1), event=event, tier=tier, changes=changes),
+                            evaluate_condition(condition.group(1), event=event, tier=tier, changes=changes, labels=labels),
                             expected,
                         )
+
+    def test_the_macos_tests_filter_lists_exactly_the_owned_crates_tests_subtrees(self):
+        # The selector table still proves every path claim (issue #2599): the
+        # companion filter is exactly the tests-only set of the lane's table
+        # entry, and each of its globs is covered by a `macos` glob, so
+        # macos_tests_count <= macos_count always and the count comparison in
+        # the `macos` output is a "has a non-test match" test.
+        ownership = MACOS_PATH_OWNERSHIP["platform-contracts"]
+        tests_only = ownership["tests_only"]
+        self.assertEqual(filter_paths(MACOS_TESTS_FILTER), tests_only)
+        macos_pr = set(ownership["pr"])
+        crate_globs = {p for p in macos_pr if p.startswith("crates/") and p.endswith("/**")}
+        for pattern in tests_only:
+            self.assertIn(pattern.removesuffix("/tests/**") + "/**", crate_globs)
+        for pattern in crate_globs:
+            self.assertIn(pattern.removesuffix("/**") + "/tests/**", tests_only)
+
+    def test_the_macos_output_narrows_a_tests_only_diff_out_of_the_lane(self):
+        # The `changes` job combines the two counts, exactly like `docs_only`.
+        self.assertIn(
+            "macos: ${{ steps.filter.outputs.macos == 'true' && "
+            "steps.filter.outputs.macos_count != "
+            "steps.filter.outputs." + MACOS_TESTS_FILTER + "_count }}\n",
+            workflow_jobs()["changes"],
+        )
+
+    def test_a_tests_only_diff_does_not_select_the_macos_lane(self):
+        for files, expected in (
+            # A tests-only diff on a lane-owned crate skips the lane.
+            (["crates/daemon/tests/foo.rs"], False),
+            # Tests of a crate the lane does not own do not count either way.
+            (["crates/xtask/tests/bar.rs"], False),
+            (["crates/daemon/tests/foo.rs", "crates/xtask/tests/bar.rs"], False),
+            (["docs/development.md"], False),
+            # Any src/ change in the same diff keeps the lane — the class of
+            # both macOS defects of 2026-11-27.
+            (["crates/daemon/tests/foo.rs", "crates/daemon/src/lib.rs"], True),
+            (["crates/daemon/src/lib.rs"], True),
+            (["crates/session-worker/src/ps.rs"], True),
+            (["crates/test-support/src/bin/test_reaper.rs"], True),
+            # A manifest, the workflow or the toolchain keeps it too.
+            (["crates/daemon/tests/foo.rs", "crates/daemon/Cargo.toml"], True),
+            (["crates/daemon/tests/foo.rs", ".github/workflows/ci.yml"], True),
+            (["rust-toolchain.toml"], True),
+        ):
+            with self.subTest(files=files):
+                self.assertEqual(macos_filter_output_for(files), expected,
+                                 f"macos output for {files}")
+
+    def test_the_macos_gate_label_is_necessary_but_not_sufficient_for_a_macos_job(self):
+        # The label never enables a lane on a paths-negative diff: on a pull
+        # request it only unlocks the paths filter's own decision (#2599).
+        jobs = workflow_jobs()
+        for name, ownership in MACOS_PATH_OWNERSHIP.items():
+            expression = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", jobs[name])
+            self.assertIsNotNone(expression, f"{name} has no explicit tier condition")
+            assert expression is not None
+            condition = expression.group(1)
+            self.assertIn(
+                f"contains(github.event.pull_request.labels.*.name, '{MACOS_GATE_LABEL}')",
+                condition,
+            )
+            with self.subTest(job=name, labels=MACOS_GATE_LABEL, filter="true"):
+                self.assertTrue(evaluate_job_condition(
+                    condition, event="pull_request",
+                    changes={ownership["filter"]: "true"}, labels=[MACOS_GATE_LABEL],
+                ))
+            with self.subTest(job=name, labels="none", filter="true"):
+                self.assertFalse(evaluate_job_condition(
+                    condition, event="pull_request",
+                    changes={ownership["filter"]: "true"}, labels=[],
+                ))
+            with self.subTest(job=name, labels=MACOS_GATE_LABEL, filter="false"):
+                self.assertFalse(evaluate_job_condition(
+                    condition, event="pull_request",
+                    changes={ownership["filter"]: "false"}, labels=[MACOS_GATE_LABEL],
+                ))
+            # Outside a pull request the label plays no role at all.
+            for event, tier in (("push", ""), ("schedule", ""),
+                                ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly")):
+                with self.subTest(job=name, event=event, tier=tier):
+                    self.assertTrue(evaluate_job_condition(
+                        condition, event=event, tier=tier, labels=[],
+                    ))
 
     def test_consumers_of_the_macos_release_build_download_it_and_never_build_version_a(self):
         jobs = workflow_jobs()
@@ -1062,6 +1217,19 @@ def glob_covers(pattern: str, path: str) -> bool:
         for part in re.split(r"(\*\*|\*)", pattern)
     )
     return re.fullmatch(regex, path) is not None
+
+
+def macos_filter_output_for(files: list[str]) -> bool:
+    """The `changes` job's `macos` output for a diff of `files` (issue #2599).
+
+    Mirrors the ci.yml wiring: `macos == 'true'` when any file matches the
+    `macos` filter, narrowed out when every matched file also matches the
+    `macos_tests` companion filter — the count comparison
+    `macos_count != macos_tests_count`.
+    """
+    matched = [f for f in files if any(glob_covers(p, f) for p in filter_paths("macos"))]
+    tests = [f for f in files if any(glob_covers(p, f) for p in filter_paths(MACOS_TESTS_FILTER))]
+    return bool(matched) and len(matched) != len(tests)
 
 
 # `cargo xtask <command> <action>` in a workflow step and `"$XTASK" <command>
@@ -1664,15 +1832,19 @@ class MacosLanePackageSetTests(unittest.TestCase):
 
 
 # Every event and tier a ci.yml run can have, crossed with the two filters
-# that decide whether the macOS lane and the Hermes macOS job run on a PR.
+# that decide whether the macOS lane and the Hermes macOS job run on a PR and
+# with the pull request's labels: on a PR the `macos-gate` label is necessary
+# for both jobs (#2599), so the PR scenarios run with and without it.
 MACOS_RUN_SCENARIOS = [
-    {"event": event, "tier": tier, "changes": {"macos": macos, "hermes_macos": hermes}}
+    {"event": event, "tier": tier, "labels": labels,
+     "changes": {"macos": macos, "hermes_macos": hermes}}
     for event, tier in (
         ("pull_request", ""), ("push", ""), ("schedule", ""),
         ("workflow_dispatch", "main"), ("workflow_dispatch", "nightly"),
     )
     for macos in ("true", "false")
     for hermes in ("true", "false")
+    for labels in ([[], [MACOS_GATE_LABEL]] if event == "pull_request" else [[]])
 ]
 # The lane also reads the test selection: a narrowed one may leave it out.
 MACOS_RUN_SELECTIONS = [
@@ -3135,15 +3307,17 @@ def evaluate_needs_expression(
     matrix: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
     step_outputs: dict[str, dict[str, str]] | None = None,
+    labels: list[str] | None = None,
 ):
     """Evaluate an expression over `needs.<job>.result` and `.outputs.<name>`.
 
     Understands `!cancelled()`, `always()`, `failure()`, `fromJSON`,
     `contains`, `github.event_name`, `inputs.tier`, `env.<NAME>`,
     `matrix.<name>`, `github.sha`, `steps.<id>.outcome`,
-    `steps.<id>.outputs.<name>` (read from `step_outputs`),
-    `needs.<job>.result` and `needs.<job>.outputs.<name>`, string and integer
-    literals, `==`, `!=`, `!`,
+    `steps.<id>.outputs.<name>` (read from `step_outputs`), the pull
+    request's `labels` (for `contains(github.event.pull_request.labels.*.name,
+    ...)`), `needs.<job>.result` and `needs.<job>.outputs.<name>`, string and
+    integer literals, `==`, `!=`, `!`,
     `&&`, `||` and parentheses; anything else fails the translation. `&&` and
     `||` return an operand, as in GitHub Actions, so a value expression
     evaluates to its value. A missing result or output reads as the empty
@@ -3170,6 +3344,13 @@ def evaluate_needs_expression(
     python = python.replace("fromJSON(", "fromjson(")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
+    # The pull request's label names (issue #2599), read before the generic
+    # `!` translation so a negated `contains(...)` keeps working.
+    python = re.sub(
+        r"contains\(github\.event\.pull_request\.labels\.\*\.name, ",
+        "contains(labels, ",
+        python,
+    )
     python = re.sub(r"\binputs\.([a-z_]+)", r"inputs.get('\1', False)", python)
     # Inputs read as booleans: `inputs.delta` is True on a delta dispatch.
     python = re.sub(r"\benv\.([A-Z_]+)", r"envs.get('\1', '')", python)
@@ -3191,7 +3372,7 @@ def evaluate_needs_expression(
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
         r"'[^']*'|\b(?:not|and|or|True|False|event|tier|cancelled|fromjson|contains|changes\.get|"
-        r"results\.get|outputs\.get|stepouts\.get|envs\.get|matrix\.get|inputs\.get|reuse_skip|get|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
+        r"results\.get|outputs\.get|stepouts\.get|envs\.get|matrix\.get|inputs\.get|reuse_skip|get|labels|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
         "",
         python,
     )
@@ -3214,6 +3395,7 @@ def evaluate_needs_expression(
         "inputs": (inputs or {"delta": event == "workflow_dispatch" and tier.lower() == "main"}),
         "changes": {name: value.lower() for name, value in (changes or {}).items()},
         "results": {name: value.lower() for name, value in (results or {}).items()},
+        "labels": [label.lower() for label in (labels or [])],
         "outputs": {
             job: {name: value.lower() for name, value in values.items()}
             for job, values in (outputs or {}).items()
@@ -5124,11 +5306,12 @@ class LaneSelectionTests(unittest.TestCase):
     """A narrowed selection without lane tests skips the macOS lane (#1225)."""
 
     def runs(self, *, event="pull_request", tier="", cancelled=False, macos="true",
-             selection="success", plan=None):
+             selection="success", plan=None, labels=None):
         return bool(evaluate_needs_expression(
             job_condition(LANE_JOB), event=event, tier=tier, cancelled=cancelled,
             changes={"macos": macos}, results={TEST_SELECTOR: selection},
             outputs={TEST_SELECTOR: {"narrowed": "true", "lane": "false"} if plan is None else plan},
+            labels=[MACOS_GATE_LABEL] if labels is None else labels,
         ))
 
     def test_the_lane_waits_for_the_selection_and_its_paths_filter(self):
@@ -5140,6 +5323,9 @@ class LaneSelectionTests(unittest.TestCase):
         self.assertFalse(self.runs())
         self.assertFalse(self.runs(macos="false", plan={"narrowed": "true", "lane": "true"}))
         self.assertFalse(self.runs(cancelled=True, plan={}))
+        # An unlabelled pull request never starts the lane, whatever the
+        # selection plans (#2599).
+        self.assertFalse(self.runs(labels=[], plan={"narrowed": "true", "lane": "true"}))
         for kwargs in (
             {"plan": {"narrowed": "true", "lane": "true"}},
             # A selector without the lane output, or any selection that is
@@ -5150,6 +5336,16 @@ class LaneSelectionTests(unittest.TestCase):
         ):
             with self.subTest(**kwargs):
                 self.assertTrue(self.runs(**kwargs))
+
+    def test_a_labelled_pr_keeps_the_lane_on_a_paths_positive_diff(self):
+        # The `macos-gate` label is necessary, not sufficient: with the label
+        # and the paths filter positive the lane runs, without the label it
+        # skips, and the label alone (paths-negative diff) does not start it.
+        self.assertTrue(self.runs(plan={"narrowed": "true", "lane": "true"},
+                                  labels=[MACOS_GATE_LABEL]))
+        self.assertFalse(self.runs(labels=[], plan={"narrowed": "true", "lane": "true"}))
+        self.assertFalse(self.runs(macos="false", plan={"narrowed": "true", "lane": "true"},
+                                   labels=[MACOS_GATE_LABEL]))
 
     def test_every_tier_run_starts_the_lane_whatever_the_selection(self):
         for event, tier in (("push", ""), ("schedule", ""), ("workflow_dispatch", "main"),
@@ -5210,12 +5406,13 @@ class LaneSelectionTests(unittest.TestCase):
         )
 
         def fails(lane, event="pull_request", macos="true", changes="success",
-                  selection="success", plan=None):
+                  selection="success", plan=None, labels=None):
             return bool(evaluate_needs_expression(
                 condition, event=event, changes={"macos": macos},
                 results={LANE_JOB: lane, "changes": changes, TEST_SELECTOR: selection},
                 outputs={TEST_SELECTOR: {"narrowed": "true", "lane": "false"}
                          if plan is None else plan},
+                labels=[MACOS_GATE_LABEL] if labels is None else labels,
             ))
 
         self.assertFalse(fails("success"))
@@ -5223,6 +5420,9 @@ class LaneSelectionTests(unittest.TestCase):
         self.assertFalse(fails("skipped"))
         self.assertFalse(fails("skipped", macos="false", plan={}))
         self.assertFalse(fails("skipped", changes="failure", plan={}))
+        # An unlabelled pull request excuses a skipped lane: the macos-gate
+        # label is necessary for the lane, so its absence is a reason.
+        self.assertFalse(fails("skipped", labels=[], plan={"narrowed": "true", "lane": "true"}))
         for args in (
             {"lane": "failure"}, {"lane": "cancelled"},
             {"lane": "skipped", "event": "push"}, {"lane": "skipped", "event": "schedule"},
@@ -5248,13 +5448,22 @@ class LaneSelectionTests(unittest.TestCase):
         lane = job_steps(workflow_jobs()[LANE_JOB])["Run macOS lane tests"]
         skip = re.search(r"(?m)^          SKIP_OWNED_BY: \$\{\{ \((.+)\) && 'hermes-macos' \|\| '' \}\}$", lane)
         self.assertIsNotNone(skip)
-        # The step judges the Hermes job under exactly the lane's skip condition.
-        self.assertIn(f"({skip.group(1)}) && ", condition)
+        # The step judges the Hermes job under the Hermes job's own pull
+        # request branch: the lane's skip condition plus the macos-gate
+        # label. The lane's SKIP_OWNED_BY needs no label because the lane
+        # itself only runs on a labelled pull request (#2599).
+        self.assertIn(
+            "(github.event_name != 'pull_request' || (needs.changes.outputs.hermes_macos == 'true'"
+            f" && contains(github.event.pull_request.labels.*.name, '{MACOS_GATE_LABEL}'))) && ",
+            condition,
+        )
+        self.assertIn(f"({skip.group(1)}) && 'hermes-macos' || ''", lane)
 
-        def fails(hermes, event="pull_request", hermes_macos="true"):
+        def fails(hermes, event="pull_request", hermes_macos="true", labels=None):
             return bool(evaluate_needs_expression(
                 condition, event=event, changes={"hermes_macos": hermes_macos},
                 results={"hermes-compatibility-macos": hermes},
+                labels=[MACOS_GATE_LABEL] if labels is None else labels,
             ))
 
         self.assertFalse(fails("success"))
@@ -5263,6 +5472,11 @@ class LaneSelectionTests(unittest.TestCase):
         for result in ("skipped", "failure"):
             with self.subTest(result=result):
                 self.assertFalse(fails(result, hermes_macos="false"))
+        # An unlabelled pull request never starts the Hermes job, so a skip
+        # there is not a failure (the label is necessary, not sufficient).
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(result=result, labels="none"):
+                self.assertFalse(fails(result, labels=[]))
         for result in ("failure", "cancelled", "skipped"):
             for event in ("pull_request", "push", "schedule", "workflow_dispatch"):
                 with self.subTest(result=result, event=event):

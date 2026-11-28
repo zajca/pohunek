@@ -289,6 +289,26 @@ that path too.
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
 
+### When the macOS lanes run
+
+The macOS jobs of `ci.yml` — `platform contracts (arm64)`, `macOS release
+daemon build (macos-15)`, `macOS package install and upgrade (macos-15)`,
+`pinned Hermes compatibility (macOS arm64, model-free)` and
+`SDK workspace (macOS arm64)` — run on every push to `main`, every nightly
+schedule and every `main`/`nightly` dispatch, and on a pull request only when
+the head carries the `macos-gate` label **and** its diff selects the job's
+paths filter. The label is necessary, never sufficient: a labelled PR whose
+diff matches no macOS path still skips the lanes. The coordinator applies the
+label to every PR that touches `crates/terminal`, `crates/session-worker`,
+`crates/daemon`, `crates/test-support/src`, `crates/platform`,
+`runtime-packages/`, `packaging/` or `.github/`, so the platform-sensitive
+work keeps its lane. Independently of the label, a diff that touches only
+`crates/*/tests/**` of a lane-owned crate — no `src/` file, manifest, script,
+workflow or toolchain file in the same diff — never selects the lane. The
+trade: a macOS-only defect in an unlabelled or tests-only PR is found by the
+post-merge `main` run, never at the PR gate, and a red `main` keeps priority
+one. ([#2599](https://github.com/zajca/pohunek/issues/2599))
+
 The `libghostty-vt` workflow (`.github/workflows/libghostty-vt.yml`) is outside
 `ci.yml` and outside the verdict. Its checks `library (x86_64-unknown-linux-gnu)`,
 `library (x86_64-unknown-linux-musl)`, `library (aarch64-apple-darwin)`,

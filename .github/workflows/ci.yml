@@ -243,9 +243,10 @@ jobs:
   platform-contracts:
     name: platform contracts (arm64)
     # macOS runners are costly (issue #125): run in the main/nightly tiers or
-    # on a PR when platform inputs change via the paths filter. A narrowed
+    # on a PR that carries the `macos-gate` label and whose platform inputs
+    # change via the paths filter. A narrowed
     # selection whose lane part selects no lane package skips it (#1225).
-    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') }}
     needs: [changes, test-selection, reuse]
     runs-on: macos-15
     permissions:
@@ -540,7 +541,7 @@ jobs:
   # either of them does.
   macos-release-build:
     name: macOS release daemon build (macos-15)
-    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-release-build') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-release-build') }}
     needs: [changes, reuse]
     runs-on: macos-15
     permissions:
@@ -616,7 +617,7 @@ jobs:
     # macOS 15 is the tested platform. The archives target macOS 14.0, a
     # supported build target that CI does not run (issue #1224).
     name: macOS package install and upgrade (macos-15)
-    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-package') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.macos_package == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-package') }}
     needs: [changes, macos-release-build, reuse]
     runs-on: macos-15
     permissions:
@@ -1308,7 +1309,12 @@ jobs:
       actions: write
     outputs:
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
-      macos: ${{ steps.filter.outputs.macos }}
+      # A pull request whose every `macos`-matched changed file is under
+      # `crates/*/tests/**` of a `macos`-owned crate (what the `macos_tests`
+      # companion filter counts) is a tests-only diff and does not select the
+      # macOS lane (issue #2599); any other matched file — a `src/` file, a
+      # manifest, a script, the workflow or the toolchain — keeps it.
+      macos: ${{ steps.filter.outputs.macos == 'true' && steps.filter.outputs.macos_count != steps.filter.outputs.macos_tests_count }}
       macos_package: ${{ steps.filter.outputs.macos_package }}
       sdk_macos: ${{ steps.filter.outputs.sdk_macos }}
       hermes_macos: ${{ steps.filter.outputs.hermes_macos }}
@@ -1419,6 +1425,35 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/pinned-cache/**'
+            # Companion counting filter of `macos` (issue #2599): the `tests/`
+            # subtrees of exactly the crates `macos` owns, nothing else. The
+            # `macos` job output compares its `_count` with `macos_count`: when
+            # every `macos`-matched changed file lies under one of these, the
+            # diff is tests-only and does not select the macOS lane. It
+            # deliberately omits the toolchain, lockfile and workflow inputs,
+            # so a toolchain-only diff still keeps the lane.
+            macos_tests:
+              - 'crates/platform/tests/**'
+              - 'crates/paths/tests/**'
+              - 'crates/worker-protocol/tests/**'
+              - 'crates/session-worker/tests/**'
+              - 'crates/terminal/tests/**'
+              - 'crates/logging/tests/**'
+              - 'crates/service-config/tests/**'
+              - 'crates/test-support/tests/**'
+              - 'crates/shape-guard/tests/**'
+              - 'crates/daemon/tests/**'
+              - 'crates/cli/tests/**'
+              - 'crates/protocol/tests/**'
+              - 'crates/client/tests/**'
+              - 'crates/knowledge/tests/**'
+              - 'crates/hostcheck/tests/**'
+              - 'crates/netbird/tests/**'
+              - 'crates/overlay/tests/**'
+              - 'crates/overlay-tailscale/tests/**'
+              - 'crates/prompt/tests/**'
+              - 'crates/assistant/tests/**'
+              - 'crates/package/tests/**'
             # Native macOS release packaging (issue #104): PRs gate the archive
             # scripts, install acceptance and launchd service code. Main and
             # nightly runs cover the complete packaged daemon dependency tree.
@@ -2240,7 +2275,7 @@ jobs:
           echo "::error::gate jobs did not run as the selection requires: $RESULTS"
           exit 1
       - name: Fail a macOS lane that failed or was skipped without a reuse skip or a reason
-        if: ${{ needs.platform-contracts.result == 'failure' || needs.platform-contracts.result == 'cancelled' || (needs.platform-contracts.result == 'skipped' && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') && !(github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.macos != 'true' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.lane == 'false')))) }}
+        if: ${{ needs.platform-contracts.result == 'failure' || needs.platform-contracts.result == 'cancelled' || (needs.platform-contracts.result == 'skipped' && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') && !(github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.macos != 'true' || !contains(github.event.pull_request.labels.*.name, 'macos-gate') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.lane == 'false')))) }}
         shell: bash
         env:
           RESULTS: "lane=${{ needs.platform-contracts.result }} changes=${{ needs.changes.result }} macos=${{ needs.changes.outputs.macos }} selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} lane_plan=${{ needs.test-selection.outputs.lane }}"
@@ -2250,7 +2285,7 @@ jobs:
       # Under the lane's `SKIP_OWNED_BY` condition the lane leaves the
       # `hermes_package` tests to the Hermes macOS job, so that job must pass.
       - name: Fail a Hermes macOS job that did not pass the tests the lane left to it and was not reused
-        if: ${{ (github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true') && needs.hermes-compatibility-macos.result != 'success' && !(needs.hermes-compatibility-macos.result == 'skipped' && contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos')) }}
+        if: ${{ (github.event_name != 'pull_request' || (needs.changes.outputs.hermes_macos == 'true' && contains(github.event.pull_request.labels.*.name, 'macos-gate'))) && needs.hermes-compatibility-macos.result != 'success' && !(needs.hermes-compatibility-macos.result == 'skipped' && contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos')) }}
         shell: bash
         env:
           RESULTS: "hermes-macos=${{ needs.hermes-compatibility-macos.result }} macos-release-build=${{ needs.macos-release-build.result }} hermes_macos=${{ needs.changes.outputs.hermes_macos }}"
@@ -3567,7 +3602,7 @@ jobs:
     # A pull request runs it only for its narrow input filter (issue #1050);
     # core inputs are covered by the main and nightly tiers. The Linux
     # `hermes-package` job follows the runtime package selection instead.
-    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.hermes_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos') }}
     needs: [changes, macos-release-build, reuse]
     runs-on: macos-15
     permissions:
@@ -4209,7 +4244,7 @@ jobs:
   # pohunek-sessiond and pohunek.
   sdk-macos:
     name: SDK workspace (macOS arm64)
-    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.sdk_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'sdk-macos') }}
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'macos-gate') && needs.changes.outputs.sdk_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'sdk-macos') }}
     needs: [changes, reuse]
     runs-on: macos-15
     permissions:
