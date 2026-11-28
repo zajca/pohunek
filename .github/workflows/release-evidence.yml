@@ -470,13 +470,8 @@ jobs:
       # Only the release archives enter the bundle: the kit bundles
       # (`build-kit-*`, issue #1613) are attested with the other producer
       # artifacts but travel to the kit repository, never here.
-      # The pinned static library of the host target (cached on a hit; issue
-      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
-      - name: Provide libghostty-vt
-        uses: ./.github/actions/libghostty-vt
-        timeout-minutes: 30
-        with:
-          target: x86_64-unknown-linux-gnu
+      # No cache is restored in this job (it holds the signing secret), so the
+      # assembler xtask is built without the library (issue #2538 P3b).
       - name: Download the Linux cli archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -528,7 +523,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Build xtask
-        run: cargo build --locked -p xtask
+        run: cargo build --locked -p xtask --no-default-features
 
       - name: Collect the inputs
         run: |
@@ -574,13 +569,8 @@ jobs:
       # Only the release archives enter the rehearsal bundle: the kit
       # bundles (`build-kit-*`, issue #1613) are attested with the other
       # producer artifacts but travel to the kit repository, never here.
-      # The pinned static library of the host target (cached on a hit; issue
-      # #2538): the default features link it now. Exports LIBGHOSTTY_VT_DIR.
-      - name: Provide libghostty-vt
-        uses: ./.github/actions/libghostty-vt
-        timeout-minutes: 30
-        with:
-          target: x86_64-unknown-linux-gnu
+      # No cache is restored in this job, so the assembler xtask is built
+      # without the library (issue #2538 P3b).
       - name: Download the Linux cli archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -628,7 +618,7 @@ jobs:
           save-if: false
 
       - name: Build xtask
-        run: cargo build --locked -p xtask
+        run: cargo build --locked -p xtask --no-default-features
 
       - name: Collect the inputs
         run: |

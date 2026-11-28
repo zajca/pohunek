@@ -1758,6 +1758,8 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-mold/**'
+              - '.github/actions/setup-zig/**'
+              - '.github/actions/libghostty-vt/**'
               - '.github/actions/pinned-cache/**'
             # The docs-only path of a pull request (#2210), decided by
             # counting: the `docs_only` output is true when every changed file
@@ -4778,12 +4780,19 @@ jobs:
       - name: Test pohunek-terminal without default features
         run: cargo test -p pohunek-terminal --no-default-features -- --skip new_reports_libghostty_in_its_snapshot_after_the_p3b_flip
 
-      - name: Assert the worker tree has no ghostty crate
+      # The whole product on vt100: the CLI and the daemon build without the
+      # library (LIBGHOSTTY_VT_DIR is never set in this job).
+      - name: Build the CLI and daemon without default features
+        run: cargo build -p pohunek-cli -p pohunek-daemon --no-default-features
+
+      - name: Assert no product package has a ghostty crate in its tree
         run: |
           set -euo pipefail
-          tree="$(cargo tree -p pohunek-session-worker --no-default-features -e normal)"
-          printf '%s\n' "$tree"
-          if printf '%s\n' "$tree" | grep -q ghostty; then
-            echo "::error::the --no-default-features worker tree links a ghostty crate"
-            exit 1
-          fi
+          for package in pohunek-session-worker pohunek-cli pohunek-daemon; do
+            tree="$(cargo tree -p "$package" --no-default-features -e normal)"
+            printf '%s\n' "$tree"
+            if printf '%s\n' "$tree" | grep -q ghostty; then
+              echo "::error::the --no-default-features $package tree links a ghostty crate"
+              exit 1
+            fi
+          done

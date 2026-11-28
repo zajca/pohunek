@@ -145,13 +145,17 @@ tarball or runs a compiler:
   `crates/session-worker` and `crates/xtask` forward it in their own
   `default`, so locally `LIBGHOSTTY_VT_DIR=<out-dir> cargo build` (build the
   pinned library into `<out-dir>` first, as above) links it, and CI provides it
-  through the action. `--no-default-features` on any consumer gives the whole
-  product on vt100 with **no Zig and no C library** — the
-  `terminal-vt100-fallback` lane of `ci.yml` proves that build and its tests,
-  and asserts the worker's dependency tree holds no ghostty crate. Rollback of
-  the default switch is one line: `default = []` in
-  `crates/terminal/Cargo.toml` (the P3a `screen_model`/`format_version` wire
-  fields stay and are harmless).
+  through the action. `--no-default-features` on any consumer (or on the whole
+  workspace) gives the whole product on vt100 with **no Zig and no C library** —
+  the `terminal-vt100-fallback` lane of `ci.yml` proves that build, the CLI and
+  daemon binaries and the dependency trees of `pohunek-terminal`,
+  `pohunek-session-worker`, `pohunek-cli` and `pohunek-daemon`.
+  Rollback of the default switch is five manifest lines, not one: drop
+  `"libghostty"` from `default` in `crates/terminal/Cargo.toml` and in
+  `crates/cli`, `crates/daemon`, `crates/session-worker` and `crates/xtask`
+  (each consumer forwards the feature in its own `default`, so flipping the
+  library crate alone leaves the product on libghostty). The P3a
+  `screen_model`/`format_version` wire fields stay and are harmless.
 - `.github/workflows/libghostty-vt.yml` (dispatch, pull requests that touch the
   build inputs, and pushes to main, which save the cache entries) runs
   `library (<target>)` for the glibc, musl and macOS targets,

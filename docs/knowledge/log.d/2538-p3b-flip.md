@@ -21,8 +21,18 @@
   per row of `plugin-ci.yml`).
 - No protocol bump: `screen_model`/`format_version` stay optional on all
   three wire layers (worker stays 9 with window 8..=9, public stays 5).
-- Rollback: one line, `default = []` in `crates/terminal/Cargo.toml` (plus the
-  guard-list move); the P3a versioning fields stay and are harmless.
+- The fallback is the whole product, not just the terminal crate: the root
+  workspace dependency on `pohunek-session-worker` and plugin-kit's
+  `pohunek-daemon` dependency now carry `default-features = false`, and the
+  CLI/daemon forward `pohunek-session-worker/libghostty` in their `libghostty`
+  feature, so `cargo build --workspace --no-default-features` (and per crate
+  cli/daemon/session-worker) succeeds with `LIBGHOSTTY_VT_DIR` unset. The
+  `terminal-vt100-fallback` lane proves it for terminal, session-worker, cli
+  and daemon.
+- Rollback is five manifest lines, not one (the consumers forward the feature
+  in their own defaults): drop `"libghostty"` from `default` in
+  `crates/terminal/Cargo.toml`, `crates/cli`, `crates/daemon`,
+  `crates/session-worker` and `crates/xtask`.
 - Source map: `crates/terminal/Cargo.toml` (+ the four consumer manifests),
   `scripts/tests/test_libghostty_vt.py`, `.github/workflows/{ci,gate-tests,plugin-ci,plugin-release,release-evidence,release}.yml`,
   `crates/terminal/tests/screen_backend.rs`, `docs/development.md`,

@@ -190,6 +190,80 @@ class PluginCiWorkflowTests(unittest.TestCase):
         self.assertIn("gh release view", check)
         self.assertIn("needs no baseline", check)
 
+    def test_the_libghostty_steps_follow_the_core_checkout_and_guard_the_staging(self):
+        # Step order inside `check`: the core checkout, then the staging, then
+        # the provide steps, then the first cargo step (issue #2538 P3b).
+        check = self.text.partition("\n  check:\n")[2]
+        names = re.findall(r"(?m)^      - name: (.+)$", check)
+        self.assertLess(
+            names.index("Check out the core ref"),
+            names.index("Stage the libghostty-vt action and scripts of the core checkout"),
+        )
+        self.assertLess(
+            names.index("Stage the libghostty-vt action and scripts of the core checkout"),
+            names.index("Provide libghostty-vt"),
+        )
+        self.assertLess(
+            names.index("Provide libghostty-vt (macOS)"),
+            names.index("Build the kit"),
+        )
+        # The staging guard: a core that predates the action (a previous-minor
+        # release) is staged nothing and exports CORE_HAS_LIBGHOSTTY=false, and
+        # the provide steps only run when the core has the action.
+        stage = check.partition("Stage the libghostty-vt action and scripts of the core checkout")[2]
+        self.assertIn("[ -d core/.github/actions/libghostty-vt ] && [ -f core/scripts/build-libghostty-vt ]", stage)
+        self.assertIn('echo "CORE_HAS_LIBGHOSTTY=true" >> "$GITHUB_ENV"', stage)
+        self.assertIn('echo "CORE_HAS_LIBGHOSTTY=false" >> "$GITHUB_ENV"', stage)
+        self.assertIn(
+            "if: env.CORE_HAS_LIBGHOSTTY == 'true' && matrix.platform == 'x86_64-unknown-linux-gnu'",
+            check,
+        )
+        self.assertIn(
+            "if: env.CORE_HAS_LIBGHOSTTY == 'true' && matrix.platform == 'aarch64-apple-darwin'",
+            check,
+        )
+
+    def test_the_producer_runs_only_for_darwin_platforms_and_the_check_tolerates_a_skip(self):
+        producer = self.text.partition("\n  libghostty-darwin:\n")[2].partition("\n  check:\n")[0]
+        self.assertIn(
+            "if: ${{ !cancelled() && contains(fromJSON(inputs.platforms), 'aarch64-apple-darwin') }}",
+            producer,
+        )
+        self.assertIn("if: env.CORE_HAS_LIBGHOSTTY == 'true'", producer)
+        check_header = self.text.partition("\n  check:\n")[2].partition("    steps:")[0]
+        self.assertIn("needs: [libghostty-darwin]", check_header)
+        self.assertIn("needs.libghostty-darwin.result == 'skipped'", check_header)
+
+
+class PluginReleaseWorkflowTests(unittest.TestCase):
+    RELEASE = ROOT / ".github" / "workflows" / "plugin-release.yml"
+
+    def test_the_build_job_restores_no_cache_even_through_composites(self):
+        text = self.RELEASE.read_text()
+        for action in USES.findall(text):
+            self.assertNotIn("actions/cache", action)
+            if LOCAL_ACTION.match(action):
+                seen = set()
+                pending = [action]
+                while pending:
+                    current = pending.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    for inner in USES.findall((ROOT / current[2:] / "action.yml").read_text()):
+                        self.assertNotRegex(inner, r"^actions/cache(/|$)", f"{current} restores a cache")
+                        if LOCAL_ACTION.match(inner):
+                            pending.append(inner)
+
+    def test_the_archive_xtask_is_built_without_the_library_after_the_core_checkout(self):
+        text = self.RELEASE.read_text()
+        self.assertIn("(cd core && cargo build --locked -p xtask --no-default-features)", text)
+        self.assertNotIn("Provide libghostty-vt", text)
+        self.assertNotIn("actions/libghostty-vt", text)
+        build = text.partition("\n  build:\n")[2]
+        names = re.findall(r"(?m)^      - name: (.+)$", build)
+        self.assertLess(names.index("Check out the core tag"), names.index("Build the archive"))
+
 
 class PluginCiShellTests(unittest.TestCase):
     """The path-check and version-bump `run:` bodies against fixtures."""

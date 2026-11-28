@@ -85,10 +85,7 @@ WIRED_LANES = {
     # Both build the core checkout of a plugin repository; the action lives in
     # that checkout (`core/.github/actions/...`).
     "plugin-ci.yml:check",
-    "plugin-release.yml:build",
     "release-evidence.yml:rows",
-    "release-evidence.yml:assemble",
-    "release-evidence.yml:assemble-rehearsal",
     "release-evidence.yml:smoke",
     "release.yml:docs-gate",
     "release.yml:sdk-gate",
@@ -97,6 +94,13 @@ WIRED_LANES = {
 # Jobs that never link the library.
 EXEMPT_LANES = {
     "libghostty-spike.yml:spike-linux",
+    # These build xtask with `--no-default-features` (the vt100 product), so
+    # they never link the library and must not restore its cache entry either:
+    # `assemble` holds the signing secret and plugin-release's rule is "no
+    # cache is restored" (issue #2538 P3b).
+    "release-evidence.yml:assemble",
+    "release-evidence.yml:assemble-rehearsal",
+    "plugin-release.yml:build",
 }
 # The vt100 fallback lane builds `--no-default-features` on purpose: it must
 # NOT have the action step, it proves the no-Zig, no-C-library product.

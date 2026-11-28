@@ -13,7 +13,10 @@ publish = false
 
 [dependencies]
 base64 = "0.22"
-pohunek-terminal = { path = "../../crates/terminal" }
+# `default-features = false`: the spike's own `libghostty` feature is the only
+# switch, so the vt100-only lanes build with no Zig and no C library (issue
+# #2538 P3b flipped the library crate's default).
+pohunek-terminal = { path = "../../crates/terminal", default-features = false }
 # The FFI crate that owns the unsafe libghostty-vt bindings (issue #2538 P2);
 # the spike drives it through pohunek-terminal's `with_model` seam.
 pohunek-terminal-ghostty-sys = { path = "../../crates/terminal-ghostty-sys", optional = true }

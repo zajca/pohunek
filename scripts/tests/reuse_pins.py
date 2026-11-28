@@ -54,7 +54,7 @@ PINNED_BODY_HASHES = {
   "upgrade-test": "5085c4d9086eb08446a2834e80a94fb0538d52e03fab110d3206f9ff17145053",
 }
 
-PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7110a00b775b94a957cf0909001b183b128d"}
+PINNED_CALLEE = {".github/workflows/upgrade.yml": "6c37d571a3fab093e32962c56dc4c570fefb0a7a11530972902248b3483662fe"}
 
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from

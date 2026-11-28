@@ -786,6 +786,20 @@ class SigningTests(ReleaseWorkflowFiles):
     def test_assemble_restores_no_cache_and_its_key_handling_lives_in_one_script(self):
         assemble = self.evidence_jobs[SIGNING_JOB]
         self.assertNotRegex(assemble, r"rust-cache|sccache|actions/cache")
+        # The rule binds the composites too: a local action that restores a
+        # cache entry would break it just the same, so expand every local
+        # `uses:` of the job through its nested composites.
+        seen = set()
+        pending = [use for use in all_uses(assemble) if LOCAL_ACTION.match(use)]
+        while pending:
+            action = pending.pop()
+            if action in seen:
+                continue
+            seen.add(action)
+            for inner in all_uses((ROOT / action[2:] / "action.yml").read_text()):
+                self.assertNotRegex(inner, r"^actions/cache(/|$)", f"{action} restores a cache")
+                if LOCAL_ACTION.match(inner):
+                    pending.append(inner)
         self.assertIn("persist-credentials: false", assemble)
         script = (SCRIPTS / "assemble").read_text()
         for expected in ("/dev/shm", "chmod 700", "shred -u", "unset CATALOG_SIGNING_KEY_CI", "umask 077"):
