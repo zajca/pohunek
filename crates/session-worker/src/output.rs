@@ -259,9 +259,26 @@ impl OutputHub {
                     })
                     .clone();
                 queue.push_output(chunk, || {
-                    Arc::clone(
-                        built.get_or_insert_with(|| Arc::new(terminal.snapshot(next_offset))),
-                    )
+                    if let Some(snapshot) = &built {
+                        return Arc::clone(snapshot);
+                    }
+                    // Only a good snapshot is cached (`built`); a degraded one
+                    // is served for this gap but the next read retries the
+                    // backend (issue #2593 finding 8).
+                    match terminal.try_snapshot(next_offset) {
+                        Ok(snapshot) => {
+                            let snapshot = Arc::new(snapshot);
+                            built = Some(Arc::clone(&snapshot));
+                            snapshot
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "the terminal snapshot failed; serving a degraded snapshot"
+                            );
+                            Arc::new(terminal.degraded_snapshot(next_offset))
+                        }
+                    }
                 });
                 retained.push(Arc::downgrade(&queue));
             }
@@ -504,14 +521,27 @@ enum OutputCloseReason {
 impl HubState {
     /// Returns the terminal state at the current ring end.
     ///
-    /// Builds and caches the snapshot when a feed or resize invalidated it.
+    /// Builds and caches the snapshot when a feed or resize invalidated it. A
+    /// failed backend read is served as a degraded snapshot that is NOT
+    /// cached, so the next read retries the backend (issue #2593 finding 8).
     fn current_snapshot(&mut self) -> Arc<TerminalSnapshot> {
         if let Some(snapshot) = &self.terminal_snapshot {
             return Arc::clone(snapshot);
         }
-        let snapshot = Arc::new(self.terminal.snapshot(self.ring.next_offset));
-        self.terminal_snapshot = Some(Arc::clone(&snapshot));
-        snapshot
+        match self.terminal.try_snapshot(self.ring.next_offset) {
+            Ok(snapshot) => {
+                let snapshot = Arc::new(snapshot);
+                self.terminal_snapshot = Some(Arc::clone(&snapshot));
+                snapshot
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "the terminal snapshot failed; serving a degraded snapshot"
+                );
+                Arc::new(self.terminal.degraded_snapshot(self.ring.next_offset))
+            }
+        }
     }
 
     fn observe(

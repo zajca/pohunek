@@ -8,11 +8,15 @@
 //! so an attach clears the client screen on either model (issue #2538 M13/M14).
 //!
 //! Unlike `visible_text`, the repaint body includes the history rows the
-//! library retained, so an attach or gap repaint of a busy session is bounded
-//! by the scrollback byte limit (`SCROLLBACK_MAX_BYTES`, 8 MiB) rather than by
-//! the active screen — the bound P3 accepted (issue #2596 finding 17, #2593
-//! finding 11); `crates/terminal/tests/screen_backend.rs` asserts both sides
-//! after a 5000-line flood.
+//! library retained, so an attach or gap repaint of a busy session grows with
+//! the retained history, not with the active screen. Measured at the
+//! 5000-line flood scenario of `crates/terminal/tests/screen_backend.rs`: a
+//! 405,000-byte input repaints as 405,103 bytes (1.0003x), and one SGR pair
+//! per line as 490,103 bytes for 450,000 input (1.089x) — so
+//! `SCROLLBACK_MAX_BYTES` (8 MiB) bounds the retained text (an allocation
+//! estimate), not the formatted output. Bounding the formatter is the open
+//! follow-up (issue #2596 finding 17, #2593 finding 11; plan a-31d1b862e65e
+//! section 6 routes the repaint-history cost there).
 
 // Rust guideline compliant 2026-11-27
 
