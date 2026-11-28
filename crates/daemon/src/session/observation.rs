@@ -103,31 +103,12 @@ impl SessionRegistry {
         {
             return Err(ProtocolError::session_output_limit_exceeded());
         }
-        let result = SessionScreenResult {
-            session_id: id.clone(),
-            worker_id: managed.worker_id,
-            runtime: runtime_identity(managed.worker_instance_id, managed.runtime_generation)?,
-            watermark: TerminalWatermark::new(snapshot.watermark),
-            dimensions: TerminalDimensions::new(
-                snapshot.dimensions.columns(),
-                snapshot.dimensions.rows(),
-            )
-            .map_err(|_error| ProtocolError::session_terminal_unavailable())?,
-            cursor: TerminalCursor {
-                row: snapshot.cursor.row,
-                col: snapshot.cursor.column,
-                visible: snapshot.cursor.visible,
-            },
-            alternate_screen: snapshot.alternate_screen,
-            // Absent when the worker predates the field (issue #2538 P3): an
-            // N-1 worker then produces exactly today's reply shape.
-            screen_model: snapshot.model.map(screen_model),
-            format_version: snapshot.format_version,
-            title: snapshot.title,
-            progress: snapshot.progress,
-            visible_lines: snapshot.visible_lines,
-            links: Vec::new(),
-        };
+        let result = screen_result(
+            id,
+            managed.worker_id,
+            runtime_identity(managed.worker_instance_id, managed.runtime_generation)?,
+            &snapshot,
+        )?;
         let serialize = |result: &SessionScreenResult| {
             serde_json::to_vec(result).map_err(|_error| {
                 runtime_error(
@@ -658,6 +639,44 @@ fn screen_model(model: pohunek_worker_protocol::ScreenModelId) -> ScreenModelId 
         pohunek_worker_protocol::ScreenModelId::Vt100 => ScreenModelId::Vt100,
         pohunek_worker_protocol::ScreenModelId::Libghostty => ScreenModelId::Libghostty,
     }
+}
+
+/// Builds the public `session.screen` result from a worker wire snapshot.
+///
+/// Issue #2538 P3a: `model`/`format_version` are carried through unchanged
+/// and omitted when the worker did not send them, so an N-1 worker produces
+/// exactly the pre-P3 reply shape.
+pub fn screen_result(
+    session_id: &SessionId,
+    worker_id: String,
+    runtime: SessionRuntimeIdentity,
+    snapshot: &pohunek_worker_protocol::TerminalSnapshot,
+) -> Result<SessionScreenResult, ProtocolError> {
+    Ok(SessionScreenResult {
+        session_id: session_id.clone(),
+        worker_id,
+        runtime,
+        watermark: TerminalWatermark::new(snapshot.watermark),
+        dimensions: TerminalDimensions::new(
+            snapshot.dimensions.columns(),
+            snapshot.dimensions.rows(),
+        )
+        .map_err(|_error| ProtocolError::session_terminal_unavailable())?,
+        cursor: TerminalCursor {
+            row: snapshot.cursor.row,
+            col: snapshot.cursor.column,
+            visible: snapshot.cursor.visible,
+        },
+        alternate_screen: snapshot.alternate_screen,
+        // Absent when the worker predates the field (issue #2538 P3): an N-1
+        // worker then produces exactly today's reply shape.
+        screen_model: snapshot.model.map(screen_model),
+        format_version: snapshot.format_version,
+        title: snapshot.title.clone(),
+        progress: snapshot.progress.clone(),
+        visible_lines: snapshot.visible_lines.clone(),
+        links: Vec::new(),
+    })
 }
 
 fn log_wait_completed(params: &SessionWaitParams, result: &SessionWaitResult, started: Instant) {

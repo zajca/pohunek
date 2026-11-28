@@ -346,34 +346,54 @@ async fn a_restarted_worker_rebuilds_the_snapshot_with_its_versioning_fields() {
 }
 
 /// Row 17 (reattach to a vt100-model worker from a libghostty-era CLI): the
-/// repaint payload is opaque bytes to the client, and the wire snapshot
-/// reports the worker's model — `vt100` in this slice's default build, where
-/// the flip is still off.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_vt100_model_worker_reports_its_model_and_an_opaque_repaint() {
-    let hub = OutputHub::new(1024, 4096, 4, 20).expect("hub");
-    hub.push(b"\x1b[2J\x1b[Hscreen").expect("push");
-    let snapshot = hub.terminal_snapshot();
-    assert_versioning(&snapshot);
+/// worker runs vt100 **explicitly** (`TerminalTracker::with_model(Vt100)`, not
+/// the build default, so this row asserts `vt100` on every lane, libghostty
+/// ones included), its wire snapshot reports `model = "vt100"` /
+/// `format_version = 1`, and the repaint payload is opaque bytes that
+/// recreate the screen on a fresh vt100 client.
+#[test]
+fn a_vt100_model_worker_reports_vt100_and_an_opaque_repaint() {
+    let mut tracker =
+        pohunek_terminal::TerminalTracker::with_model(pohunek_terminal::ModelKind::Vt100, 4, 20);
+    tracker.feed(b"\x1b[2J\x1b[Hscreen");
+    let snapshot = tracker.snapshot(0);
+    assert_eq!(snapshot.model, ScreenModelId::Vt100);
+    assert_eq!(snapshot.format_version, CURRENT_FORMAT_VERSION);
+
     let wire = wire_terminal(&snapshot).expect("conversion");
-    let expected = if cfg!(feature = "libghostty") {
-        WireScreenModelId::Libghostty
-    } else {
-        WireScreenModelId::Vt100
-    };
     assert_eq!(
         wire.model,
-        Some(expected),
-        "session.screen reports the worker's model"
+        Some(WireScreenModelId::Vt100),
+        "row 17 asserts vt100 unconditionally, whatever the build default is"
     );
     assert_eq!(wire.format_version, Some(CURRENT_FORMAT_VERSION));
+    let json = serde_json::to_value(&wire).expect("serialize");
+    assert_eq!(json["model"], "vt100");
+    assert_eq!(json["format_version"], 1);
 
-    // The attach repaint reaches the client as opaque bytes: exactly the
-    // snapshot's ansi, nothing typed.
-    let mut subscriber = hub.subscribe_terminal_snapshot();
-    let repaint = collect_repaint(&mut subscriber).await;
+    // The attach repaint reaches the client as opaque bytes: feeding them to
+    // a fresh vt100 terminal recreates the screen exactly.
+    assert!(snapshot.ansi.starts_with(SYNC_BEGIN), "{snapshot:?}");
+    let mut fresh = pohunek_terminal::TerminalTracker::with_model(
+        pohunek_terminal::ModelKind::Vt100,
+        snapshot.rows,
+        snapshot.cols,
+    );
+    fresh.feed(&snapshot.ansi);
+    let replayed = fresh.snapshot(0);
     assert_eq!(
-        repaint, snapshot.ansi,
+        (
+            replayed.visible_text,
+            replayed.cursor_row,
+            replayed.cursor_col,
+            replayed.alternate_screen,
+        ),
+        (
+            snapshot.visible_text,
+            snapshot.cursor_row,
+            snapshot.cursor_col,
+            snapshot.alternate_screen,
+        ),
         "the repaint payload is opaque bytes"
     );
 }

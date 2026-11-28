@@ -206,6 +206,12 @@ pub use retention::{spawn_session_retention, POLICY_FILE_NAME as RETENTION_POLIC
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
 
+/// Test-only seam (M-TEST-UTIL): the `session.screen` result the daemon
+/// builds from a worker wire snapshot, so an integration scenario can drive
+/// the wire-to-public mapping (issue #2538 P3a) without a live PTY.
+#[cfg(feature = "test-util")]
+pub use observation::screen_result;
+
 use attach::{generate_daemon_instance_id, ActiveAttach, PendingAttach};
 use hooks::SessionHookRequest;
 #[cfg(test)]
