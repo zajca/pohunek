@@ -16,8 +16,10 @@
 //! A missing link means no reaper was armed (or the owner already removed it
 //! on a normal end), so there is nothing to sweep and the helper exits at
 //! once. The helper writes nothing on any stream: it is spawned with all three
-//! standard streams null and an empty environment, and a reaper must never
-//! hold the test runner's pipes.
+//! standard streams null and an empty environment except
+//! [`pohunek_test_support::owner::REAPER_HOME_ENV`], which carries the owner's
+//! canonical home for the sweep-root refusal, and a reaper must never hold
+//! the test runner's pipes.
 
 // Rust guideline compliant 2026-11-27
 

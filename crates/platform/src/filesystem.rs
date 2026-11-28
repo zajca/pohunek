@@ -2301,6 +2301,234 @@ impl TrustedDir {
     }
 }
 
+/// Mask of the permission bits that grant group or other access to a private
+/// socket endpoint entry.
+const ENDPOINT_GROUP_OTHER_ACCESS_MASK: u32 = 0o077;
+
+/// Checks that an existing runtime directory and daemon socket are private to
+/// `effective_uid`, with the full [`TrustedDir`] validation this module
+/// implements: no symbolic link on any path component, every ancestor passing
+/// the ancestor policy (ownership, writability, ACL), and each existing entry
+/// owned by `effective_uid`, of the required kind, granting no access to group
+/// or other, and carrying a private ACL.
+///
+/// This is the one private-endpoint validator; the socket resolver of
+/// [`crate::socket_endpoint`] calls it, and no second implementation exists
+/// (#2563). An entry that does not exist passes: no daemon is listening yet,
+/// and connecting reports that. The socket's own ACL is not queried — a bound
+/// socket cannot be opened for an fd-based ACL read without connecting — but
+/// its parent directory's ACL is checked, and a socket inherits its parent's
+/// ACL on creation.
+///
+/// # Errors
+///
+/// Returns [`pohunek_paths::PathError::UnsafeSocketEndpoint`] for the first
+/// entry or ancestor that fails.
+pub fn verify_private_socket_endpoint(
+    runtime_dir: &Path,
+    socket: &Path,
+    effective_uid: u32,
+) -> Result<(), pohunek_paths::PathError> {
+    validate_private_endpoint_entry(runtime_dir, EntryKind::Directory, effective_uid)
+        .map_err(|error| endpoint_path_error(runtime_dir, &error))?;
+    validate_private_endpoint_entry(socket, EntryKind::Socket, effective_uid)
+        .map_err(|error| endpoint_path_error(socket, &error))?;
+    Ok(())
+}
+
+/// Validates one endpoint entry: walks `path` component by component without
+/// following symlinks, validates every ancestor with [`validate_ancestor`],
+/// and validates the final entry's kind, owner, mode bits and link count.
+///
+/// A missing final entry passes. A directory final entry is additionally
+/// opened and its ACL checked through the descriptor, so the check is bound to
+/// the validated inode.
+fn validate_private_endpoint_entry(
+    path: &Path,
+    kind: EntryKind,
+    effective_uid: u32,
+) -> FsResult<()> {
+    let components = absolute_components(path)?;
+    let Some(final_index) = components.len().checked_sub(1) else {
+        return Err(FsError::InvalidAbsolutePath {
+            path: path.to_path_buf(),
+        });
+    };
+    let root_fd = fs::open(
+        Path::new("/"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| io_error("open filesystem root", Path::new("/"), source))?;
+    let root_file = File::from(root_fd);
+    let root_stat = fs::fstat(&root_file)
+        .map_err(|source| io_error("inspect filesystem root", Path::new("/"), source))?;
+    let system_uid = stat_uid(&root_stat);
+    // Ancestors are validated against the process's real effective uid, exactly
+    // as `TrustedDir` does; the caller-supplied `effective_uid` applies to the
+    // endpoint entries themselves (it is a test seam: tests simulate a foreign
+    // owner by passing a different uid, which must not implicate the ancestors
+    // the real process owns).
+    let process_uid = rustix::process::geteuid().as_raw();
+    let mut directory = TrustedDir {
+        path: PathBuf::from("/"),
+        file: root_file,
+    };
+    for (index, component) in components.into_iter().enumerate() {
+        let name = validate_component(component)?;
+        let child_path = directory.path.join(name);
+        if index == final_index {
+            let stat = match fs::statat(&directory.file, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(rustix::io::Errno::NOENT) => return Ok(()),
+                Err(source) => return Err(io_error("inspect trusted entry", &child_path, source)),
+            };
+            validate_endpoint_stat(&stat, &child_path, kind, effective_uid)?;
+            if kind == EntryKind::Directory {
+                let fd = open_directory_at(&directory.file, name)
+                    .map_err(|source| io_error("open trusted directory", &child_path, source))?;
+                let child = TrustedDir {
+                    path: child_path.clone(),
+                    file: File::from(fd),
+                };
+                let fd_stat = fs::fstat(&child.file).map_err(|source| {
+                    io_error("inspect trusted descriptor", &child_path, source)
+                })?;
+                validate_endpoint_stat(&fd_stat, &child_path, kind, effective_uid)?;
+                validate_private_acl(&child.file, &child_path)?;
+            }
+            return Ok(());
+        }
+        // A missing ancestor means the whole endpoint is absent: no daemon is
+        // listening yet, and connecting reports that.
+        if matches!(
+            fs::statat(&directory.file, name, AtFlags::SYMLINK_NOFOLLOW),
+            Err(rustix::io::Errno::NOENT)
+        ) {
+            return Ok(());
+        }
+        directory = directory.open_child_inner(component, 0o700, false, false)?;
+        validate_ancestor(
+            &directory.file,
+            &directory.path,
+            0o700,
+            process_uid,
+            system_uid,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validates one endpoint entry's stat: kind, owner, group/other access bits
+/// and link count, against `expected_uid`.
+fn validate_endpoint_stat(
+    stat: &Stat,
+    path: &Path,
+    kind: EntryKind,
+    expected_uid: u32,
+) -> FsResult<()> {
+    let actual_type = FileType::from_raw_mode(stat.st_mode);
+    if !kind.matches(actual_type) {
+        return Err(FsError::UnsafeType {
+            path: path.to_path_buf(),
+            expected: kind,
+            actual: file_type_name(actual_type),
+        });
+    }
+    let actual_uid = stat_uid(stat);
+    if actual_uid != expected_uid {
+        return Err(FsError::UnsafeOwner {
+            path: path.to_path_buf(),
+            actual: actual_uid,
+            expected: expected_uid,
+        });
+    }
+    let mode = stat_mode(stat);
+    if mode & ENDPOINT_GROUP_OTHER_ACCESS_MASK != 0 {
+        return Err(FsError::UnsafeMode {
+            path: path.to_path_buf(),
+            actual: mode,
+            expected: mode & !ENDPOINT_GROUP_OTHER_ACCESS_MASK,
+        });
+    }
+    let links = stat_links(stat);
+    if links == 0 {
+        return Err(FsError::UnsafeLinkCount {
+            path: path.to_path_buf(),
+            actual: links,
+        });
+    }
+    Ok(())
+}
+
+/// The path an [`FsError`] names, when it names one.
+fn fs_error_path(error: &FsError) -> Option<&Path> {
+    match error {
+        FsError::InvalidComponent { .. } | FsError::InvalidMode { .. } => None,
+        FsError::InvalidAbsolutePath { path }
+        | FsError::FileTooLarge { path, .. }
+        | FsError::UnsafeType { path, .. }
+        | FsError::UnsafeOwner { path, .. }
+        | FsError::UnsafeMode { path, .. }
+        | FsError::UnsafeAcl { path }
+        | FsError::UnsafeLinkCount { path, .. }
+        | FsError::LockContended { path }
+        | FsError::AtomicMoveUnsupported { path, .. }
+        | FsError::RecoveryConflict { path }
+        | FsError::StagedRecoveryRequired { path, .. }
+        | FsError::IdentityChanged { path }
+        | FsError::CommittedDurabilityUncertain { path, .. }
+        | FsError::Io { path, .. } => Some(path),
+    }
+}
+
+/// Maps an [`FsError`] of the endpoint walk to the endpoint's typed path error.
+///
+/// A failure naming a path other than the endpoint entry itself is an ancestor
+/// failure and reports [`pohunek_paths::UnsafeEndpointReason::UnsafeAncestor`].
+fn endpoint_path_error(path: &Path, error: &FsError) -> pohunek_paths::PathError {
+    use pohunek_paths::UnsafeEndpointReason;
+    let is_ancestor = fs_error_path(error).is_some_and(|named| named != path);
+    let reason = if is_ancestor {
+        UnsafeEndpointReason::UnsafeAncestor
+    } else {
+        match &error {
+            FsError::UnsafeType {
+                expected, actual, ..
+            } => {
+                if *actual == file_type_name(FileType::Symlink) {
+                    UnsafeEndpointReason::Symlink
+                } else {
+                    match expected {
+                        EntryKind::Directory => UnsafeEndpointReason::NotDirectory,
+                        EntryKind::Socket => UnsafeEndpointReason::NotSocket,
+                        _ => UnsafeEndpointReason::Unreadable(io::ErrorKind::Other),
+                    }
+                }
+            }
+            FsError::UnsafeOwner {
+                actual, expected, ..
+            } => UnsafeEndpointReason::ForeignOwner {
+                owner: *actual,
+                expected: *expected,
+            },
+            FsError::UnsafeMode { actual, .. } => UnsafeEndpointReason::GroupOrOtherAccess {
+                mode: actual & MODE_MASK,
+            },
+            FsError::UnsafeAcl { .. } => UnsafeEndpointReason::UnsafeAcl,
+            // Kind and symlink refusals come from the `statat` above as
+            // `UnsafeType`; an I/O failure here is an inspection failure.
+            FsError::Io { source, .. } => UnsafeEndpointReason::Unreadable(source.kind()),
+            _ => UnsafeEndpointReason::Unreadable(io::ErrorKind::Other),
+        }
+    };
+    pohunek_paths::PathError::UnsafeSocketEndpoint {
+        path: path.to_path_buf(),
+        reason,
+    }
+}
+
 fn recover_staging_failure(staged: &StagedEntry, source: &OsStr, error: FsError) -> FsError {
     let staged_path = staged.path();
     match staged.restore(source) {

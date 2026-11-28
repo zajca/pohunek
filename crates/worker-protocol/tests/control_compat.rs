@@ -92,6 +92,8 @@ async fn attach_request_rejects_invalid_dimensions_and_accepts_omitted_size() {
     ));
 }
 
+/// A revision-less claim (the offline journal snapshot shape, not a negotiated
+/// connection) is read and written without the forwarding fields.
 #[tokio::test]
 async fn previous_worker_claim_without_the_forwarding_fields_is_read_and_written_without_them() {
     let (reader, writer) = tokio::io::duplex(4096);

@@ -333,8 +333,9 @@ pub enum PathError {
     },
 }
 
-/// Why an existing runtime directory or socket is refused by
-/// [`verify_private_socket_endpoint`].
+/// Why an existing runtime directory or socket is refused by the private socket
+/// endpoint check of `pohunek-platform`
+/// (`pohunek_platform::socket_endpoint::verify_private_socket_endpoint`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnsafeEndpointReason {
@@ -356,6 +357,12 @@ pub enum UnsafeEndpointReason {
         /// Permission bits of the entry.
         mode: u32,
     },
+    /// An ancestor directory of the entry fails the trusted-directory ancestor
+    /// policy (ownership, writability or ACL).
+    UnsafeAncestor,
+    /// The entry carries an extended ACL that grants access beyond its mode
+    /// bits.
+    UnsafeAcl,
     /// The entry could not be inspected.
     Unreadable(std::io::ErrorKind),
 }
@@ -372,113 +379,21 @@ impl fmt::Display for UnsafeEndpointReason {
             Self::GroupOrOtherAccess { mode } => {
                 write!(f, "its mode {mode:04o} grants group or other access")
             }
+            Self::UnsafeAncestor => {
+                f.write_str("an ancestor directory of it fails the trusted-directory policy")
+            }
+            Self::UnsafeAcl => f.write_str("its extended ACL grants access beyond its mode bits"),
             Self::Unreadable(kind) => write!(f, "it cannot be inspected ({kind})"),
         }
     }
 }
 
-/// Mask of the permission bits that grant group or other access.
-const GROUP_OTHER_ACCESS_MASK: u32 = 0o077;
-
-/// Permission bits reported for an endpoint that grants group or other access.
-const PERMISSION_BITS_MASK: u32 = 0o7777;
-
-/// Checks that an existing runtime directory and daemon socket are private to
-/// `effective_uid`.
-///
-/// Each entry that exists must not be a symbolic link, must be a directory
-/// (respectively a socket), must be owned by `effective_uid` and must grant no
-/// access to group or other. An entry that does not exist passes: no daemon is
-/// listening yet, and connecting reports that.
-///
-/// # Errors
-///
-/// Returns [`PathError::UnsafeSocketEndpoint`] for the first entry that fails.
-pub fn verify_private_socket_endpoint(
-    runtime_dir: &Path,
-    socket: &Path,
-    effective_uid: u32,
-) -> Result<(), PathError> {
-    verify_private_entry(runtime_dir, EntryKind::Directory, effective_uid)?;
-    verify_private_entry(socket, EntryKind::Socket, effective_uid)
-}
-
-#[derive(Clone, Copy)]
-enum EntryKind {
-    Directory,
-    Socket,
-}
-
-fn verify_private_entry(path: &Path, kind: EntryKind, effective_uid: u32) -> Result<(), PathError> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    let unsafe_entry = |reason| PathError::UnsafeSocketEndpoint {
-        path: path.to_path_buf(),
-        reason,
-    };
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(unsafe_entry(UnsafeEndpointReason::Unreadable(error.kind()))),
-    };
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(unsafe_entry(UnsafeEndpointReason::Symlink));
-    }
-    match kind {
-        EntryKind::Directory if !file_type.is_dir() => {
-            return Err(unsafe_entry(UnsafeEndpointReason::NotDirectory));
-        }
-        EntryKind::Socket if !file_type.is_socket() => {
-            return Err(unsafe_entry(UnsafeEndpointReason::NotSocket));
-        }
-        _ => {}
-    }
-    if metadata.uid() != effective_uid {
-        return Err(unsafe_entry(UnsafeEndpointReason::ForeignOwner {
-            owner: metadata.uid(),
-            expected: effective_uid,
-        }));
-    }
-    if metadata.mode() & GROUP_OTHER_ACCESS_MASK != 0 {
-        return Err(unsafe_entry(UnsafeEndpointReason::GroupOrOtherAccess {
-            mode: metadata.mode() & PERMISSION_BITS_MASK,
-        }));
-    }
-    Ok(())
-}
-
-/// Resolves the local control socket path and verifies that an existing
-/// runtime directory and socket are private to the caller.
-///
-/// # Errors
-///
-/// Returns the [`PathError`] of [`socket_path`], or
-/// [`PathError::UnsafeSocketEndpoint`] when an existing entry is not private.
-pub fn verified_socket_path() -> Result<PathBuf, PathError> {
-    let platform = Platform::current()?;
-    let effective_uid = nix::unistd::Uid::effective().as_raw();
-    verified_socket_path_for(platform, effective_uid, &PathEnv::capture())
-}
-
-/// [`verified_socket_path`] from explicit platform, identity and environment
-/// inputs, so every platform and failure can be exercised without changing the
-/// process environment.
-///
-/// # Errors
-///
-/// Same as [`verified_socket_path`].
-pub fn verified_socket_path_for(
-    platform: Platform,
-    effective_uid: u32,
-    env: &PathEnv,
-) -> Result<PathBuf, PathError> {
-    let runtime_dir = resolve_runtime_dir(platform, effective_uid, env)?;
-    let socket = runtime_dir.join(SOCKET_NAME);
-    validate_socket_path(&socket, platform, SocketKind::Daemon)?;
-    verify_private_socket_endpoint(&runtime_dir, &socket, effective_uid)?;
-    Ok(socket)
-}
+// The private socket endpoint check itself lives in `pohunek-platform`
+// (`pohunek_platform::socket_endpoint`), where the `TrustedDir` validation it
+// reuses is implemented: this crate sits below `pohunek-platform` in the crate
+// graph, so it cannot call back into it. The error contract
+// ([`PathError::UnsafeSocketEndpoint`], [`UnsafeEndpointReason`]) stays here so
+// callers map one typed error regardless of where the check runs.
 
 /// Shared XDG-derived path set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1025,7 +940,18 @@ pub fn worker_socket_path(
     Ok(Some(socket))
 }
 
-fn resolve_runtime_dir(
+/// Resolves the runtime directory (`<XDG_RUNTIME_DIR>/pohunek`, or the macOS
+/// per-uid fallback) from explicit platform, identity and environment inputs.
+///
+/// Used by the verified socket resolver of `pohunek-platform`
+/// (`pohunek_platform::socket_endpoint`), which adds the private-endpoint
+/// check on top.
+///
+/// # Errors
+///
+/// Returns the [`PathError`] of an invalid or missing runtime directory
+/// variable.
+pub fn resolve_runtime_dir(
     platform: Platform,
     effective_uid: u32,
     env: &PathEnv,

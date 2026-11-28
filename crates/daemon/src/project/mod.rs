@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use protocol::{
     ErrorClass, ProjectInfo, ProjectListFilter, ProjectShowResult, ProjectSource, ProjectWorktree,
-    ProtocolError,
+    ProtocolError, MAX_PROJECT_NAME_BYTES,
 };
 
 use crate::store::{ProjectRecord, ProjectResolution, Store, StoreMutation, WorktreeStatus};
@@ -451,11 +451,14 @@ fn store_error(err: io::Error) -> ProtocolError {
     )
 }
 
-/// Reject a blank or control-character-bearing custom name. A blank label leaves
-/// a project referenceable only by its `p-…` id; a tab/newline in a label would
-/// corrupt tab-delimited rows in line-oriented clients and — via a newline-split
-/// row — smuggle an unvalidated fragment into them. The label is
-/// attacker-influenceable on a remote host, so this is the trust boundary.
+/// Reject a blank, control-character-bearing or over-cap custom name. A blank
+/// label leaves a project referenceable only by its `p-…` id; a tab/newline in
+/// a label would corrupt tab-delimited rows in line-oriented clients and — via
+/// a newline-split row — smuggle an unvalidated fragment into them. The label
+/// is attacker-influenceable on a remote host, so this is the trust boundary.
+/// The byte cap ([`MAX_PROJECT_NAME_BYTES`], shared with the CLI's check) keeps
+/// one project record far below the control-line limit, so a single maximal
+/// name cannot make the whole `project.list` walk unframeable (#2580).
 fn validate_project_name(name: &str) -> Result<(), ProtocolError> {
     if name.trim().is_empty() {
         return Err(ProtocolError::bad_request(
@@ -466,6 +469,12 @@ fn validate_project_name(name: &str) -> Result<(), ProtocolError> {
         return Err(ProtocolError::bad_request(
             "project name cannot contain control characters",
         ));
+    }
+    if name.len() > MAX_PROJECT_NAME_BYTES {
+        return Err(ProtocolError::bad_request(format!(
+            "project name is at most {MAX_PROJECT_NAME_BYTES} bytes ({} given)",
+            name.len()
+        )));
     }
     Ok(())
 }
@@ -750,6 +759,41 @@ mod tests {
                 .expect_err("control-char name rejected");
             assert_eq!(err.code, "bad_request", "name {bad:?}: {err:?}");
         }
+    }
+
+    #[test]
+    fn rename_and_add_enforce_the_project_name_byte_cap() {
+        let (pm, _store) = manager("name-cap");
+        let repo = init_repo("name-cap");
+        let added = pm
+            .add(&repo, None, None, &crate::runtime::SearchPath::process())
+            .expect("add");
+        // A name exactly at the cap is accepted.
+        let at_cap = "n".repeat(protocol::MAX_PROJECT_NAME_BYTES);
+        let renamed = pm
+            .rename(&added.id, at_cap.clone())
+            .expect("name at the cap is accepted");
+        assert_eq!(renamed.label, at_cap);
+        // One byte over is refused with a typed error, on rename and on add.
+        let over_cap = "n".repeat(protocol::MAX_PROJECT_NAME_BYTES + 1);
+        let err = pm
+            .rename(&added.id, over_cap.clone())
+            .expect_err("over-cap rename");
+        assert_eq!(err.code, "bad_request", "got: {err:?}");
+        assert!(
+            err.to_string().contains("at most"),
+            "the refusal names the cap: {err:?}"
+        );
+        let repo2 = init_repo("name-cap-2");
+        let err = pm
+            .add(
+                &repo2,
+                Some(over_cap),
+                None,
+                &crate::runtime::SearchPath::process(),
+            )
+            .expect_err("over-cap add name");
+        assert_eq!(err.code, "bad_request", "got: {err:?}");
     }
 
     #[test]

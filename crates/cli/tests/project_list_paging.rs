@@ -1,8 +1,9 @@
 //! `project.list` against a project set larger than one response.
 //!
 //! A real daemon is served from this test process. Projects are registered
-//! through the public `project.add` method, with display names that make each
-//! record large where a scenario needs a set beyond one control line. The set
+//! through the public `project.add` method, with an origin URL that makes each
+//! record large where a scenario needs a set beyond one control line (display
+//! names are capped, so they cannot inflate a record). The set
 //! is listed through the `pohunek` binary and through raw `project.list`
 //! requests, so each outcome is what an operator or a client observes.
 
@@ -27,13 +28,13 @@ mod plugin_harness;
 
 use plugin_harness::Harness;
 
-/// Bytes of the display name of each large project and how many there are:
+/// Bytes of the origin URL of each large project and how many there are:
 /// together they need more than one control line, while a page of the
 /// client's size is still one request.
-const LARGE_NAME_BYTES: usize = 20_000;
+const LARGE_ORIGIN_BYTES: usize = 20_000;
 const LARGE_PROJECTS: usize = 60;
 
-const _: () = assert!(LARGE_PROJECTS * LARGE_NAME_BYTES > MAX_CONTROL_LINE_BYTES);
+const _: () = assert!(LARGE_PROJECTS * LARGE_ORIGIN_BYTES > MAX_CONTROL_LINE_BYTES);
 
 /// Projects of the small set that is read page by page.
 const SMALL_PROJECTS: usize = 25;
@@ -54,9 +55,9 @@ fn init_repo(root: &Path, name: &str) -> std::path::PathBuf {
     path
 }
 
-/// Registers `count` projects whose display names have `name_bytes` bytes and
+/// Registers `count` projects whose origin URL has `origin_bytes` bytes and
 /// returns them ordered by label, then id (the order of an unpaged listing).
-async fn add_projects(harness: &Harness, count: usize, name_bytes: usize) -> Vec<ProjectInfo> {
+async fn add_projects(harness: &Harness, count: usize, origin_bytes: usize) -> Vec<ProjectInfo> {
     let root = tempdir().expect("create the repository root");
     let mut client = Client::connect_local(harness.socket())
         .await
@@ -64,15 +65,24 @@ async fn add_projects(harness: &Harness, count: usize, name_bytes: usize) -> Vec
     let mut projects = Vec::new();
     for index in 0..count {
         let repo = init_repo(root.path(), &format!("repo-{index:04}"));
-        let prefix = format!("{index:04}-");
-        let name = format!(
-            "{prefix}{}",
-            "n".repeat(name_bytes.saturating_sub(prefix.len()))
-        );
+        if origin_bytes > 0 {
+            const URL_PREFIX: &str = "https://example.invalid/";
+            let url = format!(
+                "{URL_PREFIX}{}",
+                "o".repeat(origin_bytes.saturating_sub(URL_PREFIX.len()))
+            );
+            let status = pohunek_test_support::git::command()
+                .args(["remote", "add", "origin"])
+                .arg(&url)
+                .current_dir(&repo)
+                .status()
+                .expect("run git remote add");
+            assert!(status.success(), "git remote add origin");
+        }
         let added = client
             .call::<method::ProjectAdd>(ProjectAddParams {
                 path: Some(repo),
-                name: Some(name),
+                name: Some(format!("{index:04}")),
                 base_branch: None,
             })
             .await
@@ -118,7 +128,7 @@ fn ids(projects: &[ProjectInfo]) -> Vec<String> {
 #[tokio::test]
 async fn a_project_set_larger_than_one_response_is_listed_completely_by_the_cli() {
     let harness = Harness::start_durable().await;
-    let projects = add_projects(&harness, LARGE_PROJECTS, LARGE_NAME_BYTES).await;
+    let projects = add_projects(&harness, LARGE_PROJECTS, LARGE_ORIGIN_BYTES).await;
 
     let (code, listed) = harness.json(&["project", "list"]).await;
 
@@ -137,7 +147,7 @@ async fn a_project_set_larger_than_one_response_is_listed_completely_by_the_cli(
 #[tokio::test]
 async fn a_page_whose_projects_exceed_one_response_is_a_typed_error() {
     let harness = Harness::start_durable().await;
-    add_projects(&harness, LARGE_PROJECTS, LARGE_NAME_BYTES).await;
+    add_projects(&harness, LARGE_PROJECTS, LARGE_ORIGIN_BYTES).await;
 
     let error = raw_list(&harness, json!({ "limit": LARGE_PROJECTS }))
         .into_result()
@@ -158,7 +168,7 @@ async fn a_page_whose_projects_exceed_one_response_is_a_typed_error() {
 #[tokio::test]
 async fn limit_and_cursor_walk_the_set_in_id_order() {
     let harness = Harness::start_durable().await;
-    let projects = add_projects(&harness, SMALL_PROJECTS, 12).await;
+    let projects = add_projects(&harness, SMALL_PROJECTS, 0).await;
     let mut all = ids(&projects);
     all.sort();
 
@@ -181,7 +191,7 @@ async fn limit_and_cursor_walk_the_set_in_id_order() {
 #[tokio::test]
 async fn a_project_renamed_between_pages_is_listed_once() {
     let harness = Harness::start_durable().await;
-    let projects = add_projects(&harness, SMALL_PROJECTS, 12).await;
+    let projects = add_projects(&harness, SMALL_PROJECTS, 0).await;
     let mut all = ids(&projects);
     all.sort();
 

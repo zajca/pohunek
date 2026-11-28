@@ -10,19 +10,20 @@ use crate::ClientError;
 ///
 /// The path is the one the daemon binds. An existing runtime directory or
 /// socket must be private to the caller: not a symlink, owned by the effective
-/// user, and without group or other access. A missing entry passes, because
-/// connecting then reports that no daemon is listening. The check inspects the
-/// two entries by name at call time; it does not cover ancestor directories or
-/// ACLs, and it does not verify the peer of a later connect.
+/// user, without group or other access, with a private ACL, and with every
+/// ancestor passing the trusted-directory policy — the same `TrustedDir`
+/// validation the daemon applies when it creates the directory
+/// (#2563). A missing entry passes, because connecting then reports that no
+/// daemon is listening. The check does not verify the peer of a later connect.
 ///
 /// # Errors
 ///
 /// Returns [`ClientError::LocalSocketUnresolvable`] when the runtime directory
 /// cannot be derived, [`ClientError::LocalSocketPathInvalid`] when the socket
 /// path violates the path contract, and [`ClientError::LocalSocketUnsafe`]
-/// when an existing entry is not private.
+/// when an existing entry or one of its ancestors is not private.
 pub fn local_socket_path() -> Result<PathBuf, ClientError> {
-    pohunek_paths::verified_socket_path().map_err(classify)
+    pohunek_platform::socket_endpoint::verified_socket_path().map_err(classify)
 }
 
 /// [`local_socket_path`] from explicit platform, identity and environment
@@ -36,7 +37,8 @@ pub fn local_socket_path_for(
     effective_uid: u32,
     env: &PathEnv,
 ) -> Result<PathBuf, ClientError> {
-    pohunek_paths::verified_socket_path_for(platform, effective_uid, env).map_err(classify)
+    pohunek_platform::socket_endpoint::verified_socket_path_for(platform, effective_uid, env)
+        .map_err(classify)
 }
 
 /// Maps a resolver failure to the client error of its kind.

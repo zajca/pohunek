@@ -219,7 +219,12 @@ async fn recover_missing_package(
         eprintln!("pohunek: {recover}");
         return Err(with_recover(error, Some(recover)));
     }
-    let Ok(mut client) = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await
+    let Ok(mut client) = crate::client::Client::connect_with_request_timeout(
+        crate::target::LOCAL_HOST,
+        paths,
+        crate::commands::setup_host::SETUP_RESPONSE_TIMEOUT,
+    )
+    .await
     else {
         return Err(error);
     };
@@ -388,7 +393,12 @@ async fn install_and_retry(
     if !opts.yes && !crate::commands::setup_host::confirm()? {
         return Err(CliError::SetupDeclined);
     }
-    let mut client = crate::client::Client::connect(crate::target::LOCAL_HOST, paths).await?;
+    let mut client = crate::client::Client::connect_with_request_timeout(
+        crate::target::LOCAL_HOST,
+        paths,
+        crate::commands::setup_host::SETUP_RESPONSE_TIMEOUT,
+    )
+    .await?;
     match crate::commands::setup_assistant::apply(&mut client, step, None, daemon_core.as_ref())
         .await
     {

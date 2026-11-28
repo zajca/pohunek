@@ -924,7 +924,7 @@ The durable session record keeps the active agent the worker journaled, with
 whether it was reported or observed, so a daemon restart restores it even after
 the worker's claim expired. A bound `session.report_agent` or
 `session.release_agent` (it carries `pid` and `monotonic_sequence`) is
-forwarded into the worker of a live session that negotiated worker protocol 8:
+forwarded into the worker of a live session that negotiated worker protocol 8 or newer:
 the worker validates the subject like a hook claim, journals it, and only then
 answers, and the daemon commits the claim the worker holds. A bound report
 therefore survives a restart whenever it is accepted, and `recorded: false`

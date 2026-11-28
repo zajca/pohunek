@@ -660,6 +660,10 @@ impl SessionRegistry {
                 }
             }
         };
+        // `selected_version()` is passed only to size the bound: the probe
+        // does not adapt the forwarded payload to the negotiated version, so a
+        // hung worker lock still logs `forward_timed_out` instead of waiting
+        // unbounded.
         if self
             .within_worker_bound(worker.selected_version())
             .await

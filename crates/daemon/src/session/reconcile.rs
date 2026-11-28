@@ -5695,8 +5695,9 @@ fn adopt_projected_claim(
                 }
             }
         }
-        // A worker without identity revisions cannot be forwarded to, so a
-        // public report of the process it journaled stays the active claim.
+        // A revision-less (offline journal snapshot) worker cannot be
+        // forwarded to, so a public report of the process it journaled stays
+        // the active claim.
         let unrevised = snapshot.active_identity_revision.is_none();
         let replaces = previous
             .as_ref()
@@ -23580,9 +23581,9 @@ generation "$1"
                 .expect("stop the session");
         }
 
-        /// T2 / V7: a forwarded release whose answer timed out and that the worker
-        /// journaled afterwards does not clear the newer memory report made after
-        /// it.
+        /// T2 / journal-snapshot: a forwarded release whose answer timed out and
+        /// that the worker journaled afterwards does not clear the newer memory
+        /// report made after it.
         #[tokio::test]
         async fn a_newer_memory_report_holds_against_a_release_the_worker_journaled_after_the_bound(
         ) {
